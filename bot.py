@@ -1,6 +1,7 @@
 """Teleclaude - Chat with Claude on Telegram. Code against GitHub."""
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -425,6 +426,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Something went wrong. Please try again.")
 
 
+async def notify_startup(app: Application) -> None:
+    """Send a startup message to all allowed users."""
+    if not ALLOWED_USER_IDS:
+        logger.info("No ALLOWED_USER_IDS set — skipping startup notification")
+        return
+
+    integrations = []
+    if gh_client:
+        integrations.append("GitHub")
+    if web_client:
+        integrations.append("Web search")
+    if tasks_client:
+        integrations.append("Tasks")
+    if calendar_client:
+        integrations.append("Calendar")
+    if email_client:
+        integrations.append("Gmail")
+
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    enabled = ", ".join(integrations) if integrations else "none"
+    msg = f"Teleclaude restarted at {now}\nModel: {CLAUDE_MODEL}\nIntegrations: {enabled}"
+
+    for user_id in ALLOWED_USER_IDS:
+        try:
+            await app.bot.send_message(chat_id=user_id, text=msg)
+            logger.info("Sent startup notification to user %d", user_id)
+        except Exception as e:
+            logger.warning("Could not notify user %d: %s", user_id, e)
+
+
 def main() -> None:
     init_db()
 
@@ -436,6 +467,8 @@ def main() -> None:
     app.add_handler(CommandHandler("new", new_conversation))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    app.post_init = notify_startup
 
     logger.info(
         "Teleclaude started — model: %s | github: %s | search: %s | tasks: %s | calendar: %s | email: %s",
