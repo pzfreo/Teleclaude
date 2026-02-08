@@ -30,6 +30,14 @@ def init_db() -> None:
             chat_id INTEGER PRIMARY KEY,
             repo TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS todo_lists (
+            chat_id INTEGER PRIMARY KEY,
+            todos TEXT NOT NULL DEFAULT '[]'
+        );
+        CREATE TABLE IF NOT EXISTS chat_modes (
+            chat_id INTEGER PRIMARY KEY,
+            plan_mode INTEGER NOT NULL DEFAULT 0
+        );
         """
     )
     conn.close()
@@ -85,6 +93,44 @@ def save_active_repo(chat_id: int, repo: str) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO active_repos (chat_id, repo) VALUES (?, ?)",
         (chat_id, repo),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_todos(chat_id: int) -> list[dict]:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT todos FROM todo_lists WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    conn.close()
+    return json.loads(row[0]) if row else []
+
+
+def save_todos(chat_id: int, todos: list[dict]) -> None:
+    conn = _connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO todo_lists (chat_id, todos) VALUES (?, ?)",
+        (chat_id, json.dumps(todos)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_plan_mode(chat_id: int) -> bool:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT plan_mode FROM chat_modes WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    conn.close()
+    return bool(row[0]) if row else False
+
+
+def save_plan_mode(chat_id: int, enabled: bool) -> None:
+    conn = _connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO chat_modes (chat_id, plan_mode) VALUES (?, ?)",
+        (chat_id, int(enabled)),
     )
     conn.commit()
     conn.close()

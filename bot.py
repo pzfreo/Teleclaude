@@ -26,6 +26,10 @@ from persistence import (
     clear_conversation,
     load_active_repo,
     save_active_repo,
+    load_todos,
+    save_todos,
+    load_plan_mode,
+    save_plan_mode,
 )
 
 load_dotenv()
@@ -165,7 +169,40 @@ Guidelines:
 - Use web search to look up documentation, error messages, or current information when needed.
 - Use Google Tasks to manage the user's tasks when they ask about todos, reminders, or task management.
 - Use Google Calendar to check schedule, create events, or manage the user's calendar.
-- You can send emails via Gmail but NEVER send an email without explicitly confirming the recipient, subject, and body with the user first."""
+- You can send emails via Gmail but NEVER send an email without explicitly confirming the recipient, subject, and body with the user first.
+- For multi-step tasks, use the update_todo_list tool to track progress. Create the list when starting, mark items in_progress as you work, and completed when done.
+- When plan mode is on, always outline your plan first and wait for user approval before executing."""
+
+# ── Internal tools (always available) ─────────────────────────────────
+
+TODO_TOOL = {
+    "name": "update_todo_list",
+    "description": (
+        "Update the task/todo list for the current session. Use this proactively to "
+        "track progress on multi-step tasks. Each todo has a content string and a "
+        "status: pending, in_progress, or completed. Send the full updated list each time."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "todos": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string", "description": "What needs to be done"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                        },
+                    },
+                    "required": ["content", "status"],
+                },
+            }
+        },
+        "required": ["todos"],
+    },
+}
 
 ALLOWED_USER_IDS: set[int] = set()
 for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
@@ -190,10 +227,35 @@ _email_tool_names = {t["name"] for t in EMAIL_TOOLS}
 conversations: dict[int, list] = {}
 active_repos: dict[int, str] = {}
 chat_models: dict[int, str] = {}
+chat_todos: dict[int, list[dict]] = {}
+chat_plan_mode: dict[int, bool] = {}
 
 
 def get_model(chat_id: int) -> str:
     return chat_models.get(chat_id, DEFAULT_MODEL)
+
+
+def get_todos(chat_id: int) -> list[dict]:
+    if chat_id not in chat_todos:
+        chat_todos[chat_id] = load_todos(chat_id)
+    return chat_todos[chat_id]
+
+
+def get_plan_mode(chat_id: int) -> bool:
+    if chat_id not in chat_plan_mode:
+        chat_plan_mode[chat_id] = load_plan_mode(chat_id)
+    return chat_plan_mode[chat_id]
+
+
+def format_todo_list(todos: list[dict]) -> str:
+    if not todos:
+        return "No tasks tracked."
+    icons = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
+    lines = []
+    for i, t in enumerate(todos, 1):
+        icon = icons.get(t.get("status", "pending"), "[ ]")
+        lines.append(f"{icon} {i}. {t['content']}")
+    return "\n".join(lines)
 
 
 def is_authorized(user_id: int) -> bool:
@@ -271,6 +333,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/repo - Show current repo\n"
         "/new - Start a fresh conversation\n"
         "/model - Show or switch Claude model (opus/sonnet/haiku)\n"
+        "/plan - Toggle plan mode (outline before executing)\n"
+        "/todo - Show current task list (/todo clear to reset)\n"
         "/help - Show this message\n\n"
         f"{status}"
     )
@@ -313,7 +377,9 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     chat_id = update.effective_chat.id
     conversations[chat_id] = []
+    chat_todos[chat_id] = []
     clear_conversation(chat_id)
+    save_todos(chat_id, [])
     await update.message.reply_text("Conversation cleared. Starting fresh.")
 
 
@@ -352,8 +418,42 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(f"Model switched to: {model_id}")
 
 
-def _execute_tool_call(block, repo) -> str:
+async def toggle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    current = get_plan_mode(chat_id)
+    new_mode = not current
+    chat_plan_mode[chat_id] = new_mode
+    save_plan_mode(chat_id, new_mode)
+    if new_mode:
+        await update.message.reply_text(
+            "Plan mode ON. I'll outline a plan before making changes and wait for your approval."
+        )
+    else:
+        await update.message.reply_text("Plan mode OFF. I'll execute tasks directly.")
+
+
+async def show_todos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    todos = get_todos(chat_id)
+    if context.args and context.args[0].lower() == "clear":
+        chat_todos[chat_id] = []
+        save_todos(chat_id, [])
+        await update.message.reply_text("Todo list cleared.")
+        return
+    await update.message.reply_text(format_todo_list(todos))
+
+
+def _execute_tool_call(block, repo, chat_id) -> str:
     """Dispatch a single tool call to the right handler."""
+    if block.name == "update_todo_list":
+        todos = block.input.get("todos", [])
+        chat_todos[chat_id] = todos
+        save_todos(chat_id, todos)
+        return format_todo_list(todos)
     if block.name == "web_search" and execute_web_tool:
         return execute_web_tool(web_client, block.name, block.input)
     elif block.name in _tasks_tool_names and execute_tasks_tool:
@@ -382,7 +482,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     trim_history(chat_id)
 
     repo = get_active_repo(chat_id)
-    tools = []
+    tools = [TODO_TOOL]  # always available
     if repo and gh_client:
         tools.extend(GITHUB_TOOLS)
     if web_client:
@@ -397,6 +497,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     system = SYSTEM_PROMPT
     if repo:
         system += f"\n\nActive repository: {repo}"
+
+    # Inject current todo list into context
+    todos = get_todos(chat_id)
+    if todos:
+        system += f"\n\nCurrent todo list:\n{format_todo_list(todos)}"
+
+    # Plan mode
+    if get_plan_mode(chat_id):
+        system += (
+            "\n\nPLAN MODE IS ON. Before making any changes (file edits, PRs, emails, etc.), "
+            "first outline a numbered plan of what you intend to do and ask the user to confirm. "
+            "Only proceed after they approve. Use the update_todo_list tool to track the plan steps."
+        )
 
     # Start typing indicator in background
     stop_typing = asyncio.Event()
@@ -435,7 +548,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             for block in response.content:
                 if block.type == "tool_use":
                     logger.info("Tool call [%d]: %s(%s)", round_num + 1, block.name, json.dumps(block.input)[:200])
-                    result = _execute_tool_call(block, repo)
+                    result = _execute_tool_call(block, repo, chat_id)
                     if len(result) > 10000:
                         result = result[:10000] + "\n... (truncated)"
                     tool_results.append(
@@ -506,6 +619,8 @@ def main() -> None:
     app.add_handler(CommandHandler("repo", set_repo))
     app.add_handler(CommandHandler("new", new_conversation))
     app.add_handler(CommandHandler("model", show_model))
+    app.add_handler(CommandHandler("plan", toggle_plan))
+    app.add_handler(CommandHandler("todo", show_todos))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.post_init = notify_startup
