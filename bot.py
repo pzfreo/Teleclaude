@@ -18,6 +18,7 @@ from telegram.ext import (
 
 from github_tools import GITHUB_TOOLS, GitHubClient, execute_tool as execute_github_tool
 from web_tools import WEB_TOOLS, WebSearchClient, execute_tool as execute_web_tool
+from tasks_tools import TASKS_TOOLS, GoogleTasksClient, execute_tool as execute_tasks_tool
 
 load_dotenv()
 
@@ -30,6 +31,9 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
 SYSTEM_PROMPT = """You are Teleclaude, a coding assistant on Telegram with access to GitHub.
@@ -44,6 +48,7 @@ Guidelines:
 - Keep Telegram responses concise. Use code blocks for short snippets only.
 - If no repo is set, you can still chat normally.
 - Use web search to look up documentation, error messages, or current information when needed.
+- Use Google Tasks to manage the user's tasks when they ask about todos, reminders, or task management."""
 
 ALLOWED_USER_IDS: set[int] = set()
 for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
@@ -58,6 +63,11 @@ MAX_TOOL_ROUNDS = 15
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 gh_client = GitHubClient(GITHUB_TOKEN) if GITHUB_TOKEN else None
 web_client = WebSearchClient()
+tasks_client = (
+    GoogleTasksClient(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN)
+    if GOOGLE_REFRESH_TOKEN
+    else None
+)
 
 # Per-chat state
 conversations: dict[int, list[dict]] = defaultdict(list)
@@ -88,8 +98,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     github_status = "connected" if gh_client else "not configured (set GITHUB_TOKEN)"
+    tasks_status = "connected" if tasks_client else "not configured (run setup_google.py)"
     await update.message.reply_text(
-        "Hello! I'm Teleclaude — Claude on Telegram with GitHub and web search.\n\n"
+        "Hello! I'm Teleclaude — Claude on Telegram with GitHub, web search, and Google Tasks.\n\n"
         "Commands:\n"
         "/repo owner/name - Set the active GitHub repo\n"
         "/repo - Show current repo\n"
@@ -97,6 +108,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model - Show current Claude model\n"
         "/help - Show this message\n\n"
         f"GitHub: {github_status}\n"
+        f"Google Tasks: {tasks_status}\n"
         "Web search: enabled"
     )
 
@@ -165,6 +177,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if repo and gh_client:
         tools.extend(GITHUB_TOOLS)
     tools.extend(WEB_TOOLS)
+    if tasks_client:
+        tools.extend(TASKS_TOOLS)
 
     system = SYSTEM_PROMPT
     if repo:
@@ -204,6 +218,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     logger.info("Tool call: %s(%s)", block.name, json.dumps(block.input)[:200])
                     if block.name == "web_search":
                         result = execute_web_tool(web_client, block.name, block.input)
+                    elif block.name in {t["name"] for t in TASKS_TOOLS}:
+                        result = execute_tasks_tool(tasks_client, block.name, block.input)
                     else:
                         result = execute_github_tool(gh_client, repo, block.name, block.input)
                     # Truncate large results to avoid blowing up context
@@ -238,7 +254,7 @@ def main() -> None:
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Teleclaude bot started (model: %s, github: %s, search: %s)", CLAUDE_MODEL, bool(gh_client), bool(web_client))
+    logger.info("Teleclaude bot started (model: %s, github: %s, search: %s, tasks: %s)", CLAUDE_MODEL, bool(gh_client), bool(web_client), bool(tasks_client))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

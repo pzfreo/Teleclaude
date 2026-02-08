@@ -9,3 +9,5 @@ env/
 dist/
 build/
 .mypy_cache/
+credentials.json
+token.json

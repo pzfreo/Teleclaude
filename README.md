@@ -1,6 +1,6 @@
 # Teleclaude
 
-A Telegram bot that connects you to Claude with GitHub integration and web search. Chat with Claude, and let it read, edit, and push code to your repos — all from Telegram.
+A Telegram bot that connects you to Claude with GitHub, web search, and Google Tasks. Chat with Claude, code against your repos, search the web, and manage your tasks — all from Telegram.
 
 ## Setup
 
@@ -20,7 +20,21 @@ A Telegram bot that connects you to Claude with GitHub integration and web searc
 1. Go to [github.com/settings/tokens](https://github.com/settings/tokens)
 2. Create a token with `repo` scope (for full access to your repositories)
 
-### 4. Configure
+### 4. Google Tasks (optional)
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a project and enable the **Google Tasks API**
+3. Go to Credentials > Create Credentials > **OAuth 2.0 Client ID** (Desktop app)
+4. Run the setup script locally:
+
+```bash
+pip install google-auth-oauthlib google-api-python-client
+python setup_google.py
+```
+
+5. It will open a browser for you to authorize. Copy the three values it prints.
+
+### 5. Configure
 
 ```bash
 cp .env.example .env
@@ -38,7 +52,7 @@ Optional settings:
 - `CLAUDE_MODEL` — which Claude model to use (default: `claude-sonnet-4-20250514`)
 - `ALLOWED_USER_IDS` — comma-separated Telegram user IDs to restrict access
 
-### 5. Run Locally
+### 6. Run Locally
 
 ```bash
 pip install -r requirements.txt
@@ -53,6 +67,7 @@ python bot.py
    - `TELEGRAM_BOT_TOKEN`
    - `ANTHROPIC_API_KEY`
    - `GITHUB_TOKEN`
+   - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (if using Tasks)
    - (and any optional ones from `.env.example`)
 4. Railway will auto-detect the `Procfile` and deploy
 
@@ -77,6 +92,7 @@ Once you set a repo with `/repo`, Claude can:
 - **View issues** — list and read issues
 - **Search code** — find code by keyword
 - **Web search** — look up docs, error messages, or current info (always available, no repo needed)
+- **Google Tasks** — list, create, complete, update, and delete tasks
 
 ### Example workflow
 
