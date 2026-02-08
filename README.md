@@ -20,12 +20,7 @@ A Telegram bot that connects you to Claude with GitHub integration and web searc
 1. Go to [github.com/settings/tokens](https://github.com/settings/tokens)
 2. Create a token with `repo` scope (for full access to your repositories)
 
-### 4. Get a Tavily API Key (for web search)
-
-1. Go to [tavily.com](https://tavily.com) and sign up (free tier: 1000 searches/month)
-2. Copy your API key
-
-### 5. Configure
+### 4. Configure
 
 ```bash
 cp .env.example .env
@@ -37,14 +32,13 @@ Edit `.env` and fill in your tokens:
 TELEGRAM_BOT_TOKEN=your-telegram-bot-token
 ANTHROPIC_API_KEY=sk-ant-...
 GITHUB_TOKEN=ghp_...
-TAVILY_API_KEY=tvly-...
 ```
 
 Optional settings:
 - `CLAUDE_MODEL` — which Claude model to use (default: `claude-sonnet-4-20250514`)
 - `ALLOWED_USER_IDS` — comma-separated Telegram user IDs to restrict access
 
-### 6. Run Locally
+### 5. Run Locally
 
 ```bash
 pip install -r requirements.txt
@@ -59,7 +53,6 @@ python bot.py
    - `TELEGRAM_BOT_TOKEN`
    - `ANTHROPIC_API_KEY`
    - `GITHUB_TOKEN`
-   - `TAVILY_API_KEY`
    - (and any optional ones from `.env.example`)
 4. Railway will auto-detect the `Procfile` and deploy
 

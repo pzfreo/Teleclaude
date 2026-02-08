@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
 SYSTEM_PROMPT = """You are Teleclaude, a coding assistant on Telegram with access to GitHub.
@@ -58,7 +57,7 @@ MAX_TOOL_ROUNDS = 15
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 gh_client = GitHubClient(GITHUB_TOKEN) if GITHUB_TOKEN else None
-web_client = WebSearchClient(TAVILY_API_KEY) if TAVILY_API_KEY else None
+web_client = WebSearchClient()
 
 # Per-chat state
 conversations: dict[int, list[dict]] = defaultdict(list)
@@ -89,7 +88,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     github_status = "connected" if gh_client else "not configured (set GITHUB_TOKEN)"
-    search_status = "connected" if web_client else "not configured (set TAVILY_API_KEY)"
     await update.message.reply_text(
         "Hello! I'm Teleclaude — Claude on Telegram with GitHub and web search.\n\n"
         "Commands:\n"
@@ -99,7 +97,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model - Show current Claude model\n"
         "/help - Show this message\n\n"
         f"GitHub: {github_status}\n"
-        f"Web search: {search_status}"
+        "Web search: enabled"
     )
 
 
@@ -166,8 +164,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     tools = []
     if repo and gh_client:
         tools.extend(GITHUB_TOOLS)
-    if web_client:
-        tools.extend(WEB_TOOLS)
+    tools.extend(WEB_TOOLS)
 
     system = SYSTEM_PROMPT
     if repo:

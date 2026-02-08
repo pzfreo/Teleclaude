@@ -1,51 +1,31 @@
-"""Web search tool that Claude can call via tool_use."""
+"""Web search tool that Claude can call via tool_use. Uses DuckDuckGo — no API key needed."""
 
 import json
 import logging
 
-import requests
+from duckduckgo_search import DDGS
 
 logger = logging.getLogger(__name__)
 
 
 class WebSearchClient:
-    """Tavily web search client."""
+    """DuckDuckGo search client. No API key, no limits."""
 
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base = "https://api.tavily.com"
+    def __init__(self):
+        pass
 
     def search(self, query: str, max_results: int = 5) -> list[dict]:
         """Search the web and return results."""
-        resp = requests.post(
-            f"{self.base}/search",
-            json={
-                "api_key": self.api_key,
-                "query": query,
-                "max_results": max_results,
-                "include_answer": True,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        results = []
-
-        # Include Tavily's AI-generated answer if available
-        if data.get("answer"):
-            results.append({"type": "answer", "content": data["answer"]})
-
-        for item in data.get("results", []):
-            results.append(
-                {
-                    "type": "result",
-                    "title": item.get("title", ""),
-                    "url": item.get("url", ""),
-                    "content": item.get("content", ""),
-                }
-            )
-
-        return results
+        with DDGS() as ddgs:
+            raw = list(ddgs.text(query, max_results=max_results))
+        return [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("href", ""),
+                "content": r.get("body", ""),
+            }
+            for r in raw
+        ]
 
 
 WEB_TOOLS = [
@@ -79,7 +59,5 @@ def execute_tool(client: WebSearchClient, tool_name: str, tool_input: dict) -> s
             results = client.search(tool_input["query"], max_results)
             return json.dumps(results, indent=2)
         return f"Unknown tool: {tool_name}"
-    except requests.HTTPError as e:
-        return f"Search API error ({e.response.status_code}): {e.response.text[:500]}"
     except Exception as e:
-        return f"Error: {e}"
+        return f"Search error: {e}"
