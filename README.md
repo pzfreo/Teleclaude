@@ -1,6 +1,6 @@
 # Teleclaude
 
-A Telegram bot that connects you to Claude with GitHub, web search, and Google Tasks. Chat with Claude, code against your repos, search the web, and manage your tasks — all from Telegram.
+A Telegram bot that connects you to Claude with GitHub, web search, Google Tasks, Google Calendar, and Gmail. Code against your repos, search the web, manage tasks and calendar, and send emails — all from Telegram.
 
 ## Setup
 
@@ -20,10 +20,10 @@ A Telegram bot that connects you to Claude with GitHub, web search, and Google T
 1. Go to [github.com/settings/tokens](https://github.com/settings/tokens)
 2. Create a token with `repo` scope (for full access to your repositories)
 
-### 4. Google Tasks (optional)
+### 4. Google integration (optional — Tasks, Calendar, Gmail send)
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a project and enable the **Google Tasks API**
+2. Create a project and enable **Google Tasks API**, **Google Calendar API**, and **Gmail API**
 3. Go to Credentials > Create Credentials > **OAuth 2.0 Client ID** (Desktop app)
 4. Run the setup script locally:
 
@@ -67,7 +67,7 @@ python bot.py
    - `TELEGRAM_BOT_TOKEN`
    - `ANTHROPIC_API_KEY`
    - `GITHUB_TOKEN`
-   - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (if using Tasks)
+   - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (if using Google integrations)
    - (and any optional ones from `.env.example`)
 4. Railway will auto-detect the `Procfile` and deploy
 
@@ -81,18 +81,19 @@ python bot.py
 - `/model` — show which Claude model is active
 - `/help` — show available commands
 
-### GitHub capabilities
+### Capabilities
 
-Once you set a repo with `/repo`, Claude can:
+All tools are optional — the bot enables whatever is configured.
 
-- **Read files** — browse directories, read source code
-- **Edit files** — create or update files with commits
-- **Manage branches** — create feature branches
-- **Open PRs** — create pull requests with descriptions
-- **View issues** — list and read issues
-- **Search code** — find code by keyword
-- **Web search** — look up docs, error messages, or current info (always available, no repo needed)
-- **Google Tasks** — list, create, complete, update, and delete tasks
+**GitHub** (with `/repo`): read files, edit code, create branches, open PRs, view issues, search code
+
+**Web search**: look up docs, error messages, or current info
+
+**Google Tasks**: list, create, complete, update, and delete tasks
+
+**Google Calendar**: view upcoming events, create events, manage calendars
+
+**Gmail (send only)**: compose and send emails — Claude always confirms before sending. No read access.
 
 ### Example workflow
 
@@ -111,4 +112,6 @@ Bot: [creates branch, reads file, edits it, commits, opens PR]
 
 - Set `ALLOWED_USER_IDS` to restrict who can use the bot
 - Your `GITHUB_TOKEN` controls what repos Claude can access — use a fine-grained token scoped to specific repos if you want to limit access
+- Gmail uses the `gmail.send` scope only — Claude cannot read your emails
+- Claude will always confirm email details with you before sending
 - Find your Telegram user ID by messaging [@userinfobot](https://t.me/userinfobot)
