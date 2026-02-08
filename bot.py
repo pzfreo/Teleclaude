@@ -526,7 +526,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if email_client:
         tools.extend(EMAIL_TOOLS)
 
-    system = SYSTEM_PROMPT
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%A, %B %d, %Y")
+    system = SYSTEM_PROMPT + f"\n\nToday's date is {today}."
     if repo:
         system += f"\n\nActive repository: {repo}"
 
