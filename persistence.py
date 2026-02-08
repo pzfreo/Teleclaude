@@ -36,7 +36,8 @@ def init_db() -> None:
         );
         CREATE TABLE IF NOT EXISTS chat_modes (
             chat_id INTEGER PRIMARY KEY,
-            plan_mode INTEGER NOT NULL DEFAULT 0
+            plan_mode INTEGER NOT NULL DEFAULT 0,
+            agent_mode INTEGER NOT NULL DEFAULT 0
         );
         """
     )
@@ -130,6 +131,27 @@ def save_plan_mode(chat_id: int, enabled: bool) -> None:
     conn = _connect()
     conn.execute(
         "INSERT OR REPLACE INTO chat_modes (chat_id, plan_mode) VALUES (?, ?)",
+        (chat_id, int(enabled)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_agent_mode(chat_id: int) -> bool:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT agent_mode FROM chat_modes WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    conn.close()
+    return bool(row[0]) if row else False
+
+
+def save_agent_mode(chat_id: int, enabled: bool) -> None:
+    conn = _connect()
+    # Use upsert to avoid overwriting plan_mode
+    conn.execute(
+        """INSERT INTO chat_modes (chat_id, agent_mode) VALUES (?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET agent_mode = excluded.agent_mode""",
         (chat_id, int(enabled)),
     )
     conn.commit()

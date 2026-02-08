@@ -30,6 +30,8 @@ from persistence import (
     save_todos,
     load_plan_mode,
     save_plan_mode,
+    load_agent_mode,
+    save_agent_mode,
 )
 
 load_dotenv()
@@ -213,6 +215,7 @@ for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
 MAX_HISTORY = 50
 MAX_TELEGRAM_LENGTH = 4096
 MAX_TOOL_ROUNDS = 15
+MAX_TOOL_ROUNDS_AGENT = 30
 TYPING_INTERVAL = 4  # seconds between typing indicator refreshes
 PROGRESS_INTERVAL = 15  # seconds before sending a progress message
 
@@ -229,6 +232,7 @@ active_repos: dict[int, str] = {}
 chat_models: dict[int, str] = {}
 chat_todos: dict[int, list[dict]] = {}
 chat_plan_mode: dict[int, bool] = {}
+chat_agent_mode: dict[int, bool] = {}
 
 
 def get_model(chat_id: int) -> str:
@@ -245,6 +249,12 @@ def get_plan_mode(chat_id: int) -> bool:
     if chat_id not in chat_plan_mode:
         chat_plan_mode[chat_id] = load_plan_mode(chat_id)
     return chat_plan_mode[chat_id]
+
+
+def get_agent_mode(chat_id: int) -> bool:
+    if chat_id not in chat_agent_mode:
+        chat_agent_mode[chat_id] = load_agent_mode(chat_id)
+    return chat_agent_mode[chat_id]
 
 
 def format_todo_list(todos: list[dict]) -> str:
@@ -334,6 +344,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/new - Start a fresh conversation\n"
         "/model - Show or switch Claude model (opus/sonnet/haiku)\n"
         "/plan - Toggle plan mode (outline before executing)\n"
+        "/agent - Toggle agent mode (autonomous + extended thinking)\n"
         "/todo - Show current task list (/todo clear to reset)\n"
         "/help - Show this message\n\n"
         f"{status}"
@@ -434,6 +445,27 @@ async def toggle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Plan mode OFF. I'll execute tasks directly.")
 
 
+async def toggle_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    current = get_agent_mode(chat_id)
+    new_mode = not current
+    chat_agent_mode[chat_id] = new_mode
+    save_agent_mode(chat_id, new_mode)
+    if new_mode:
+        await update.message.reply_text(
+            "Agent mode ON. I'll work autonomously:\n"
+            "- Extended thinking for deeper reasoning\n"
+            "- Up to 30 tool rounds per message\n"
+            "- Full repo exploration before changes\n"
+            "- CI/test checks after changes\n"
+            "- Proactive issue investigation"
+        )
+    else:
+        await update.message.reply_text("Agent mode OFF. Back to normal conversational mode.")
+
+
 async def show_todos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
@@ -511,6 +543,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "Only proceed after they approve. Use the update_todo_list tool to track the plan steps."
         )
 
+    agent_mode = get_agent_mode(chat_id)
+    if agent_mode:
+        system += (
+            "\n\nAGENT MODE IS ON. You are an autonomous coding agent. Work like Claude Code:"
+            "\n- Think deeply about the problem before acting."
+            "\n- For coding tasks: explore the repo structure first (use get_tree), read relevant files, "
+            "understand the codebase, then make changes."
+            "\n- Always use update_todo_list to track your progress on multi-step tasks."
+            "\n- After making code changes, check if the repo has CI workflows and review their status."
+            "\n- If CI fails, read the logs, diagnose, and fix the issue."
+            "\n- Be thorough — investigate related files, not just the one that was mentioned."
+            "\n- When fixing bugs: find the root cause, don't just patch symptoms."
+            "\n- When adding features: consider edge cases, error handling, and test coverage."
+            "\n- Report back concisely when done with a summary of what you did."
+        )
+
+    max_rounds = MAX_TOOL_ROUNDS_AGENT if agent_mode else MAX_TOOL_ROUNDS
+
     # Start typing indicator in background
     stop_typing = asyncio.Event()
     start_time = time.time()
@@ -519,15 +569,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     try:
-        for round_num in range(MAX_TOOL_ROUNDS):
+        for round_num in range(max_rounds):
             kwargs = {
                 "model": get_model(chat_id),
-                "max_tokens": 4096,
+                "max_tokens": 16384 if agent_mode else 4096,
                 "system": system,
                 "messages": history,
             }
             if tools:
                 kwargs["tools"] = tools
+
+            # Extended thinking in agent mode
+            if agent_mode:
+                kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
 
             response = api_client.messages.create(**kwargs)
 
@@ -620,6 +674,7 @@ def main() -> None:
     app.add_handler(CommandHandler("new", new_conversation))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("plan", toggle_plan))
+    app.add_handler(CommandHandler("agent", toggle_agent))
     app.add_handler(CommandHandler("todo", show_todos))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

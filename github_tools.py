@@ -149,6 +149,107 @@ class GitHubClient:
         items = self._get(f"/repos/{repo}/branches", params={"per_page": 30})
         return [i["name"] for i in items]
 
+    def delete_file(self, repo: str, path: str, message: str, branch: str) -> str:
+        """Delete a file from the repo."""
+        sha = self.get_file_sha(repo, path, ref=branch)
+        if not sha:
+            return f"File not found: {path}"
+        resp = self.session.delete(
+            f"{self.base}/repos/{repo}/contents/{path}",
+            json={"message": message, "sha": sha, "branch": branch},
+        )
+        resp.raise_for_status()
+        return f"Deleted {path} on {branch}"
+
+    def get_tree(self, repo: str, ref: str = "HEAD", recursive: bool = True) -> list[dict]:
+        """Get the full file tree of a repo (fast way to see all files)."""
+        data = self._get(
+            f"/repos/{repo}/git/trees/{ref}",
+            params={"recursive": "1"} if recursive else None,
+        )
+        return [
+            {"path": i["path"], "type": i["type"], "size": i.get("size", 0)}
+            for i in data.get("tree", [])
+            if i["type"] == "blob"
+        ]
+
+    def list_workflow_runs(self, repo: str, branch: str | None = None, limit: int = 5) -> list[dict]:
+        """List recent GitHub Actions workflow runs."""
+        params: dict = {"per_page": limit}
+        if branch:
+            params["branch"] = branch
+        data = self._get(f"/repos/{repo}/actions/runs", params=params)
+        return [
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "status": r["status"],
+                "conclusion": r["conclusion"],
+                "branch": r["head_branch"],
+                "url": r["html_url"],
+                "created_at": r["created_at"],
+            }
+            for r in data.get("workflow_runs", [])[:limit]
+        ]
+
+    def get_workflow_run(self, repo: str, run_id: int) -> dict:
+        """Get details of a specific workflow run."""
+        data = self._get(f"/repos/{repo}/actions/runs/{run_id}")
+        return {
+            "id": data["id"],
+            "name": data["name"],
+            "status": data["status"],
+            "conclusion": data["conclusion"],
+            "branch": data["head_branch"],
+            "url": data["html_url"],
+            "created_at": data["created_at"],
+        }
+
+    def get_workflow_run_logs(self, repo: str, run_id: int) -> str:
+        """Get the log output of a failed workflow run's jobs."""
+        jobs_data = self._get(f"/repos/{repo}/actions/runs/{run_id}/jobs")
+        output_lines = []
+        for job in jobs_data.get("jobs", []):
+            output_lines.append(f"Job: {job['name']} — {job['conclusion']}")
+            for step in job.get("steps", []):
+                if step.get("conclusion") == "failure":
+                    output_lines.append(f"  FAILED step: {step['name']}")
+        return "\n".join(output_lines) if output_lines else "No job details available."
+
+    def trigger_workflow(self, repo: str, workflow_id: str, ref: str = "main", inputs: dict | None = None) -> str:
+        """Trigger a workflow_dispatch event."""
+        payload: dict = {"ref": ref}
+        if inputs:
+            payload["inputs"] = inputs
+        resp = self.session.post(
+            f"{self.base}/repos/{repo}/actions/workflows/{workflow_id}/dispatches",
+            json=payload,
+        )
+        resp.raise_for_status()
+        return f"Workflow '{workflow_id}' triggered on {ref}"
+
+    def list_workflows(self, repo: str) -> list[dict]:
+        """List available workflows in a repo."""
+        data = self._get(f"/repos/{repo}/actions/workflows")
+        return [
+            {"id": w["id"], "name": w["name"], "path": w["path"], "state": w["state"]}
+            for w in data.get("workflows", [])
+        ]
+
+    def add_issue_comment(self, repo: str, number: int, body: str) -> dict:
+        """Add a comment to an issue or PR."""
+        data = self._post(f"/repos/{repo}/issues/{number}/comments", json={"body": body})
+        return {"id": data["id"], "url": data["html_url"]}
+
+    def get_pr_diff(self, repo: str, number: int) -> str:
+        """Get the diff of a pull request."""
+        resp = self.session.get(
+            f"{self.base}/repos/{repo}/pulls/{number}",
+            headers={"Accept": "application/vnd.github.v3.diff"},
+        )
+        resp.raise_for_status()
+        return resp.text[:15000]  # cap at 15k chars
+
 
 # ── Tool definitions for Claude's tool_use API ──────────────────────
 
@@ -281,6 +382,108 @@ GITHUB_TOOLS = [
             "required": [],
         },
     },
+    {
+        "name": "delete_file",
+        "description": "Delete a file from the repository.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to delete"},
+                "message": {"type": "string", "description": "Commit message"},
+                "branch": {"type": "string", "description": "Branch to delete from"},
+            },
+            "required": ["path", "message", "branch"],
+        },
+    },
+    {
+        "name": "get_tree",
+        "description": "Get the full file tree of the repository. Fast way to see all files and their sizes without browsing directory by directory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string", "description": "Branch or commit SHA (defaults to HEAD)"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "list_workflows",
+        "description": "List available GitHub Actions workflows in the repository.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "list_workflow_runs",
+        "description": "List recent GitHub Actions workflow runs (CI/CD). Check if tests/builds are passing.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "branch": {"type": "string", "description": "Filter by branch name"},
+                "limit": {"type": "integer", "default": 5},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_workflow_run",
+        "description": "Get details of a specific workflow run by ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "integer", "description": "The workflow run ID"},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "get_workflow_run_logs",
+        "description": "Get the failed step details from a workflow run. Use this to diagnose CI failures.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "integer", "description": "The workflow run ID"},
+            },
+            "required": ["run_id"],
+        },
+    },
+    {
+        "name": "trigger_workflow",
+        "description": "Trigger a GitHub Actions workflow (must support workflow_dispatch). Use this to run tests or CI after making changes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "workflow_id": {"type": "string", "description": "Workflow filename (e.g. 'ci.yml') or ID"},
+                "ref": {"type": "string", "description": "Branch to run on (defaults to main)", "default": "main"},
+            },
+            "required": ["workflow_id"],
+        },
+    },
+    {
+        "name": "add_issue_comment",
+        "description": "Add a comment to an issue or pull request.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "number": {"type": "integer", "description": "Issue or PR number"},
+                "body": {"type": "string", "description": "Comment body (markdown)"},
+            },
+            "required": ["number", "body"],
+        },
+    },
+    {
+        "name": "get_pr_diff",
+        "description": "Get the diff of a pull request. Use this to review changes.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "number": {"type": "integer", "description": "PR number"},
+            },
+            "required": ["number"],
+        },
+    },
 ]
 
 
@@ -328,6 +531,24 @@ def execute_tool(gh: GitHubClient, repo: str, tool_name: str, tool_input: dict) 
             result = gh.list_branches(repo)
         elif tool_name == "get_default_branch":
             result = gh.get_default_branch(repo)
+        elif tool_name == "delete_file":
+            result = gh.delete_file(repo, tool_input["path"], tool_input["message"], tool_input["branch"])
+        elif tool_name == "get_tree":
+            result = gh.get_tree(repo, tool_input.get("ref", "HEAD"))
+        elif tool_name == "list_workflows":
+            result = gh.list_workflows(repo)
+        elif tool_name == "list_workflow_runs":
+            result = gh.list_workflow_runs(repo, tool_input.get("branch"), tool_input.get("limit", 5))
+        elif tool_name == "get_workflow_run":
+            result = gh.get_workflow_run(repo, tool_input["run_id"])
+        elif tool_name == "get_workflow_run_logs":
+            result = gh.get_workflow_run_logs(repo, tool_input["run_id"])
+        elif tool_name == "trigger_workflow":
+            result = gh.trigger_workflow(repo, tool_input["workflow_id"], tool_input.get("ref", "main"))
+        elif tool_name == "add_issue_comment":
+            result = gh.add_issue_comment(repo, tool_input["number"], tool_input["body"])
+        elif tool_name == "get_pr_diff":
+            result = gh.get_pr_diff(repo, tool_input["number"])
         else:
             result = f"Unknown tool: {tool_name}"
 
