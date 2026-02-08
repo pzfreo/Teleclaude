@@ -1,6 +1,7 @@
 """Teleclaude - Chat with Claude on Telegram. Code against GitHub."""
 
 import asyncio
+import collections
 import datetime
 import json
 import logging
@@ -11,6 +12,7 @@ import time
 import anthropic
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -247,6 +249,35 @@ chat_todos: dict[int, list[dict]] = {}
 chat_plan_mode: dict[int, bool] = {}
 chat_agent_mode: dict[int, bool] = {}
 
+# Per-chat locks to prevent concurrent message handling corruption
+_chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
+
+
+async def _call_anthropic(**kwargs) -> anthropic.types.Message:
+    """Call Anthropic API with retry on transient errors (rate limit, overloaded).
+
+    Runs the synchronous SDK call in a thread to avoid blocking the event loop.
+    """
+    loop = asyncio.get_running_loop()
+    max_retries = 3
+    for attempt in range(max_retries + 1):
+        try:
+            return await loop.run_in_executor(None, lambda: api_client.messages.create(**kwargs))
+        except anthropic.RateLimitError:
+            if attempt < max_retries:
+                wait = 2 ** (attempt + 1)
+                logger.warning("Rate limited, retrying in %ds (attempt %d/%d)", wait, attempt + 1, max_retries)
+                await asyncio.sleep(wait)
+            else:
+                raise
+        except anthropic.InternalServerError:
+            if attempt < max_retries:
+                wait = 2 ** (attempt + 1)
+                logger.warning("API overloaded, retrying in %ds (attempt %d/%d)", wait, attempt + 1, max_retries)
+                await asyncio.sleep(wait)
+            else:
+                raise
+
 
 def get_model(chat_id: int) -> str:
     return chat_models.get(chat_id, DEFAULT_MODEL)
@@ -303,10 +334,32 @@ def get_active_repo(chat_id: int) -> str | None:
     return active_repos.get(chat_id)
 
 
+MAX_CONTENT_SIZE = 20000  # max chars per content string in history
+
+
+def _trim_content(content) -> any:
+    """Truncate oversized content blocks when reloading history."""
+    if isinstance(content, str) and len(content) > MAX_CONTENT_SIZE:
+        return content[:MAX_CONTENT_SIZE] + "\n... (truncated)"
+    if isinstance(content, list):
+        trimmed = []
+        for item in content:
+            if isinstance(item, dict):
+                item = dict(item)  # shallow copy
+                if isinstance(item.get("content"), str) and len(item["content"]) > MAX_CONTENT_SIZE:
+                    item["content"] = item["content"][:MAX_CONTENT_SIZE] + "\n... (truncated)"
+            trimmed.append(item)
+        return trimmed
+    return content
+
+
 def trim_history(chat_id: int) -> None:
     history = get_conversation(chat_id)
     if len(history) > MAX_HISTORY * 2:
         conversations[chat_id] = history[-(MAX_HISTORY * 2) :]
+    # Trim any oversized content blocks to prevent context bloat
+    for msg in conversations.get(chat_id, []):
+        msg["content"] = _trim_content(msg.get("content"))
 
 
 def save_state(chat_id: int) -> None:
@@ -314,20 +367,31 @@ def save_state(chat_id: int) -> None:
     save_conversation(chat_id, get_conversation(chat_id))
 
 
-async def send_long_message(update: Update, text: str) -> None:
+async def send_long_message(chat_id: int, text: str, bot) -> None:
     """Send a message, splitting if it exceeds Telegram's limit."""
+    if not text:
+        return
     for i in range(0, len(text), MAX_TELEGRAM_LENGTH):
-        await update.message.reply_text(text[i : i + MAX_TELEGRAM_LENGTH])
+        try:
+            await bot.send_message(chat_id=chat_id, text=text[i : i + MAX_TELEGRAM_LENGTH])
+        except TelegramError as e:
+            logger.warning("Failed to send message chunk to %d: %s", chat_id, e)
 
 
-async def keep_typing(chat, stop_event: asyncio.Event, start_time: float, update: Update):
+async def keep_typing(chat, stop_event: asyncio.Event, start_time: float, bot):
     """Keep the typing indicator alive and send progress messages."""
     progress_sent = False
     while not stop_event.is_set():
-        await chat.send_action("typing")
+        try:
+            await chat.send_action("typing")
+        except TelegramError:
+            pass  # chat may have been deleted or bot blocked
         elapsed = time.time() - start_time
         if elapsed > PROGRESS_INTERVAL and not progress_sent:
-            await update.message.reply_text("Still working on it...")
+            try:
+                await bot.send_message(chat_id=chat.id, text="Still working on it...")
+            except TelegramError:
+                pass
             progress_sent = True
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=TYPING_INTERVAL)
@@ -495,27 +559,36 @@ async def show_todos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 def _execute_tool_call(block, repo, chat_id) -> str:
     """Dispatch a single tool call to the right handler."""
-    if block.name == "update_todo_list":
-        todos = block.input.get("todos", [])
-        chat_todos[chat_id] = todos
-        save_todos(chat_id, todos)
-        return format_todo_list(todos)
-    if block.name == "web_search" and execute_web_tool:
-        return execute_web_tool(web_client, block.name, block.input)
-    elif block.name in _tasks_tool_names and execute_tasks_tool:
-        return execute_tasks_tool(tasks_client, block.name, block.input)
-    elif block.name in _calendar_tool_names and execute_calendar_tool:
-        return execute_calendar_tool(calendar_client, block.name, block.input)
-    elif block.name in _email_tool_names and execute_email_tool:
-        return execute_email_tool(email_client, block.name, block.input)
-    elif execute_github_tool:
-        return execute_github_tool(gh_client, repo, block.name, block.input)
-    return f"Tool '{block.name}' is not available."
+    try:
+        if block.name == "update_todo_list":
+            todos = block.input.get("todos", [])
+            chat_todos[chat_id] = todos
+            save_todos(chat_id, todos)
+            return format_todo_list(todos)
+        if block.name == "web_search" and execute_web_tool:
+            return execute_web_tool(web_client, block.name, block.input)
+        elif block.name in _tasks_tool_names and execute_tasks_tool:
+            return execute_tasks_tool(tasks_client, block.name, block.input)
+        elif block.name in _calendar_tool_names and execute_calendar_tool:
+            return execute_calendar_tool(calendar_client, block.name, block.input)
+        elif block.name in _email_tool_names and execute_email_tool:
+            return execute_email_tool(email_client, block.name, block.input)
+        elif execute_github_tool:
+            return execute_github_tool(gh_client, repo, block.name, block.input)
+        return f"Tool '{block.name}' is not available."
+    except Exception as e:
+        logger.error("Tool '%s' crashed: %s", block.name, e, exc_info=True)
+        return f"Tool error: {e}"
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
     if not is_authorized(update.effective_user.id):
-        await update.message.reply_text("Sorry, you're not authorized to use this bot.")
+        try:
+            await update.message.reply_text("Sorry, you're not authorized to use this bot.")
+        except TelegramError:
+            pass
         return
 
     chat_id = update.effective_chat.id
@@ -523,7 +596,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user_text:
         return
 
+    async with _chat_locks[chat_id]:
+        await _process_message(chat_id, user_text, update, context)
+
+
+async def _process_message(chat_id: int, user_text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Core message processing, runs under per-chat lock."""
+    bot = context.bot
     history = get_conversation(chat_id)
+    history_len_before = len(history)
     history.append({"role": "user", "content": user_text})
     trim_history(chat_id)
 
@@ -590,7 +671,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     stop_typing = asyncio.Event()
     start_time = time.time()
     typing_task = asyncio.create_task(
-        keep_typing(update.effective_chat, stop_typing, start_time, update)
+        keep_typing(update.effective_chat, stop_typing, start_time, bot)
     )
 
     try:
@@ -608,7 +689,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if agent_mode:
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
 
-            response = api_client.messages.create(**kwargs)
+            response = await _call_anthropic(**kwargs)
 
             if response.stop_reason != "tool_use":
                 text_parts = [b.text for b in response.content if b.type == "text"]
@@ -617,7 +698,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 save_state(chat_id)
                 stop_typing.set()
                 await typing_task
-                await send_long_message(update, reply)
+                await send_long_message(chat_id, reply, bot)
                 return
 
             # Tool use round
@@ -640,22 +721,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         stop_typing.set()
         await typing_task
-        await update.message.reply_text("(Reached tool call limit. Send another message to continue.)")
+        await send_long_message(chat_id, "(Reached tool call limit. Send another message to continue.)", bot)
 
     except anthropic.APIError as e:
         logger.error("Anthropic API error: %s", e)
-        history.pop()
+        # Roll back all messages added during this request
+        conversations[chat_id] = history[:history_len_before]
         save_state(chat_id)
         stop_typing.set()
         await typing_task
-        await update.message.reply_text(f"Claude API error: {e.message}")
+        msg = f"Claude API error: {getattr(e, 'message', str(e))}"
+        await send_long_message(chat_id, msg, bot)
     except Exception as e:
         logger.error("Unexpected error: %s", e, exc_info=True)
-        history.pop()
+        # Roll back all messages added during this request
+        conversations[chat_id] = history[:history_len_before]
         save_state(chat_id)
         stop_typing.set()
         await typing_task
-        await update.message.reply_text("Something went wrong. Please try again.")
+        await send_long_message(chat_id, "Something went wrong. Please try again.", bot)
 
 
 async def generate_briefing(bot, chat_id: int) -> None:
@@ -690,7 +774,7 @@ async def generate_briefing(bot, chat_id: int) -> None:
     messages = [{"role": "user", "content": briefing_prompt}]
 
     for _ in range(10):
-        response = api_client.messages.create(
+        response = await _call_anthropic(
             model=DEFAULT_MODEL,
             max_tokens=2048,
             system="You are Teleclaude generating a daily briefing. Be concise and useful.",
@@ -701,20 +785,22 @@ async def generate_briefing(bot, chat_id: int) -> None:
         if response.stop_reason != "tool_use":
             text_parts = [b.text for b in response.content if b.type == "text"]
             reply = "\n".join(text_parts) if text_parts else "No briefing available."
-            for i in range(0, len(reply), MAX_TELEGRAM_LENGTH):
-                await bot.send_message(chat_id=chat_id, text=reply[i : i + MAX_TELEGRAM_LENGTH])
+            await send_long_message(chat_id, reply, bot)
             return
 
         messages.append({"role": "assistant", "content": response.content})
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
-                if block.name in _tasks_tool_names and execute_tasks_tool:
-                    result = execute_tasks_tool(tasks_client, block.name, block.input)
-                elif block.name in _calendar_tool_names and execute_calendar_tool:
-                    result = execute_calendar_tool(calendar_client, block.name, block.input)
-                else:
-                    result = f"Tool '{block.name}' not available for briefing."
+                try:
+                    if block.name in _tasks_tool_names and execute_tasks_tool:
+                        result = execute_tasks_tool(tasks_client, block.name, block.input)
+                    elif block.name in _calendar_tool_names and execute_calendar_tool:
+                        result = execute_calendar_tool(calendar_client, block.name, block.input)
+                    else:
+                        result = f"Tool '{block.name}' not available for briefing."
+                except Exception as e:
+                    result = f"Tool error: {e}"
                 tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
         messages.append({"role": "user", "content": tool_results})
 
