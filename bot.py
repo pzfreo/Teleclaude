@@ -40,7 +40,13 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+
+AVAILABLE_MODELS = {
+    "opus": "claude-opus-4-20250514",
+    "sonnet": "claude-sonnet-4-20250514",
+    "haiku": "claude-haiku-4-5-20251001",
+}
 
 if not TELEGRAM_BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN is not set. Bot cannot start.")
@@ -183,6 +189,11 @@ _email_tool_names = {t["name"] for t in EMAIL_TOOLS}
 # In-memory cache (backed by SQLite)
 conversations: dict[int, list] = {}
 active_repos: dict[int, str] = {}
+chat_models: dict[int, str] = {}
+
+
+def get_model(chat_id: int) -> str:
+    return chat_models.get(chat_id, DEFAULT_MODEL)
 
 
 def is_authorized(user_id: int) -> bool:
@@ -259,7 +270,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/repo owner/name - Set the active GitHub repo\n"
         "/repo - Show current repo\n"
         "/new - Start a fresh conversation\n"
-        "/model - Show current Claude model\n"
+        "/model - Show or switch Claude model (opus/sonnet/haiku)\n"
         "/help - Show this message\n\n"
         f"{status}"
     )
@@ -309,7 +320,36 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
-    await update.message.reply_text(f"Current model: {CLAUDE_MODEL}")
+
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+        model = get_model(chat_id)
+        shortcuts = ", ".join(AVAILABLE_MODELS.keys())
+        await update.message.reply_text(
+            f"Current model: {model}\n\n"
+            f"Switch with: /model <name>\n"
+            f"Shortcuts: {shortcuts}\n"
+            f"Or use a full model ID, e.g. /model claude-sonnet-4-20250514"
+        )
+        return
+
+    choice = context.args[0].lower().strip()
+
+    if choice in AVAILABLE_MODELS:
+        model_id = AVAILABLE_MODELS[choice]
+    elif choice.startswith("claude-"):
+        model_id = choice
+    else:
+        shortcuts = "\n".join(f"  {k} → {v}" for k, v in AVAILABLE_MODELS.items())
+        await update.message.reply_text(
+            f"Unknown model: {choice}\n\nAvailable shortcuts:\n{shortcuts}\n\n"
+            f"Or use a full model ID starting with claude-"
+        )
+        return
+
+    chat_models[chat_id] = model_id
+    await update.message.reply_text(f"Model switched to: {model_id}")
 
 
 def _execute_tool_call(block, repo) -> str:
@@ -368,7 +408,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         for round_num in range(MAX_TOOL_ROUNDS):
             kwargs = {
-                "model": CLAUDE_MODEL,
+                "model": get_model(chat_id),
                 "max_tokens": 4096,
                 "system": system,
                 "messages": history,
@@ -446,7 +486,7 @@ async def notify_startup(app: Application) -> None:
 
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     enabled = ", ".join(integrations) if integrations else "none"
-    msg = f"Teleclaude restarted at {now}\nModel: {CLAUDE_MODEL}\nIntegrations: {enabled}"
+    msg = f"Teleclaude restarted at {now}\nModel: {DEFAULT_MODEL}\nIntegrations: {enabled}"
 
     for user_id in ALLOWED_USER_IDS:
         try:
@@ -472,7 +512,7 @@ def main() -> None:
 
     logger.info(
         "Teleclaude started — model: %s | github: %s | search: %s | tasks: %s | calendar: %s | email: %s",
-        CLAUDE_MODEL,
+        DEFAULT_MODEL,
         "on" if gh_client else "off",
         "on" if web_client else "off",
         "on" if tasks_client else "off",
