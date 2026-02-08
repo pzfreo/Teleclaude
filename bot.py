@@ -1,5 +1,6 @@
-"""Teleclaude - A Telegram bot that connects you to Claude."""
+"""Teleclaude - Chat with Claude on Telegram. Code against GitHub."""
 
+import json
 import logging
 import os
 from collections import defaultdict
@@ -15,6 +16,8 @@ from telegram.ext import (
     filters,
 )
 
+from github_tools import GITHUB_TOOLS, GitHubClient, execute_tool
+
 load_dotenv()
 
 logging.basicConfig(
@@ -25,57 +28,108 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    "You are a helpful assistant responding via Telegram. Keep responses concise but thorough.",
-)
+
+SYSTEM_PROMPT = """You are Teleclaude, a coding assistant on Telegram with access to GitHub.
+
+When the user sets a repo with /repo, you can read files, edit code, create branches, and open PRs.
+
+Guidelines:
+- Always read existing files before modifying them.
+- Create a feature branch for changes — never commit directly to main.
+- Write clear commit messages.
+- When making multiple file changes, do them on the same branch, then open a single PR.
+- Keep Telegram responses concise. Use code blocks for short snippets only.
+- If no repo is set, you can still chat normally."""
+
 ALLOWED_USER_IDS: set[int] = set()
 for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
     uid = uid.strip()
     if uid.isdigit():
         ALLOWED_USER_IDS.add(int(uid))
 
-MAX_HISTORY = 50  # max message pairs to keep per conversation
+MAX_HISTORY = 50
 MAX_TELEGRAM_LENGTH = 4096
+MAX_TOOL_ROUNDS = 15
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+gh_client = GitHubClient(GITHUB_TOKEN) if GITHUB_TOKEN else None
 
-# conversation history keyed by chat_id
+# Per-chat state
 conversations: dict[int, list[dict]] = defaultdict(list)
+active_repos: dict[int, str] = {}  # chat_id -> "owner/repo"
 
 
 def is_authorized(user_id: int) -> bool:
-    """Check if a user is authorized to use the bot."""
     if not ALLOWED_USER_IDS:
         return True
     return user_id in ALLOWED_USER_IDS
 
 
 def trim_history(chat_id: int) -> None:
-    """Keep conversation history within limits."""
     history = conversations[chat_id]
     if len(history) > MAX_HISTORY * 2:
         conversations[chat_id] = history[-(MAX_HISTORY * 2) :]
 
 
+async def send_long_message(update: Update, text: str) -> None:
+    """Send a message, splitting if it exceeds Telegram's limit."""
+    for i in range(0, len(text), MAX_TELEGRAM_LENGTH):
+        await update.message.reply_text(text[i : i + MAX_TELEGRAM_LENGTH])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start command."""
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Sorry, you're not authorized to use this bot.")
         return
+
+    github_status = "connected" if gh_client else "not configured (set GITHUB_TOKEN)"
     await update.message.reply_text(
-        "Hello! I'm Teleclaude — a bridge to Claude.\n\n"
-        "Just send me a message and I'll forward it to Claude and relay the response.\n\n"
+        "Hello! I'm Teleclaude — Claude on Telegram with GitHub integration.\n\n"
         "Commands:\n"
+        "/repo owner/name - Set the active GitHub repo\n"
+        "/repo - Show current repo\n"
         "/new - Start a fresh conversation\n"
         "/model - Show current Claude model\n"
-        "/help - Show this message"
+        "/help - Show this message\n\n"
+        f"GitHub: {github_status}"
     )
 
 
+async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+        repo = active_repos.get(chat_id)
+        if repo:
+            await update.message.reply_text(f"Active repo: {repo}")
+        else:
+            await update.message.reply_text("No repo set. Use: /repo owner/name")
+        return
+
+    repo = context.args[0]
+    if "/" not in repo or len(repo.split("/")) != 2:
+        await update.message.reply_text("Format: /repo owner/name (e.g. /repo pzfreo/Teleclaude)")
+        return
+
+    if not gh_client:
+        await update.message.reply_text("GitHub not configured. Set GITHUB_TOKEN in environment.")
+        return
+
+    # Verify the repo is accessible
+    try:
+        default_branch = gh_client.get_default_branch(repo)
+        active_repos[chat_id] = repo
+        await update.message.reply_text(f"Active repo set to: {repo} (default branch: {default_branch})")
+    except Exception as e:
+        await update.message.reply_text(f"Can't access {repo}: {e}")
+
+
 async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /new command - clear conversation history."""
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
@@ -84,71 +138,97 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /model command."""
     if not is_authorized(update.effective_user.id):
         return
     await update.message.reply_text(f"Current model: {CLAUDE_MODEL}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle incoming text messages by sending them to Claude."""
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Sorry, you're not authorized to use this bot.")
         return
 
     chat_id = update.effective_chat.id
     user_text = update.message.text
-
     if not user_text:
         return
 
-    # Add user message to history
     conversations[chat_id].append({"role": "user", "content": user_text})
     trim_history(chat_id)
 
-    # Show typing indicator
+    repo = active_repos.get(chat_id)
+    tools = GITHUB_TOOLS if (repo and gh_client) else []
+
+    system = SYSTEM_PROMPT
+    if repo:
+        system += f"\n\nActive repository: {repo}"
+
     await update.effective_chat.send_action("typing")
 
     try:
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=conversations[chat_id],
-        )
-        reply = response.content[0].text
+        # Tool-use loop: Claude may call tools multiple times
+        for _ in range(MAX_TOOL_ROUNDS):
+            kwargs = {
+                "model": CLAUDE_MODEL,
+                "max_tokens": 4096,
+                "system": system,
+                "messages": conversations[chat_id],
+            }
+            if tools:
+                kwargs["tools"] = tools
+
+            response = client.messages.create(**kwargs)
+
+            # If Claude doesn't want to use tools, we're done
+            if response.stop_reason != "tool_use":
+                # Extract text from response
+                text_parts = [b.text for b in response.content if b.type == "text"]
+                reply = "\n".join(text_parts) if text_parts else "(no response)"
+                conversations[chat_id].append({"role": "assistant", "content": response.content})
+                await send_long_message(update, reply)
+                return
+
+            # Claude wants to use tools — execute them
+            conversations[chat_id].append({"role": "assistant", "content": response.content})
+
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    logger.info("Tool call: %s(%s)", block.name, json.dumps(block.input)[:200])
+                    result = execute_tool(gh_client, repo, block.name, block.input)
+                    # Truncate large results to avoid blowing up context
+                    if len(result) > 10000:
+                        result = result[:10000] + "\n... (truncated)"
+                    tool_results.append(
+                        {"type": "tool_result", "tool_use_id": block.id, "content": result}
+                    )
+
+            conversations[chat_id].append({"role": "user", "content": tool_results})
+            await update.effective_chat.send_action("typing")
+
+        await update.message.reply_text("(Reached tool call limit. Send another message to continue.)")
+
     except anthropic.APIError as e:
         logger.error("Anthropic API error: %s", e)
-        # Remove the failed user message from history
         conversations[chat_id].pop()
         await update.message.reply_text(f"Claude API error: {e.message}")
-        return
     except Exception as e:
-        logger.error("Unexpected error: %s", e)
+        logger.error("Unexpected error: %s", e, exc_info=True)
         conversations[chat_id].pop()
         await update.message.reply_text("Something went wrong. Please try again.")
-        return
-
-    # Add assistant response to history
-    conversations[chat_id].append({"role": "assistant", "content": reply})
-
-    # Split long messages to stay within Telegram's limit
-    for i in range(0, len(reply), MAX_TELEGRAM_LENGTH):
-        chunk = reply[i : i + MAX_TELEGRAM_LENGTH]
-        await update.message.reply_text(chunk)
 
 
 def main() -> None:
-    """Start the bot."""
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("repo", set_repo))
     app.add_handler(CommandHandler("new", new_conversation))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Teleclaude bot started (model: %s)", CLAUDE_MODEL)
+    logger.info("Teleclaude bot started (model: %s, github: %s)", CLAUDE_MODEL, bool(gh_client))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
