@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import sys
 from collections import defaultdict
 
 import anthropic
@@ -16,10 +17,6 @@ from telegram.ext import (
     filters,
 )
 
-from github_tools import GITHUB_TOOLS, GitHubClient, execute_tool as execute_github_tool
-from web_tools import WEB_TOOLS, WebSearchClient, execute_tool as execute_web_tool
-from tasks_tools import TASKS_TOOLS, GoogleTasksClient, execute_tool as execute_tasks_tool
-
 load_dotenv()
 
 logging.basicConfig(
@@ -28,13 +25,74 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
-GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "")
+# ── Required config ──────────────────────────────────────────────────
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+
+if not TELEGRAM_BOT_TOKEN:
+    logger.error("TELEGRAM_BOT_TOKEN is not set. Bot cannot start.")
+    sys.exit(1)
+
+if not ANTHROPIC_API_KEY:
+    logger.error("ANTHROPIC_API_KEY is not set. Bot cannot start.")
+    sys.exit(1)
+
+# ── Optional integrations (each loads gracefully) ────────────────────
+
+# GitHub
+gh_client = None
+GITHUB_TOOLS = []
+execute_github_tool = None
+try:
+    from github_tools import GITHUB_TOOLS, GitHubClient, execute_tool as _execute_github
+    token = os.getenv("GITHUB_TOKEN", "")
+    if token:
+        gh_client = GitHubClient(token)
+        execute_github_tool = _execute_github
+        logger.info("GitHub integration: enabled")
+    else:
+        GITHUB_TOOLS = []
+        logger.info("GitHub integration: disabled (no GITHUB_TOKEN)")
+except Exception as e:
+    logger.warning("GitHub integration: failed to load (%s)", e)
+    GITHUB_TOOLS = []
+
+# Web search
+web_client = None
+WEB_TOOLS = []
+execute_web_tool = None
+try:
+    from web_tools import WEB_TOOLS, WebSearchClient, execute_tool as _execute_web
+    web_client = WebSearchClient()
+    execute_web_tool = _execute_web
+    logger.info("Web search: enabled")
+except Exception as e:
+    logger.warning("Web search: failed to load (%s)", e)
+    WEB_TOOLS = []
+
+# Google Tasks
+tasks_client = None
+TASKS_TOOLS = []
+execute_tasks_tool = None
+try:
+    from tasks_tools import TASKS_TOOLS, GoogleTasksClient, execute_tool as _execute_tasks
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN", "")
+    if client_id and client_secret and refresh_token:
+        tasks_client = GoogleTasksClient(client_id, client_secret, refresh_token)
+        execute_tasks_tool = _execute_tasks
+        logger.info("Google Tasks: enabled")
+    else:
+        TASKS_TOOLS = []
+        logger.info("Google Tasks: disabled (missing GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, or GOOGLE_REFRESH_TOKEN)")
+except Exception as e:
+    logger.warning("Google Tasks: failed to load (%s)", e)
+    TASKS_TOOLS = []
+
+# ── Bot config ───────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are Teleclaude, a coding assistant on Telegram with access to GitHub.
 
@@ -61,13 +119,9 @@ MAX_TELEGRAM_LENGTH = 4096
 MAX_TOOL_ROUNDS = 15
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-gh_client = GitHubClient(GITHUB_TOKEN) if GITHUB_TOKEN else None
-web_client = WebSearchClient()
-tasks_client = (
-    GoogleTasksClient(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN)
-    if GOOGLE_REFRESH_TOKEN
-    else None
-)
+
+# Build set of task tool names for dispatch
+_tasks_tool_names = {t["name"] for t in TASKS_TOOLS}
 
 # Per-chat state
 conversations: dict[int, list[dict]] = defaultdict(list)
@@ -97,19 +151,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Sorry, you're not authorized to use this bot.")
         return
 
-    github_status = "connected" if gh_client else "not configured (set GITHUB_TOKEN)"
-    tasks_status = "connected" if tasks_client else "not configured (run setup_google.py)"
+    status_lines = []
+    status_lines.append(f"GitHub: {'enabled' if gh_client else 'not configured'}")
+    status_lines.append(f"Web search: {'enabled' if web_client else 'not configured'}")
+    status_lines.append(f"Google Tasks: {'enabled' if tasks_client else 'not configured'}")
+    status = "\n".join(status_lines)
+
     await update.message.reply_text(
-        "Hello! I'm Teleclaude — Claude on Telegram with GitHub, web search, and Google Tasks.\n\n"
+        "Hello! I'm Teleclaude — Claude on Telegram.\n\n"
         "Commands:\n"
         "/repo owner/name - Set the active GitHub repo\n"
         "/repo - Show current repo\n"
         "/new - Start a fresh conversation\n"
         "/model - Show current Claude model\n"
         "/help - Show this message\n\n"
-        f"GitHub: {github_status}\n"
-        f"Google Tasks: {tasks_status}\n"
-        "Web search: enabled"
+        f"{status}"
     )
 
 
@@ -176,7 +232,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     tools = []
     if repo and gh_client:
         tools.extend(GITHUB_TOOLS)
-    tools.extend(WEB_TOOLS)
+    if web_client:
+        tools.extend(WEB_TOOLS)
     if tasks_client:
         tools.extend(TASKS_TOOLS)
 
@@ -216,12 +273,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             for block in response.content:
                 if block.type == "tool_use":
                     logger.info("Tool call: %s(%s)", block.name, json.dumps(block.input)[:200])
-                    if block.name == "web_search":
+                    if block.name == "web_search" and execute_web_tool:
                         result = execute_web_tool(web_client, block.name, block.input)
-                    elif block.name in {t["name"] for t in TASKS_TOOLS}:
+                    elif block.name in _tasks_tool_names and execute_tasks_tool:
                         result = execute_tasks_tool(tasks_client, block.name, block.input)
-                    else:
+                    elif execute_github_tool:
                         result = execute_github_tool(gh_client, repo, block.name, block.input)
+                    else:
+                        result = f"Tool '{block.name}' is not available."
                     # Truncate large results to avoid blowing up context
                     if len(result) > 10000:
                         result = result[:10000] + "\n... (truncated)"
@@ -254,7 +313,13 @@ def main() -> None:
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Teleclaude bot started (model: %s, github: %s, search: %s, tasks: %s)", CLAUDE_MODEL, bool(gh_client), bool(web_client), bool(tasks_client))
+    logger.info(
+        "Teleclaude started — model: %s | github: %s | search: %s | tasks: %s",
+        CLAUDE_MODEL,
+        "on" if gh_client else "off",
+        "on" if web_client else "off",
+        "on" if tasks_client else "off",
+    )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
