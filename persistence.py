@@ -41,8 +41,20 @@ def init_db() -> None:
         );
         """
     )
+    # Migrations for existing databases
+    _migrate(conn)
     conn.close()
     logger.info("Database initialized at %s", DB_PATH)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns that may not exist in older databases."""
+    cursor = conn.execute("PRAGMA table_info(chat_modes)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "agent_mode" not in columns:
+        conn.execute("ALTER TABLE chat_modes ADD COLUMN agent_mode INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+        logger.info("Migrated chat_modes: added agent_mode column")
 
 
 def load_conversation(chat_id: int) -> list[dict]:
