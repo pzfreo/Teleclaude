@@ -33,12 +33,22 @@ Optional settings in `.env`:
 - `SYSTEM_PROMPT` — customize Claude's behavior
 - `ALLOWED_USER_IDS` — comma-separated Telegram user IDs to restrict access (empty = allow all)
 
-### 4. Install and Run
+### 4. Run Locally
 
 ```bash
 pip install -r requirements.txt
 python bot.py
 ```
+
+## Deploy to Railway
+
+1. Push this repo to GitHub
+2. Go to [railway.app](https://railway.app) and create a new project from your repo
+3. Add environment variables in the Railway dashboard:
+   - `TELEGRAM_BOT_TOKEN`
+   - `ANTHROPIC_API_KEY`
+   - (and any optional ones from `.env.example`)
+4. Railway will auto-detect the `Procfile` and deploy
 
 ## Usage
 
