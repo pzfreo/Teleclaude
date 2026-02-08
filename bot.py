@@ -158,6 +158,7 @@ except Exception as e:
 # ── Bot config ───────────────────────────────────────────────────────
 
 USER_TIMEZONE = os.getenv("TIMEZONE", "UTC")
+DAILY_BRIEFING_TIME = os.getenv("DAILY_BRIEFING_TIME", "")  # e.g. "08:00"
 
 SYSTEM_PROMPT = """You are Teleclaude, a personal AI assistant on Telegram. You help with coding, productivity, and daily tasks.
 
@@ -358,6 +359,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/plan - Toggle plan mode (outline before executing)\n"
         "/agent - Toggle agent mode (autonomous + extended thinking)\n"
         "/todo - Show current task list (/todo clear to reset)\n"
+        "/briefing - Get a daily summary of calendar + tasks\n"
         "/help - Show this message\n\n"
         f"{status}"
     )
@@ -656,6 +658,91 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Something went wrong. Please try again.")
 
 
+async def generate_briefing(bot, chat_id: int) -> None:
+    """Generate and send a daily briefing using Claude with available tools."""
+    tools = []
+    if tasks_client:
+        tools.extend(TASKS_TOOLS)
+    if calendar_client:
+        tools.extend(CALENDAR_TOOLS)
+
+    if not tools:
+        await bot.send_message(chat_id=chat_id, text="No calendar or tasks configured — nothing to brief on.")
+        return
+
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(USER_TIMEZONE)
+    except Exception:
+        tz = datetime.timezone.utc
+    now = datetime.datetime.now(tz)
+
+    briefing_prompt = (
+        f"Today is {now.strftime('%A, %B %d, %Y')} ({USER_TIMEZONE}).\n\n"
+        "Give me a concise morning briefing. Check my calendar for today's events "
+        "and my task list for pending items. Format it as:\n"
+        "- A quick summary line (e.g. '3 events, 5 tasks')\n"
+        "- Today's schedule in chronological order\n"
+        "- Top pending tasks\n"
+        "Keep it short and scannable for a phone screen."
+    )
+
+    messages = [{"role": "user", "content": briefing_prompt}]
+
+    for _ in range(10):
+        response = api_client.messages.create(
+            model=DEFAULT_MODEL,
+            max_tokens=2048,
+            system="You are Teleclaude generating a daily briefing. Be concise and useful.",
+            messages=messages,
+            tools=tools,
+        )
+
+        if response.stop_reason != "tool_use":
+            text_parts = [b.text for b in response.content if b.type == "text"]
+            reply = "\n".join(text_parts) if text_parts else "No briefing available."
+            for i in range(0, len(reply), MAX_TELEGRAM_LENGTH):
+                await bot.send_message(chat_id=chat_id, text=reply[i : i + MAX_TELEGRAM_LENGTH])
+            return
+
+        messages.append({"role": "assistant", "content": response.content})
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                if block.name in _tasks_tool_names and execute_tasks_tool:
+                    result = execute_tasks_tool(tasks_client, block.name, block.input)
+                elif block.name in _calendar_tool_names and execute_calendar_tool:
+                    result = execute_calendar_tool(calendar_client, block.name, block.input)
+                else:
+                    result = f"Tool '{block.name}' not available for briefing."
+                tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
+        messages.append({"role": "user", "content": tool_results})
+
+    await bot.send_message(chat_id=chat_id, text="Briefing generation hit tool limit.")
+
+
+async def scheduled_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job callback for the daily scheduled briefing."""
+    for user_id in ALLOWED_USER_IDS:
+        try:
+            await generate_briefing(context.bot, user_id)
+        except Exception as e:
+            logger.warning("Failed to send briefing to %d: %s", user_id, e)
+
+
+async def trigger_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manual /briefing command."""
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("Generating briefing...")
+    try:
+        await generate_briefing(context.bot, chat_id)
+    except Exception as e:
+        logger.error("Briefing error: %s", e, exc_info=True)
+        await update.message.reply_text(f"Briefing failed: {e}")
+
+
 async def notify_startup(app: Application) -> None:
     """Send a startup message to all allowed users."""
     if not ALLOWED_USER_IDS:
@@ -699,7 +786,22 @@ def main() -> None:
     app.add_handler(CommandHandler("plan", toggle_plan))
     app.add_handler(CommandHandler("agent", toggle_agent))
     app.add_handler(CommandHandler("todo", show_todos))
+    app.add_handler(CommandHandler("briefing", trigger_briefing))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Schedule daily briefing
+    if DAILY_BRIEFING_TIME and ALLOWED_USER_IDS:
+        try:
+            import zoneinfo
+            tz = zoneinfo.ZoneInfo(USER_TIMEZONE)
+        except Exception:
+            tz = datetime.timezone.utc
+        hour, minute = (int(x) for x in DAILY_BRIEFING_TIME.split(":"))
+        briefing_time = datetime.time(hour=hour, minute=minute, tzinfo=tz)
+        app.job_queue.run_daily(scheduled_briefing, time=briefing_time)
+        logger.info("Daily briefing scheduled at %s %s", DAILY_BRIEFING_TIME, USER_TIMEZONE)
+    elif DAILY_BRIEFING_TIME:
+        logger.info("Daily briefing configured but no ALLOWED_USER_IDS set — skipping")
 
     app.post_init = notify_startup
 
