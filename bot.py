@@ -16,7 +16,8 @@ from telegram.ext import (
     filters,
 )
 
-from github_tools import GITHUB_TOOLS, GitHubClient, execute_tool
+from github_tools import GITHUB_TOOLS, GitHubClient, execute_tool as execute_github_tool
+from web_tools import WEB_TOOLS, WebSearchClient, execute_tool as execute_web_tool
 
 load_dotenv()
 
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
 SYSTEM_PROMPT = """You are Teleclaude, a coding assistant on Telegram with access to GitHub.
@@ -41,7 +43,8 @@ Guidelines:
 - Write clear commit messages.
 - When making multiple file changes, do them on the same branch, then open a single PR.
 - Keep Telegram responses concise. Use code blocks for short snippets only.
-- If no repo is set, you can still chat normally."""
+- If no repo is set, you can still chat normally.
+- Use web search to look up documentation, error messages, or current information when needed.
 
 ALLOWED_USER_IDS: set[int] = set()
 for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
@@ -55,6 +58,7 @@ MAX_TOOL_ROUNDS = 15
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 gh_client = GitHubClient(GITHUB_TOKEN) if GITHUB_TOKEN else None
+web_client = WebSearchClient(TAVILY_API_KEY) if TAVILY_API_KEY else None
 
 # Per-chat state
 conversations: dict[int, list[dict]] = defaultdict(list)
@@ -85,15 +89,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     github_status = "connected" if gh_client else "not configured (set GITHUB_TOKEN)"
+    search_status = "connected" if web_client else "not configured (set TAVILY_API_KEY)"
     await update.message.reply_text(
-        "Hello! I'm Teleclaude — Claude on Telegram with GitHub integration.\n\n"
+        "Hello! I'm Teleclaude — Claude on Telegram with GitHub and web search.\n\n"
         "Commands:\n"
         "/repo owner/name - Set the active GitHub repo\n"
         "/repo - Show current repo\n"
         "/new - Start a fresh conversation\n"
         "/model - Show current Claude model\n"
         "/help - Show this message\n\n"
-        f"GitHub: {github_status}"
+        f"GitHub: {github_status}\n"
+        f"Web search: {search_status}"
     )
 
 
@@ -157,7 +163,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     trim_history(chat_id)
 
     repo = active_repos.get(chat_id)
-    tools = GITHUB_TOOLS if (repo and gh_client) else []
+    tools = []
+    if repo and gh_client:
+        tools.extend(GITHUB_TOOLS)
+    if web_client:
+        tools.extend(WEB_TOOLS)
 
     system = SYSTEM_PROMPT
     if repo:
@@ -195,7 +205,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             for block in response.content:
                 if block.type == "tool_use":
                     logger.info("Tool call: %s(%s)", block.name, json.dumps(block.input)[:200])
-                    result = execute_tool(gh_client, repo, block.name, block.input)
+                    if block.name == "web_search":
+                        result = execute_web_tool(web_client, block.name, block.input)
+                    else:
+                        result = execute_github_tool(gh_client, repo, block.name, block.input)
                     # Truncate large results to avoid blowing up context
                     if len(result) > 10000:
                         result = result[:10000] + "\n... (truncated)"
@@ -228,7 +241,7 @@ def main() -> None:
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Teleclaude bot started (model: %s, github: %s)", CLAUDE_MODEL, bool(gh_client))
+    logger.info("Teleclaude bot started (model: %s, github: %s, search: %s)", CLAUDE_MODEL, bool(gh_client), bool(web_client))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
