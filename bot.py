@@ -329,9 +329,10 @@ def is_authorized(user_id: int) -> bool:
 
 
 def get_conversation(chat_id: int) -> list:
-    """Get conversation from cache or load from DB."""
+    """Get conversation from cache or load from DB (sanitized)."""
     if chat_id not in conversations:
-        conversations[chat_id] = load_conversation(chat_id)
+        loaded = load_conversation(chat_id)
+        conversations[chat_id] = _sanitize_history(loaded)
     return conversations[chat_id]
 
 
@@ -378,11 +379,74 @@ def _trim_content(content, keep_images: bool = True) -> any:
 _KEEP_IMAGES_LAST_N = 10
 
 
+def _sanitize_history(history: list[dict]) -> list[dict]:
+    """Ensure history is valid for the Anthropic API.
+
+    - Every tool_use block must have a matching tool_result in the next message.
+    - History must start with a user message.
+    - Remove thinking blocks (they cause issues when sent back).
+    """
+    if not history:
+        return history
+
+    # Strip thinking blocks from assistant content (they can't be replayed)
+    for msg in history:
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
+            msg["content"] = [
+                b for b in msg["content"]
+                if not (isinstance(b, dict) and b.get("type") == "thinking")
+            ]
+
+    # Walk backwards and remove orphaned tool_use/tool_result pairs
+    sanitized = []
+    i = 0
+    while i < len(history):
+        msg = history[i]
+
+        # Check if this assistant message has tool_use blocks
+        if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
+            tool_use_ids = {
+                b["id"] for b in msg["content"]
+                if isinstance(b, dict) and b.get("type") == "tool_use" and "id" in b
+            }
+
+            if tool_use_ids:
+                # There must be a next message with matching tool_results
+                if i + 1 < len(history):
+                    next_msg = history[i + 1]
+                    if next_msg.get("role") == "user" and isinstance(next_msg.get("content"), list):
+                        result_ids = {
+                            b.get("tool_use_id") for b in next_msg["content"]
+                            if isinstance(b, dict) and b.get("type") == "tool_result"
+                        }
+                        if tool_use_ids <= result_ids:
+                            # Pair is complete, keep both
+                            sanitized.append(msg)
+                            sanitized.append(next_msg)
+                            i += 2
+                            continue
+                # Pair is broken — skip the assistant message (and orphaned results if any)
+                logger.warning("Dropping orphaned tool_use message at index %d", i)
+                i += 1
+                continue
+
+        sanitized.append(msg)
+        i += 1
+
+    # Ensure history starts with a user message
+    while sanitized and sanitized[0].get("role") != "user":
+        sanitized.pop(0)
+
+    return sanitized
+
+
 def trim_history(chat_id: int) -> None:
     history = get_conversation(chat_id)
     if len(history) > MAX_HISTORY * 2:
         conversations[chat_id] = history[-(MAX_HISTORY * 2) :]
-    msgs = conversations.get(chat_id, [])
+    # Sanitize to fix any broken tool_use/tool_result pairs
+    conversations[chat_id] = _sanitize_history(conversations.get(chat_id, []))
+    msgs = conversations[chat_id]
     cutoff = max(0, len(msgs) - _KEEP_IMAGES_LAST_N)
     for i, msg in enumerate(msgs):
         msg["content"] = _trim_content(msg.get("content"), keep_images=(i >= cutoff))
