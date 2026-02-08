@@ -157,23 +157,35 @@ except Exception as e:
 
 # ── Bot config ───────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are Teleclaude, a coding assistant on Telegram with access to GitHub.
+USER_TIMEZONE = os.getenv("TIMEZONE", "UTC")
 
-When the user sets a repo with /repo, you can read files, edit code, create branches, and open PRs.
+SYSTEM_PROMPT = """You are Teleclaude, a personal AI assistant on Telegram. You help with coding, productivity, and daily tasks.
 
-Guidelines:
+You have access to: GitHub (code, issues, PRs, CI), web search, Google Tasks, Google Calendar, and Gmail (send only).
+
+Coding guidelines:
 - Always read existing files before modifying them.
 - Create a feature branch for changes — never commit directly to main.
 - Write clear commit messages.
 - When making multiple file changes, do them on the same branch, then open a single PR.
-- Keep Telegram responses concise. Use code blocks for short snippets only.
-- If no repo is set, you can still chat normally.
-- Use web search to look up documentation, error messages, or current information when needed.
+
+Communication guidelines:
+- Keep Telegram responses concise — this is a phone screen, not a desktop.
+- Use short paragraphs. Avoid walls of text.
+- Use code blocks sparingly — only for short snippets.
+- When listing items, prefer compact formats.
+- If a response would be very long, summarize and offer to elaborate.
+
+Tool usage:
+- Use web search to look up documentation, error messages, or current information.
 - Use Google Tasks to manage the user's tasks when they ask about todos, reminders, or task management.
 - Use Google Calendar to check schedule, create events, or manage the user's calendar.
+- For time-specific events, use the user's timezone unless they specify otherwise.
 - You can send emails via Gmail but NEVER send an email without explicitly confirming the recipient, subject, and body with the user first.
-- For multi-step tasks, use the update_todo_list tool to track progress. Create the list when starting, mark items in_progress as you work, and completed when done.
-- When plan mode is on, always outline your plan first and wait for user approval before executing."""
+- For multi-step tasks, use the update_todo_list tool to track progress.
+- When plan mode is on, always outline your plan first and wait for user approval before executing.
+
+You are a knowledgeable assistant across many domains — not just coding. You can help with writing, research, brainstorming, analysis, math, and general questions."""
 
 # ── Internal tools (always available) ─────────────────────────────────
 
@@ -526,8 +538,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if email_client:
         tools.extend(EMAIL_TOOLS)
 
-    today = datetime.datetime.now(datetime.timezone.utc).strftime("%A, %B %d, %Y")
-    system = SYSTEM_PROMPT + f"\n\nToday's date is {today}."
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(USER_TIMEZONE)
+    except Exception:
+        tz = datetime.timezone.utc
+    now = datetime.datetime.now(tz)
+    context_lines = [
+        f"\n\nCurrent date and time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}",
+        f"Timezone: {USER_TIMEZONE}",
+        f"Model: {get_model(chat_id)}",
+    ]
+    system = SYSTEM_PROMPT + "\n".join(context_lines)
     if repo:
         system += f"\n\nActive repository: {repo}"
 
