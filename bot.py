@@ -791,15 +791,18 @@ def main() -> None:
 
     # Schedule daily briefing
     if DAILY_BRIEFING_TIME and ALLOWED_USER_IDS:
-        try:
-            import zoneinfo
-            tz = zoneinfo.ZoneInfo(USER_TIMEZONE)
-        except Exception:
-            tz = datetime.timezone.utc
-        hour, minute = (int(x) for x in DAILY_BRIEFING_TIME.split(":"))
-        briefing_time = datetime.time(hour=hour, minute=minute, tzinfo=tz)
-        app.job_queue.run_daily(scheduled_briefing, time=briefing_time)
-        logger.info("Daily briefing scheduled at %s %s", DAILY_BRIEFING_TIME, USER_TIMEZONE)
+        if app.job_queue is None:
+            logger.warning("JobQueue not available — install python-telegram-bot[job-queue] for daily briefings")
+        else:
+            try:
+                import zoneinfo
+                tz = zoneinfo.ZoneInfo(USER_TIMEZONE)
+            except Exception:
+                tz = datetime.timezone.utc
+            hour, minute = (int(x) for x in DAILY_BRIEFING_TIME.split(":"))
+            briefing_time = datetime.time(hour=hour, minute=minute, tzinfo=tz)
+            app.job_queue.run_daily(scheduled_briefing, time=briefing_time)
+            logger.info("Daily briefing scheduled at %s %s", DAILY_BRIEFING_TIME, USER_TIMEZONE)
     elif DAILY_BRIEFING_TIME:
         logger.info("Daily briefing configured but no ALLOWED_USER_IDS set — skipping")
 
