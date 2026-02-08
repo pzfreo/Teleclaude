@@ -30,11 +30,11 @@ SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "You are a helpful assistant responding via Telegram. Keep responses concise but thorough.",
 )
-ALLOWED_USER_IDS = {
-    int(uid.strip())
-    for uid in os.getenv("ALLOWED_USER_IDS", "").split(",")
-    if uid.strip()
-}
+ALLOWED_USER_IDS: set[int] = set()
+for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
+    uid = uid.strip()
+    if uid.isdigit():
+        ALLOWED_USER_IDS.add(int(uid))
 
 MAX_HISTORY = 50  # max message pairs to keep per conversation
 MAX_TELEGRAM_LENGTH = 4096
