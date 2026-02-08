@@ -1,10 +1,11 @@
 """Teleclaude - Chat with Claude on Telegram. Code against GitHub."""
 
+import asyncio
 import json
 import logging
 import os
 import sys
-from collections import defaultdict
+import time
 
 import anthropic
 from dotenv import load_dotenv
@@ -15,6 +16,15 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     filters,
+)
+
+from persistence import (
+    init_db,
+    load_conversation,
+    save_conversation,
+    clear_conversation,
+    load_active_repo,
+    save_active_repo,
 )
 
 load_dotenv()
@@ -87,7 +97,7 @@ try:
         logger.info("Google Tasks: enabled")
     else:
         TASKS_TOOLS = []
-        logger.info("Google Tasks: disabled (missing GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, or GOOGLE_REFRESH_TOKEN)")
+        logger.info("Google Tasks: disabled (missing Google credentials)")
 except Exception as e:
     logger.warning("Google Tasks: failed to load (%s)", e)
     TASKS_TOOLS = []
@@ -159,17 +169,19 @@ for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
 MAX_HISTORY = 50
 MAX_TELEGRAM_LENGTH = 4096
 MAX_TOOL_ROUNDS = 15
+TYPING_INTERVAL = 4  # seconds between typing indicator refreshes
+PROGRESS_INTERVAL = 15  # seconds before sending a progress message
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+api_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Build tool name sets for dispatch
 _tasks_tool_names = {t["name"] for t in TASKS_TOOLS}
 _calendar_tool_names = {t["name"] for t in CALENDAR_TOOLS}
 _email_tool_names = {t["name"] for t in EMAIL_TOOLS}
 
-# Per-chat state
-conversations: dict[int, list[dict]] = defaultdict(list)
-active_repos: dict[int, str] = {}  # chat_id -> "owner/repo"
+# In-memory cache (backed by SQLite)
+conversations: dict[int, list] = {}
+active_repos: dict[int, str] = {}
 
 
 def is_authorized(user_id: int) -> bool:
@@ -178,16 +190,53 @@ def is_authorized(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
+def get_conversation(chat_id: int) -> list:
+    """Get conversation from cache or load from DB."""
+    if chat_id not in conversations:
+        conversations[chat_id] = load_conversation(chat_id)
+    return conversations[chat_id]
+
+
+def get_active_repo(chat_id: int) -> str | None:
+    """Get active repo from cache or load from DB."""
+    if chat_id not in active_repos:
+        repo = load_active_repo(chat_id)
+        if repo:
+            active_repos[chat_id] = repo
+    return active_repos.get(chat_id)
+
+
 def trim_history(chat_id: int) -> None:
-    history = conversations[chat_id]
+    history = get_conversation(chat_id)
     if len(history) > MAX_HISTORY * 2:
         conversations[chat_id] = history[-(MAX_HISTORY * 2) :]
+
+
+def save_state(chat_id: int) -> None:
+    """Persist current conversation to SQLite."""
+    save_conversation(chat_id, get_conversation(chat_id))
 
 
 async def send_long_message(update: Update, text: str) -> None:
     """Send a message, splitting if it exceeds Telegram's limit."""
     for i in range(0, len(text), MAX_TELEGRAM_LENGTH):
         await update.message.reply_text(text[i : i + MAX_TELEGRAM_LENGTH])
+
+
+async def keep_typing(chat, stop_event: asyncio.Event, start_time: float, update: Update):
+    """Keep the typing indicator alive and send progress messages."""
+    progress_sent = False
+    while not stop_event.is_set():
+        await chat.send_action("typing")
+        elapsed = time.time() - start_time
+        if elapsed > PROGRESS_INTERVAL and not progress_sent:
+            await update.message.reply_text("Still working on it...")
+            progress_sent = True
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=TYPING_INTERVAL)
+            break
+        except asyncio.TimeoutError:
+            continue
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -222,7 +271,7 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
 
     if not context.args:
-        repo = active_repos.get(chat_id)
+        repo = get_active_repo(chat_id)
         if repo:
             await update.message.reply_text(f"Active repo: {repo}")
         else:
@@ -238,10 +287,10 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("GitHub not configured. Set GITHUB_TOKEN in environment.")
         return
 
-    # Verify the repo is accessible
     try:
         default_branch = gh_client.get_default_branch(repo)
         active_repos[chat_id] = repo
+        save_active_repo(chat_id, repo)
         await update.message.reply_text(f"Active repo set to: {repo} (default branch: {default_branch})")
     except Exception as e:
         await update.message.reply_text(f"Can't access {repo}: {e}")
@@ -252,6 +301,7 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     chat_id = update.effective_chat.id
     conversations[chat_id] = []
+    clear_conversation(chat_id)
     await update.message.reply_text("Conversation cleared. Starting fresh.")
 
 
@@ -259,6 +309,21 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_authorized(update.effective_user.id):
         return
     await update.message.reply_text(f"Current model: {CLAUDE_MODEL}")
+
+
+def _execute_tool_call(block, repo) -> str:
+    """Dispatch a single tool call to the right handler."""
+    if block.name == "web_search" and execute_web_tool:
+        return execute_web_tool(web_client, block.name, block.input)
+    elif block.name in _tasks_tool_names and execute_tasks_tool:
+        return execute_tasks_tool(tasks_client, block.name, block.input)
+    elif block.name in _calendar_tool_names and execute_calendar_tool:
+        return execute_calendar_tool(calendar_client, block.name, block.input)
+    elif block.name in _email_tool_names and execute_email_tool:
+        return execute_email_tool(email_client, block.name, block.input)
+    elif execute_github_tool:
+        return execute_github_tool(gh_client, repo, block.name, block.input)
+    return f"Tool '{block.name}' is not available."
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -271,10 +336,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user_text:
         return
 
-    conversations[chat_id].append({"role": "user", "content": user_text})
+    history = get_conversation(chat_id)
+    history.append({"role": "user", "content": user_text})
     trim_history(chat_id)
 
-    repo = active_repos.get(chat_id)
+    repo = get_active_repo(chat_id)
     tools = []
     if repo and gh_client:
         tools.extend(GITHUB_TOOLS)
@@ -291,73 +357,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if repo:
         system += f"\n\nActive repository: {repo}"
 
-    await update.effective_chat.send_action("typing")
+    # Start typing indicator in background
+    stop_typing = asyncio.Event()
+    start_time = time.time()
+    typing_task = asyncio.create_task(
+        keep_typing(update.effective_chat, stop_typing, start_time, update)
+    )
 
     try:
-        # Tool-use loop: Claude may call tools multiple times
-        for _ in range(MAX_TOOL_ROUNDS):
+        for round_num in range(MAX_TOOL_ROUNDS):
             kwargs = {
                 "model": CLAUDE_MODEL,
                 "max_tokens": 4096,
                 "system": system,
-                "messages": conversations[chat_id],
+                "messages": history,
             }
             if tools:
                 kwargs["tools"] = tools
 
-            response = client.messages.create(**kwargs)
+            response = api_client.messages.create(**kwargs)
 
-            # If Claude doesn't want to use tools, we're done
             if response.stop_reason != "tool_use":
-                # Extract text from response
                 text_parts = [b.text for b in response.content if b.type == "text"]
                 reply = "\n".join(text_parts) if text_parts else "(no response)"
-                conversations[chat_id].append({"role": "assistant", "content": response.content})
+                history.append({"role": "assistant", "content": response.content})
+                save_state(chat_id)
+                stop_typing.set()
+                await typing_task
                 await send_long_message(update, reply)
                 return
 
-            # Claude wants to use tools — execute them
-            conversations[chat_id].append({"role": "assistant", "content": response.content})
+            # Tool use round
+            history.append({"role": "assistant", "content": response.content})
 
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    logger.info("Tool call: %s(%s)", block.name, json.dumps(block.input)[:200])
-                    if block.name == "web_search" and execute_web_tool:
-                        result = execute_web_tool(web_client, block.name, block.input)
-                    elif block.name in _tasks_tool_names and execute_tasks_tool:
-                        result = execute_tasks_tool(tasks_client, block.name, block.input)
-                    elif block.name in _calendar_tool_names and execute_calendar_tool:
-                        result = execute_calendar_tool(calendar_client, block.name, block.input)
-                    elif block.name in _email_tool_names and execute_email_tool:
-                        result = execute_email_tool(email_client, block.name, block.input)
-                    elif execute_github_tool:
-                        result = execute_github_tool(gh_client, repo, block.name, block.input)
-                    else:
-                        result = f"Tool '{block.name}' is not available."
-                    # Truncate large results to avoid blowing up context
+                    logger.info("Tool call [%d]: %s(%s)", round_num + 1, block.name, json.dumps(block.input)[:200])
+                    result = _execute_tool_call(block, repo)
                     if len(result) > 10000:
                         result = result[:10000] + "\n... (truncated)"
                     tool_results.append(
                         {"type": "tool_result", "tool_use_id": block.id, "content": result}
                     )
 
-            conversations[chat_id].append({"role": "user", "content": tool_results})
-            await update.effective_chat.send_action("typing")
+            history.append({"role": "user", "content": tool_results})
+            # Save after each tool round in case of crash
+            save_state(chat_id)
 
+        stop_typing.set()
+        await typing_task
         await update.message.reply_text("(Reached tool call limit. Send another message to continue.)")
 
     except anthropic.APIError as e:
         logger.error("Anthropic API error: %s", e)
-        conversations[chat_id].pop()
+        history.pop()
+        save_state(chat_id)
+        stop_typing.set()
+        await typing_task
         await update.message.reply_text(f"Claude API error: {e.message}")
     except Exception as e:
         logger.error("Unexpected error: %s", e, exc_info=True)
-        conversations[chat_id].pop()
+        history.pop()
+        save_state(chat_id)
+        stop_typing.set()
+        await typing_task
         await update.message.reply_text("Something went wrong. Please try again.")
 
 
 def main() -> None:
+    init_db()
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))

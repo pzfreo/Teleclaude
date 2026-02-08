@@ -11,3 +11,4 @@ build/
 .mypy_cache/
 credentials.json
 token.json
+data/
