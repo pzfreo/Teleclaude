@@ -241,6 +241,19 @@ class GitHubClient:
         data = self._post(f"/repos/{repo}/issues/{number}/comments", json={"body": body})
         return {"id": data["id"], "url": data["html_url"]}
 
+    def create_or_update_binary_file(
+        self, repo: str, path: str, base64_content: str, message: str, branch: str, sha: str | None = None
+    ) -> dict:
+        """Create or update a binary file using raw base64 content (for images, etc.)."""
+        payload: dict[str, Any] = {
+            "message": message,
+            "content": base64_content,  # already base64-encoded
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
+        return self._put(f"/repos/{repo}/contents/{path}", json=payload)
+
     def get_pr_diff(self, repo: str, number: int) -> str:
         """Get the diff of a pull request."""
         resp = self.session.get(
@@ -484,6 +497,24 @@ GITHUB_TOOLS = [
             "required": ["number"],
         },
     },
+    {
+        "name": "upload_binary_file",
+        "description": (
+            "Upload a binary file (image, etc.) to the repository. Use this when the user shares "
+            "an image or binary file and wants to save it to a repo. The base64_content should be "
+            "the raw base64-encoded data from the image the user attached."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path in repo (e.g. 'docs/images/screenshot.png')"},
+                "base64_content": {"type": "string", "description": "Base64-encoded file content"},
+                "message": {"type": "string", "description": "Commit message"},
+                "branch": {"type": "string", "description": "Branch to commit to"},
+            },
+            "required": ["path", "base64_content", "message", "branch"],
+        },
+    },
 ]
 
 
@@ -549,6 +580,17 @@ def execute_tool(gh: GitHubClient, repo: str, tool_name: str, tool_input: dict) 
             result = gh.add_issue_comment(repo, tool_input["number"], tool_input["body"])
         elif tool_name == "get_pr_diff":
             result = gh.get_pr_diff(repo, tool_input["number"])
+        elif tool_name == "upload_binary_file":
+            sha = gh.get_file_sha(repo, tool_input["path"], ref=tool_input["branch"])
+            gh.create_or_update_binary_file(
+                repo,
+                tool_input["path"],
+                tool_input["base64_content"],
+                tool_input["message"],
+                tool_input["branch"],
+                sha=sha,
+            )
+            result = f"Binary file {'updated' if sha else 'uploaded'}: {tool_input['path']} on {tool_input['branch']}"
         else:
             result = f"Unknown tool: {tool_name}"
 

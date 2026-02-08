@@ -1,6 +1,7 @@
 """Teleclaude - Chat with Claude on Telegram. Code against GitHub."""
 
 import asyncio
+import base64
 import collections
 import datetime
 import json
@@ -187,6 +188,14 @@ Tool usage:
 - You can send emails via Gmail but NEVER send an email without explicitly confirming the recipient, subject, and body with the user first.
 - For multi-step tasks, use the update_todo_list tool to track progress.
 - When plan mode is on, always outline your plan first and wait for user approval before executing.
+- You can upload binary files (images, etc.) to GitHub repos using the upload_binary_file tool.
+- If a GitHub tool says "No active repo", tell the user to set one with /repo owner/name.
+
+Attachments:
+- Users can send photos, documents (images, PDFs, text files), stickers, locations, and contacts.
+- You can see and analyze images. You can read PDFs and text files.
+- If a user sends an image and wants it saved to a repo, use upload_binary_file with the base64 data from the image.
+- Voice messages and video are not yet supported — ask the user to type instead.
 
 You are a knowledgeable assistant across many domains — not just coding. You can help with writing, research, brainstorming, analysis, math, and general questions."""
 
@@ -237,6 +246,7 @@ PROGRESS_INTERVAL = 15  # seconds before sending a progress message
 api_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # Build tool name sets for dispatch
+_github_tool_names = {t["name"] for t in GITHUB_TOOLS}
 _tasks_tool_names = {t["name"] for t in TASKS_TOOLS}
 _calendar_tool_names = {t["name"] for t in CALENDAR_TOOLS}
 _email_tool_names = {t["name"] for t in EMAIL_TOOLS}
@@ -337,8 +347,12 @@ def get_active_repo(chat_id: int) -> str | None:
 MAX_CONTENT_SIZE = 20000  # max chars per content string in history
 
 
-def _trim_content(content) -> any:
-    """Truncate oversized content blocks when reloading history."""
+def _trim_content(content, keep_images: bool = True) -> any:
+    """Truncate oversized content blocks when reloading history.
+
+    When keep_images is False, replace image/document blocks with text placeholders
+    to save context space for older messages.
+    """
     if isinstance(content, str) and len(content) > MAX_CONTENT_SIZE:
         return content[:MAX_CONTENT_SIZE] + "\n... (truncated)"
     if isinstance(content, list):
@@ -346,6 +360,13 @@ def _trim_content(content) -> any:
         for item in content:
             if isinstance(item, dict):
                 item = dict(item)  # shallow copy
+                # Strip binary data from old messages
+                if not keep_images and item.get("type") == "image":
+                    trimmed.append({"type": "text", "text": "[image was here]"})
+                    continue
+                if not keep_images and item.get("type") == "document":
+                    trimmed.append({"type": "text", "text": "[document was here]"})
+                    continue
                 if isinstance(item.get("content"), str) and len(item["content"]) > MAX_CONTENT_SIZE:
                     item["content"] = item["content"][:MAX_CONTENT_SIZE] + "\n... (truncated)"
             trimmed.append(item)
@@ -353,13 +374,18 @@ def _trim_content(content) -> any:
     return content
 
 
+# Number of recent messages to keep images for (the rest get stripped)
+_KEEP_IMAGES_LAST_N = 10
+
+
 def trim_history(chat_id: int) -> None:
     history = get_conversation(chat_id)
     if len(history) > MAX_HISTORY * 2:
         conversations[chat_id] = history[-(MAX_HISTORY * 2) :]
-    # Trim any oversized content blocks to prevent context bloat
-    for msg in conversations.get(chat_id, []):
-        msg["content"] = _trim_content(msg.get("content"))
+    msgs = conversations.get(chat_id, [])
+    cutoff = max(0, len(msgs) - _KEEP_IMAGES_LAST_N)
+    for i, msg in enumerate(msgs):
+        msg["content"] = _trim_content(msg.get("content"), keep_images=(i >= cutoff))
 
 
 def save_state(chat_id: int) -> None:
@@ -573,12 +599,127 @@ def _execute_tool_call(block, repo, chat_id) -> str:
             return execute_calendar_tool(calendar_client, block.name, block.input)
         elif block.name in _email_tool_names and execute_email_tool:
             return execute_email_tool(email_client, block.name, block.input)
-        elif execute_github_tool:
+        elif block.name in _github_tool_names and execute_github_tool:
+            if not repo:
+                return "No active repo. Ask the user to set one with /repo owner/name first."
             return execute_github_tool(gh_client, repo, block.name, block.input)
         return f"Tool '{block.name}' is not available."
     except Exception as e:
         logger.error("Tool '%s' crashed: %s", block.name, e, exc_info=True)
         return f"Tool error: {e}"
+
+
+_IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+_SUPPORTED_DOC_MIMES = _IMAGE_MIME_TYPES | {"application/pdf"}
+
+
+async def _download_telegram_file(file_obj, bot) -> bytes:
+    """Download a Telegram file and return its bytes."""
+    tg_file = await bot.get_file(file_obj.file_id)
+    return bytes(await tg_file.download_as_bytearray())
+
+
+async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
+    """Extract user content from a Telegram message: text, images, docs, voice, stickers, location.
+
+    Returns a list of content blocks for multimodal, a plain string for text-only, or None if nothing useful.
+    """
+    msg = update.message
+    content_blocks = []
+    text = msg.text or msg.caption or ""
+
+    # Photos (Telegram sends multiple sizes; take the largest)
+    if msg.photo:
+        try:
+            photo = msg.photo[-1]  # highest resolution
+            data = await _download_telegram_file(photo, bot)
+            content_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(data).decode()},
+            })
+        except Exception as e:
+            logger.warning("Failed to download photo: %s", e)
+            text += "\n[Photo attached but could not be downloaded]"
+
+    # Stickers → treat as image
+    if msg.sticker and not msg.sticker.is_animated and not msg.sticker.is_video:
+        try:
+            data = await _download_telegram_file(msg.sticker, bot)
+            media_type = "image/webp"
+            content_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(data).decode()},
+            })
+            if not text:
+                text = f"[Sticker: {msg.sticker.emoji or 'unknown'}]"
+        except Exception as e:
+            logger.warning("Failed to download sticker: %s", e)
+
+    # Documents (images, PDFs, or text files sent as attachments)
+    if msg.document:
+        mime = msg.document.mime_type or ""
+        fname = msg.document.file_name or "file"
+        try:
+            if mime in _SUPPORTED_DOC_MIMES:
+                data = await _download_telegram_file(msg.document, bot)
+                if mime in _IMAGE_MIME_TYPES:
+                    content_blocks.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": mime, "data": base64.b64encode(data).decode()},
+                    })
+                elif mime == "application/pdf":
+                    content_blocks.append({
+                        "type": "document",
+                        "source": {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(data).decode()},
+                    })
+            elif mime.startswith("text/") or fname.endswith((".txt", ".py", ".js", ".ts", ".json", ".md", ".csv", ".yaml", ".yml", ".toml", ".xml", ".html", ".css", ".sh", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".rb", ".sql", ".log")):
+                data = await _download_telegram_file(msg.document, bot)
+                file_text = data.decode("utf-8", errors="replace")
+                if len(file_text) > MAX_CONTENT_SIZE:
+                    file_text = file_text[:MAX_CONTENT_SIZE] + "\n... (truncated)"
+                text += f"\n\n--- Attached file: {fname} ---\n{file_text}"
+            else:
+                text += f"\n[Attached file: {fname} ({mime}) — unsupported format]"
+        except Exception as e:
+            logger.warning("Failed to download document %s: %s", fname, e)
+            text += f"\n[Attached file: {fname} — download failed]"
+
+    # Voice messages
+    if msg.voice:
+        text += "\n[Voice message received — voice transcription not supported yet. Please type your message instead.]"
+
+    # Audio files
+    if msg.audio:
+        text += f"\n[Audio file: {msg.audio.title or msg.audio.file_name or 'audio'} — audio processing not supported]"
+
+    # Video
+    if msg.video:
+        text += f"\n[Video attached ({msg.video.duration}s) — video processing not supported]"
+
+    # Video notes (circle videos)
+    if msg.video_note:
+        text += "\n[Video note attached — video processing not supported]"
+
+    # Location
+    if msg.location:
+        lat, lon = msg.location.latitude, msg.location.longitude
+        text += f"\n[Location shared: {lat}, {lon}]"
+
+    # Contact
+    if msg.contact:
+        c = msg.contact
+        parts = [c.first_name or "", c.last_name or ""]
+        name = " ".join(p for p in parts if p)
+        text += f"\n[Contact shared: {name}, {c.phone_number or 'no phone'}]"
+
+    # Build final content
+    if content_blocks:
+        if text:
+            content_blocks.append({"type": "text", "text": text})
+        return content_blocks
+    elif text:
+        return text
+    return None
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -592,25 +733,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     chat_id = update.effective_chat.id
-    user_text = update.message.text
-    if not user_text:
+
+    # Build user content from text + any attachments
+    user_content = await _build_user_content(update, context.bot)
+    if not user_content:
         return
 
     async with _chat_locks[chat_id]:
-        await _process_message(chat_id, user_text, update, context)
+        await _process_message(chat_id, user_content, update, context)
 
 
-async def _process_message(chat_id: int, user_text: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Core message processing, runs under per-chat lock."""
+async def _process_message(chat_id: int, user_content, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Core message processing, runs under per-chat lock.
+
+    user_content can be a plain string or a list of content blocks (multimodal).
+    """
     bot = context.bot
     history = get_conversation(chat_id)
     history_len_before = len(history)
-    history.append({"role": "user", "content": user_text})
+    history.append({"role": "user", "content": user_content})
     trim_history(chat_id)
 
     repo = get_active_repo(chat_id)
     tools = [TODO_TOOL]  # always available
-    if repo and gh_client:
+    if gh_client:
         tools.extend(GITHUB_TOOLS)
     if web_client:
         tools.extend(WEB_TOOLS)
@@ -873,7 +1019,13 @@ def main() -> None:
     app.add_handler(CommandHandler("agent", toggle_agent))
     app.add_handler(CommandHandler("todo", show_todos))
     app.add_handler(CommandHandler("briefing", trigger_briefing))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE
+         | filters.Sticker.STATIC | filters.LOCATION | filters.CONTACT
+         | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE)
+        & ~filters.COMMAND,
+        handle_message,
+    ))
 
     # Schedule daily briefing
     if DAILY_BRIEFING_TIME and ALLOWED_USER_IDS:
