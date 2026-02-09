@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Auto-bump patch version if VERSION wasn't already bumped in this commit.
+# To do a feature bump instead, run ./bump feature before committing.
+
+# Check if VERSION is already staged (manually bumped)
+if git diff --cached --name-only | grep -q '^VERSION$'; then
+    exit 0
+fi
+
+# Check if any meaningful files are staged (skip version-only or hook-only changes)
+STAGED=$(git diff --cached --name-only -- '*.py' '*.txt' '*.md' 'VERSION' 'Procfile' 'bump')
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+# Auto patch bump
+./bump fix
+git add VERSION
