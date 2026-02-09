@@ -675,8 +675,13 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat_id = update.effective_chat.id
     conversations[chat_id] = []
     chat_todos[chat_id] = []
+    chat_plan_mode[chat_id] = False
+    chat_agent_mode[chat_id] = False
     clear_conversation(chat_id)
     save_todos(chat_id, [])
+    save_plan_mode(chat_id, False)
+    save_agent_mode(chat_id, False)
+    set_active_branch(chat_id, None)
     await update.message.reply_text("Conversation cleared. Starting fresh.")
 
 
