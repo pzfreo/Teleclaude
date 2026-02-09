@@ -605,20 +605,55 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not context.args:
         repo = get_active_repo(chat_id)
+        lines = []
         if repo:
             branch = get_active_branch(chat_id)
-            msg = f"Active repo: {repo}"
-            if branch:
-                msg += f"\nBranch: {branch}"
-            await update.message.reply_text(msg)
-        else:
-            await update.message.reply_text("No repo set. Use: /repo owner/name")
+            lines.append(f"Active repo: {repo}" + (f" ({branch})" if branch else ""))
+            lines.append("")
+
+        # List recent repos if GitHub is configured
+        if gh_client:
+            try:
+                loop = asyncio.get_running_loop()
+                repos = await loop.run_in_executor(None, gh_client.list_user_repos, 5)
+                lines.append("Recent repos:")
+                for i, r in enumerate(repos, 1):
+                    desc = f" — {r['description']}" if r["description"] else ""
+                    marker = " *" if r["full_name"] == repo else ""
+                    lines.append(f"  {i}. {r['full_name']}{desc}{marker}")
+                lines.append("\n/repo <number> or /repo owner/name")
+            except Exception as e:
+                logger.warning("Failed to list repos: %s", e)
+                if not repo:
+                    lines.append("No repo set. Use: /repo owner/name")
+        elif not repo:
+            lines.append("No repo set. Use: /repo owner/name")
+
+        await update.message.reply_text("\n".join(lines))
         return
 
-    repo = context.args[0]
-    if "/" not in repo or len(repo.split("/")) != 2:
-        await update.message.reply_text("Format: /repo owner/name (e.g. /repo pzfreo/Teleclaude)")
-        return
+    arg = context.args[0]
+
+    # Check if it's a number (pick from recent list)
+    if arg.isdigit() and gh_client:
+        try:
+            loop = asyncio.get_running_loop()
+            repos = await loop.run_in_executor(None, gh_client.list_user_repos, 5)
+            idx = int(arg) - 1
+            if 0 <= idx < len(repos):
+                repo = repos[idx]["full_name"]
+                # Fall through to set this repo
+            else:
+                await update.message.reply_text(f"Invalid number. Use 1-{len(repos)}.")
+                return
+        except Exception as e:
+            await update.message.reply_text(f"Failed to list repos: {e}")
+            return
+    else:
+        repo = arg
+        if "/" not in repo or len(repo.split("/")) != 2:
+            await update.message.reply_text("Format: /repo owner/name (e.g. /repo pzfreo/Teleclaude)")
+            return
 
     if not gh_client:
         await update.message.reply_text("GitHub not configured. Set GITHUB_TOKEN in environment.")
@@ -761,24 +796,62 @@ async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
+    repo = get_active_repo(chat_id)
 
     if not context.args:
-        branch = get_active_branch(chat_id)
-        repo = get_active_repo(chat_id)
-        if branch:
-            await update.message.reply_text(f"Active branch: {branch}" + (f" ({repo})" if repo else ""))
-        else:
-            await update.message.reply_text("No branch set. Use: /branch name\nOr it auto-sets when Claude creates a branch.")
+        # List branches from the repo
+        if not repo:
+            await update.message.reply_text("No repo set. Use /repo first.")
+            return
+        if not gh_client:
+            await update.message.reply_text("GitHub not configured.")
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            branches = await loop.run_in_executor(None, gh_client.list_branches, repo)
+            current = get_active_branch(chat_id)
+            lines = []
+            for i, b in enumerate(branches, 1):
+                marker = " *" if b == current else ""
+                lines.append(f"  {i}. {b}{marker}")
+            header = f"Branches on {repo}:"
+            if current:
+                header += f"\n(active: {current})"
+            await update.message.reply_text(
+                f"{header}\n" + "\n".join(lines) + "\n\n/branch <number> or /branch <name>"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Failed to list branches: {e}")
         return
 
-    if context.args[0].lower() == "clear":
+    arg = context.args[0].lower()
+
+    if arg == "clear":
         set_active_branch(chat_id, None)
         await update.message.reply_text("Branch cleared. Claude will use the default branch.")
         return
 
-    branch = context.args[0]
-    set_active_branch(chat_id, branch)
-    await update.message.reply_text(f"Active branch set to: {branch}")
+    # Check if it's a number (pick from list)
+    if arg.isdigit() and repo and gh_client:
+        try:
+            loop = asyncio.get_running_loop()
+            branches = await loop.run_in_executor(None, gh_client.list_branches, repo)
+            idx = int(arg) - 1
+            if 0 <= idx < len(branches):
+                branch = branches[idx]
+                set_active_branch(chat_id, branch)
+                await update.message.reply_text(f"Active branch set to: {branch}")
+                return
+            else:
+                await update.message.reply_text(f"Invalid number. Use 1-{len(branches)}.")
+                return
+        except Exception as e:
+            await update.message.reply_text(f"Failed to list branches: {e}")
+            return
+
+    # Literal branch name
+    set_active_branch(chat_id, context.args[0])
+    await update.message.reply_text(f"Active branch set to: {context.args[0]}")
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

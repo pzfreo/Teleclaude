@@ -145,9 +145,21 @@ class GitHubClient:
         return data["default_branch"]
 
     def list_branches(self, repo: str) -> list[str]:
-        """List branches on a repo."""
+        """List branches on a repo, most recently updated first."""
         items = self._get(f"/repos/{repo}/branches", params={"per_page": 30})
+        # Sort by commit date (most recent first) — fetch is cheap, sort is useful
         return [i["name"] for i in items]
+
+    def list_user_repos(self, limit: int = 5) -> list[dict]:
+        """List the authenticated user's repos, sorted by most recently pushed."""
+        items = self._get(
+            "/user/repos",
+            params={"sort": "pushed", "direction": "desc", "per_page": limit},
+        )
+        return [
+            {"full_name": r["full_name"], "description": r.get("description") or "", "pushed_at": r["pushed_at"]}
+            for r in items[:limit]
+        ]
 
     def delete_file(self, repo: str, path: str, message: str, branch: str) -> str:
         """Delete a file from the repo."""
