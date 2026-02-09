@@ -1163,7 +1163,11 @@ async def notify_startup(app: Application) -> None:
 
     for user_id in ALLOWED_USER_IDS:
         try:
-            await app.bot.send_message(chat_id=user_id, text=msg)
+            repo = get_active_repo(user_id)
+            user_msg = msg
+            if repo:
+                user_msg += f"\nActive repo: {repo}"
+            await app.bot.send_message(chat_id=user_id, text=user_msg)
             logger.info("Sent startup notification to user %d", user_id)
         except Exception as e:
             logger.warning("Could not notify user %d: %s", user_id, e)
