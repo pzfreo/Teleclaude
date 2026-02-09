@@ -497,21 +497,38 @@ async def send_long_message(chat_id: int, text: str, bot) -> None:
             logger.warning("Failed to send message chunk to %d: %s", chat_id, e)
 
 
-async def keep_typing(chat, stop_event: asyncio.Event, start_time: float, bot):
-    """Keep the typing indicator alive and send progress messages."""
-    progress_sent = False
+async def keep_typing(chat, stop_event: asyncio.Event, start_time: float, bot, status: dict):
+    """Keep the typing indicator alive and send progress updates.
+
+    status dict is shared with the tool loop:
+      - status["round"]: current tool round number
+      - status["max"]: max tool rounds
+      - status["tools"]: list of tool names called so far
+      - status["last_update_round"]: last round we sent a progress message for
+    """
+    last_update_round = -1
     while not stop_event.is_set():
         try:
             await chat.send_action("typing")
         except TelegramError:
             pass  # chat may have been deleted or bot blocked
         elapsed = time.time() - start_time
-        if elapsed > PROGRESS_INTERVAL and not progress_sent:
+        current_round = status.get("round", 0)
+        # Send a progress update when: enough time has passed AND there's new tool activity
+        if elapsed > PROGRESS_INTERVAL and current_round > last_update_round:
+            tools_used = status.get("tools", [])
+            max_rounds = status.get("max", 15)
+            if tools_used:
+                recent = tools_used[-3:]  # last 3 tools
+                tool_summary = ", ".join(recent)
+                msg = f"[{current_round}/{max_rounds}] {tool_summary}"
+            else:
+                msg = "Thinking..."
             try:
-                await bot.send_message(chat_id=chat.id, text="Still working on it...")
+                await bot.send_message(chat_id=chat.id, text=msg)
             except TelegramError:
                 pass
-            progress_sent = True
+            last_update_round = current_round
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=TYPING_INTERVAL)
             break
@@ -927,15 +944,20 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
 
     max_rounds = MAX_TOOL_ROUNDS_AGENT if agent_mode else MAX_TOOL_ROUNDS
 
+    # Shared progress status — the tool loop writes, keep_typing reads
+    progress = {"round": 0, "max": max_rounds, "tools": [], "last_update_round": -1}
+
     # Start typing indicator in background
     stop_typing = asyncio.Event()
     start_time = time.time()
     typing_task = asyncio.create_task(
-        keep_typing(update.effective_chat, stop_typing, start_time, bot)
+        keep_typing(update.effective_chat, stop_typing, start_time, bot, progress)
     )
 
     try:
         for round_num in range(max_rounds):
+            progress["round"] = round_num + 1
+
             kwargs = {
                 "model": get_model(chat_id),
                 "max_tokens": 16384 if agent_mode else 4096,
@@ -968,6 +990,7 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
             for block in response.content:
                 if block.type == "tool_use":
                     logger.info("Tool call [%d]: %s(%s)", round_num + 1, block.name, json.dumps(block.input)[:200])
+                    progress["tools"].append(block.name)
                     result = _execute_tool_call(block, repo, chat_id)
                     if len(result) > 10000:
                         result = result[:10000] + "\n... (truncated)"
