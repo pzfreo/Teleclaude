@@ -1,6 +1,7 @@
 """Teleclaude - Chat with Claude on Telegram. Code against GitHub."""
 
-VERSION = "0.1.0"
+from pathlib import Path as _Path
+VERSION = (_Path(__file__).parent / "VERSION").read_text().strip()
 
 import asyncio
 import base64
