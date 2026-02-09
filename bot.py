@@ -66,6 +66,12 @@ logging.basicConfig(
 )
 # Attach ring buffer to root logger so it captures everything
 logging.getLogger().addHandler(_ring_handler)
+
+# Silence noisy/leaky loggers:
+#   httpx logs every HTTP request with full URL (includes bot token!)
+#   googleapiclient.discovery_cache warns about oauth2client version
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 # ── Required config ──────────────────────────────────────────────────
