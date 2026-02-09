@@ -1,5 +1,7 @@
 """Teleclaude - Chat with Claude on Telegram. Code against GitHub."""
 
+VERSION = "0.1.0"
+
 import asyncio
 import base64
 import collections
@@ -36,6 +38,8 @@ from persistence import (
     save_plan_mode,
     load_agent_mode,
     save_agent_mode,
+    load_model,
+    save_model,
 )
 
 load_dotenv()
@@ -78,11 +82,11 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
 
 AVAILABLE_MODELS = {
-    "opus": "claude-opus-4-20250514",
-    "sonnet": "claude-sonnet-4-20250514",
+    "opus": "claude-opus-4-6",
+    "sonnet": "claude-sonnet-4-5-20250929",
     "haiku": "claude-haiku-4-5-20251001",
 }
 
@@ -319,6 +323,10 @@ async def _call_anthropic(**kwargs) -> anthropic.types.Message:
 
 
 def get_model(chat_id: int) -> str:
+    if chat_id not in chat_models:
+        saved = load_model(chat_id)
+        if saved:
+            chat_models[chat_id] = saved
     return chat_models.get(chat_id, DEFAULT_MODEL)
 
 
@@ -561,6 +569,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/todo - Show current task list (/todo clear to reset)\n"
         "/briefing - Get a daily summary of calendar + tasks\n"
         "/logs [min] - Download recent logs (default 5 min)\n"
+        "/version - Show bot version\n"
         "/help - Show this message\n\n"
         f"{status}"
     )
@@ -641,6 +650,7 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     chat_models[chat_id] = model_id
+    save_model(chat_id, model_id)
     await update.message.reply_text(f"Model switched to: {model_id}")
 
 
@@ -712,6 +722,12 @@ async def send_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     buf = io.BytesIO(content.encode("utf-8"))
     buf.name = f"teleclaude_logs_{minutes}min.txt"
     await update.message.reply_document(document=buf, caption=f"Last {minutes} min — {len(lines)} lines")
+
+
+async def show_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+    await update.message.reply_text(f"Teleclaude v{VERSION}\nModel: {get_model(update.effective_chat.id)}")
 
 
 def _execute_tool_call(block, repo, chat_id) -> str:
@@ -987,11 +1003,14 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
             history.append({"role": "assistant", "content": response.content})
 
             tool_results = []
+            loop = asyncio.get_running_loop()
             for block in response.content:
                 if block.type == "tool_use":
                     logger.info("Tool call [%d]: %s(%s)", round_num + 1, block.name, json.dumps(block.input)[:200])
                     progress["tools"].append(block.name)
-                    result = _execute_tool_call(block, repo, chat_id)
+                    result = await loop.run_in_executor(
+                        None, _execute_tool_call, block, repo, chat_id
+                    )
                     if len(result) > 10000:
                         result = result[:10000] + "\n... (truncated)"
                     tool_results.append(
@@ -1132,7 +1151,7 @@ async def notify_startup(app: Application) -> None:
 
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     enabled = ", ".join(integrations) if integrations else "none"
-    msg = f"Teleclaude restarted at {now}\nModel: {DEFAULT_MODEL}\nIntegrations: {enabled}"
+    msg = f"Teleclaude v{VERSION} restarted at {now}\nModel: {DEFAULT_MODEL}\nIntegrations: {enabled}"
 
     for user_id in ALLOWED_USER_IDS:
         try:
@@ -1155,8 +1174,10 @@ def main() -> None:
     app.add_handler(CommandHandler("plan", toggle_plan))
     app.add_handler(CommandHandler("agent", toggle_agent))
     app.add_handler(CommandHandler("todo", show_todos))
+    app.add_handler(CommandHandler("todos", show_todos))
     app.add_handler(CommandHandler("briefing", trigger_briefing))
     app.add_handler(CommandHandler("logs", send_logs))
+    app.add_handler(CommandHandler("version", show_version))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE
          | filters.Sticker.STATIC | filters.LOCATION | filters.CONTACT

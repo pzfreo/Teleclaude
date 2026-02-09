@@ -55,6 +55,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE chat_modes ADD COLUMN agent_mode INTEGER NOT NULL DEFAULT 0")
         conn.commit()
         logger.info("Migrated chat_modes: added agent_mode column")
+    if "model" not in columns:
+        conn.execute("ALTER TABLE chat_modes ADD COLUMN model TEXT")
+        conn.commit()
+        logger.info("Migrated chat_modes: added model column")
 
 
 def load_conversation(chat_id: int) -> list[dict]:
@@ -142,7 +146,8 @@ def load_plan_mode(chat_id: int) -> bool:
 def save_plan_mode(chat_id: int, enabled: bool) -> None:
     conn = _connect()
     conn.execute(
-        "INSERT OR REPLACE INTO chat_modes (chat_id, plan_mode) VALUES (?, ?)",
+        """INSERT INTO chat_modes (chat_id, plan_mode) VALUES (?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET plan_mode = excluded.plan_mode""",
         (chat_id, int(enabled)),
     )
     conn.commit()
@@ -165,6 +170,27 @@ def save_agent_mode(chat_id: int, enabled: bool) -> None:
         """INSERT INTO chat_modes (chat_id, agent_mode) VALUES (?, ?)
            ON CONFLICT(chat_id) DO UPDATE SET agent_mode = excluded.agent_mode""",
         (chat_id, int(enabled)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_model(chat_id: int) -> str | None:
+    """Load persisted model choice for a chat. Returns None if not set."""
+    conn = _connect()
+    row = conn.execute(
+        "SELECT model FROM chat_modes WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
+def save_model(chat_id: int, model: str) -> None:
+    conn = _connect()
+    conn.execute(
+        """INSERT INTO chat_modes (chat_id, model) VALUES (?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET model = excluded.model""",
+        (chat_id, model),
     )
     conn.commit()
     conn.close()
