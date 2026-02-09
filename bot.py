@@ -894,7 +894,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user_content:
         return
 
-    async with _chat_locks[chat_id]:
+    lock = _chat_locks[chat_id]
+    if lock.locked():
+        try:
+            await update.message.reply_text("Queued — I'll get to this once I finish the current request.")
+        except TelegramError:
+            pass
+    async with lock:
         await _process_message(chat_id, user_content, update, context)
 
 
@@ -1176,7 +1182,7 @@ async def notify_startup(app: Application) -> None:
 def main() -> None:
     init_db()
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
