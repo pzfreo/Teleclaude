@@ -1170,9 +1170,14 @@ async def notify_startup(app: Application) -> None:
     for user_id in ALLOWED_USER_IDS:
         try:
             repo = get_active_repo(user_id)
+            todos = get_todos(user_id)
             user_msg = msg
             if repo:
                 user_msg += f"\nActive repo: {repo}"
+            if todos:
+                pending = sum(1 for t in todos if t.get("status") != "completed")
+                done = len(todos) - pending
+                user_msg += f"\nTodos: {pending} pending, {done} done"
             await app.bot.send_message(chat_id=user_id, text=user_msg)
             logger.info("Sent startup notification to user %d", user_id)
         except Exception as e:
