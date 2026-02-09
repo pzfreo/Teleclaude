@@ -60,6 +60,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.commit()
         logger.info("Migrated chat_modes: added model column")
 
+    # Check active_repos for branch column
+    cursor = conn.execute("PRAGMA table_info(active_repos)")
+    repo_columns = {row[1] for row in cursor.fetchall()}
+    if "branch" not in repo_columns:
+        conn.execute("ALTER TABLE active_repos ADD COLUMN branch TEXT")
+        conn.commit()
+        logger.info("Migrated active_repos: added branch column")
+
 
 def load_conversation(chat_id: int) -> list[dict]:
     """Load conversation history for a chat."""
@@ -110,6 +118,25 @@ def save_active_repo(chat_id: int, repo: str) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO active_repos (chat_id, repo) VALUES (?, ?)",
         (chat_id, repo),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_active_branch(chat_id: int) -> str | None:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT branch FROM active_repos WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
+def save_active_branch(chat_id: int, branch: str | None) -> None:
+    conn = _connect()
+    conn.execute(
+        """UPDATE active_repos SET branch = ? WHERE chat_id = ?""",
+        (branch, chat_id),
     )
     conn.commit()
     conn.close()

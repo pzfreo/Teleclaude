@@ -263,6 +263,71 @@ class GitHubClient:
         resp.raise_for_status()
         return resp.text[:15000]  # cap at 15k chars
 
+    def commit_multiple_files(
+        self, repo: str, branch: str, message: str, files: list[dict]
+    ) -> dict:
+        """Create a single atomic commit with multiple file changes.
+
+        Uses the Git Trees API. Each entry in files should have:
+          - path: file path relative to repo root
+          - content: file content (text) — omit for deletions
+          - action: "create"|"update"|"delete" (default "update")
+        """
+        # Get the current commit SHA for the branch
+        ref_data = self._get(f"/repos/{repo}/git/ref/heads/{branch}")
+        base_commit_sha = ref_data["object"]["sha"]
+
+        # Get the base tree
+        commit_data = self._get(f"/repos/{repo}/git/commits/{base_commit_sha}")
+        base_tree_sha = commit_data["tree"]["sha"]
+
+        # Build tree entries
+        tree_entries = []
+        for f in files:
+            if f.get("action") == "delete":
+                # To delete, we create a blob-less entry (sha=None)
+                tree_entries.append({
+                    "path": f["path"],
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": None,
+                })
+            else:
+                tree_entries.append({
+                    "path": f["path"],
+                    "mode": "100644",
+                    "type": "blob",
+                    "content": f["content"],
+                })
+
+        # Create the new tree
+        new_tree = self._post(
+            f"/repos/{repo}/git/trees",
+            json={"base_tree": base_tree_sha, "tree": tree_entries},
+        )
+
+        # Create the commit
+        new_commit = self._post(
+            f"/repos/{repo}/git/commits",
+            json={
+                "message": message,
+                "tree": new_tree["sha"],
+                "parents": [base_commit_sha],
+            },
+        )
+
+        # Update the branch reference
+        self._patch(
+            f"/repos/{repo}/git/refs/heads/{branch}",
+            json={"sha": new_commit["sha"]},
+        )
+
+        return {
+            "sha": new_commit["sha"],
+            "message": message,
+            "files_changed": len(files),
+        }
+
 
 # ── Tool definitions for Claude's tool_use API ──────────────────────
 
@@ -515,6 +580,39 @@ GITHUB_TOOLS = [
             "required": ["path", "base64_content", "message", "branch"],
         },
     },
+    {
+        "name": "commit_multiple_files",
+        "description": (
+            "Create a single atomic commit that changes multiple files at once. "
+            "Use this instead of create_or_update_file when you need to modify several files together "
+            "(e.g. a feature that touches multiple files). All changes land in one commit."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "branch": {"type": "string", "description": "Branch to commit to"},
+                "message": {"type": "string", "description": "Commit message"},
+                "files": {
+                    "type": "array",
+                    "description": "List of file changes",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "File path relative to repo root"},
+                            "content": {"type": "string", "description": "Full file content (omit for delete)"},
+                            "action": {
+                                "type": "string",
+                                "enum": ["create", "update", "delete"],
+                                "description": "What to do with this file (default: update)",
+                            },
+                        },
+                        "required": ["path"],
+                    },
+                },
+            },
+            "required": ["branch", "message", "files"],
+        },
+    },
 ]
 
 
@@ -591,6 +689,15 @@ def execute_tool(gh: GitHubClient, repo: str, tool_name: str, tool_input: dict) 
                 sha=sha,
             )
             result = f"Binary file {'updated' if sha else 'uploaded'}: {tool_input['path']} on {tool_input['branch']}"
+        elif tool_name == "commit_multiple_files":
+            result = gh.commit_multiple_files(
+                repo,
+                tool_input["branch"],
+                tool_input["message"],
+                tool_input["files"],
+            )
+            paths = ", ".join(f["path"] for f in tool_input["files"])
+            result = f"Committed {len(tool_input['files'])} files on {tool_input['branch']}: {paths}"
         else:
             result = f"Unknown tool: {tool_name}"
 

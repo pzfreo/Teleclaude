@@ -41,6 +41,8 @@ from persistence import (
     save_agent_mode,
     load_model,
     save_model,
+    load_active_branch,
+    save_active_branch,
 )
 
 load_dotenv()
@@ -288,6 +290,7 @@ _email_tool_names = {t["name"] for t in EMAIL_TOOLS}
 # In-memory cache (backed by SQLite)
 conversations: dict[int, list] = {}
 active_repos: dict[int, str] = {}
+active_branches: dict[int, str] = {}
 chat_models: dict[int, str] = {}
 chat_todos: dict[int, list[dict]] = {}
 chat_plan_mode: dict[int, bool] = {}
@@ -381,6 +384,23 @@ def get_active_repo(chat_id: int) -> str | None:
         if repo:
             active_repos[chat_id] = repo
     return active_repos.get(chat_id)
+
+
+def get_active_branch(chat_id: int) -> str | None:
+    """Get active branch from cache or load from DB."""
+    if chat_id not in active_branches:
+        branch = load_active_branch(chat_id)
+        if branch:
+            active_branches[chat_id] = branch
+    return active_branches.get(chat_id)
+
+
+def set_active_branch(chat_id: int, branch: str | None) -> None:
+    if branch:
+        active_branches[chat_id] = branch
+    elif chat_id in active_branches:
+        del active_branches[chat_id]
+    save_active_branch(chat_id, branch)
 
 
 MAX_CONTENT_SIZE = 20000  # max chars per content string in history
@@ -562,7 +582,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Hello! I'm Teleclaude — Claude on Telegram.\n\n"
         "Commands:\n"
         "/repo owner/name - Set the active GitHub repo\n"
-        "/repo - Show current repo\n"
+        "/repo - Show current repo and branch\n"
+        "/branch name - Set active branch (/branch clear to reset)\n"
         "/new - Start a fresh conversation\n"
         "/model - Show or switch Claude model (opus/sonnet/haiku)\n"
         "/plan - Toggle plan mode (outline before executing)\n"
@@ -585,7 +606,11 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         repo = get_active_repo(chat_id)
         if repo:
-            await update.message.reply_text(f"Active repo: {repo}")
+            branch = get_active_branch(chat_id)
+            msg = f"Active repo: {repo}"
+            if branch:
+                msg += f"\nBranch: {branch}"
+            await update.message.reply_text(msg)
         else:
             await update.message.reply_text("No repo set. Use: /repo owner/name")
         return
@@ -603,6 +628,7 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         default_branch = gh_client.get_default_branch(repo)
         active_repos[chat_id] = repo
         save_active_repo(chat_id, repo)
+        set_active_branch(chat_id, None)  # reset branch on repo switch
         await update.message.reply_text(f"Active repo set to: {repo} (default branch: {default_branch})")
     except Exception as e:
         await update.message.reply_text(f"Can't access {repo}: {e}")
@@ -731,6 +757,30 @@ async def show_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"Teleclaude v{VERSION}\nModel: {get_model(update.effective_chat.id)}")
 
 
+async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+        branch = get_active_branch(chat_id)
+        repo = get_active_repo(chat_id)
+        if branch:
+            await update.message.reply_text(f"Active branch: {branch}" + (f" ({repo})" if repo else ""))
+        else:
+            await update.message.reply_text("No branch set. Use: /branch name\nOr it auto-sets when Claude creates a branch.")
+        return
+
+    if context.args[0].lower() == "clear":
+        set_active_branch(chat_id, None)
+        await update.message.reply_text("Branch cleared. Claude will use the default branch.")
+        return
+
+    branch = context.args[0]
+    set_active_branch(chat_id, branch)
+    await update.message.reply_text(f"Active branch set to: {branch}")
+
+
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not is_authorized(update.effective_user.id):
         return
@@ -757,7 +807,15 @@ def _execute_tool_call(block, repo, chat_id) -> str:
         elif block.name in _github_tool_names and execute_github_tool:
             if not repo:
                 return "No active repo. Ask the user to set one with /repo owner/name first."
-            return execute_github_tool(gh_client, repo, block.name, block.input)
+            result = execute_github_tool(gh_client, repo, block.name, block.input)
+            # Auto-track branch
+            if block.name == "create_branch":
+                set_active_branch(chat_id, block.input.get("branch_name"))
+            elif block.name in ("create_or_update_file", "upload_binary_file", "delete_file", "commit_multiple_files"):
+                branch = block.input.get("branch")
+                if branch:
+                    set_active_branch(chat_id, branch)
+            return result
         return f"Tool '{block.name}' is not available."
     except Exception as e:
         logger.error("Tool '%s' crashed: %s", block.name, e, exc_info=True)
@@ -941,7 +999,10 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
     ]
     system = SYSTEM_PROMPT + "\n".join(context_lines)
     if repo:
+        branch = get_active_branch(chat_id)
         system += f"\n\nActive repository: {repo}"
+        if branch:
+            system += f"\nActive branch: {branch} — use this branch for file changes unless the user specifies otherwise."
 
     # Inject current todo list into context
     todos = get_todos(chat_id)
@@ -1170,10 +1231,17 @@ async def notify_startup(app: Application) -> None:
     for user_id in ALLOWED_USER_IDS:
         try:
             repo = get_active_repo(user_id)
+            branch = get_active_branch(user_id)
             todos = get_todos(user_id)
+            agent = get_agent_mode(user_id)
             user_msg = msg
             if repo:
-                user_msg += f"\nActive repo: {repo}"
+                repo_line = f"\nActive repo: {repo}"
+                if branch:
+                    repo_line += f" ({branch})"
+                user_msg += repo_line
+            if agent:
+                user_msg += "\nAgent mode: ON"
             if todos:
                 pending = sum(1 for t in todos if t.get("status") != "completed")
                 done = len(todos) - pending
@@ -1192,6 +1260,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("repo", set_repo))
+    app.add_handler(CommandHandler("branch", set_branch))
     app.add_handler(CommandHandler("new", new_conversation))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("plan", toggle_plan))
