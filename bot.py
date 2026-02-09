@@ -730,6 +730,13 @@ async def show_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"Teleclaude v{VERSION}\nModel: {get_model(update.effective_chat.id)}")
 
 
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not is_authorized(update.effective_user.id):
+        return
+    cmd = update.message.text.split()[0] if update.message.text else "/?"
+    await update.message.reply_text(f"Unknown command: {cmd}\nType /help to see available commands.")
+
+
 def _execute_tool_call(block, repo, chat_id) -> str:
     """Dispatch a single tool call to the right handler."""
     try:
@@ -1178,6 +1185,7 @@ def main() -> None:
     app.add_handler(CommandHandler("briefing", trigger_briefing))
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("version", show_version))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE
          | filters.Sticker.STATIC | filters.LOCATION | filters.CONTACT
