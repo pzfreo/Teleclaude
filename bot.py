@@ -4,6 +4,7 @@ import asyncio
 import base64
 import collections
 import datetime
+import io
 import json
 import logging
 import os
@@ -39,10 +40,32 @@ from persistence import (
 
 load_dotenv()
 
+
+class _RingBufferHandler(logging.Handler):
+    """Keeps the last N log records in a deque for on-demand retrieval."""
+
+    def __init__(self, capacity: int = 5000):
+        super().__init__()
+        self._buf: collections.deque[logging.LogRecord] = collections.deque(maxlen=capacity)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._buf.append(record)
+
+    def get_recent(self, seconds: int = 300) -> list[str]:
+        """Return formatted log lines from the last `seconds` seconds."""
+        cutoff = time.time() - seconds
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        return [formatter.format(r) for r in self._buf if r.created >= cutoff]
+
+
+_ring_handler = _RingBufferHandler()
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# Attach ring buffer to root logger so it captures everything
+logging.getLogger().addHandler(_ring_handler)
 logger = logging.getLogger(__name__)
 
 # ── Required config ──────────────────────────────────────────────────
@@ -514,6 +537,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/agent - Toggle agent mode (autonomous + extended thinking)\n"
         "/todo - Show current task list (/todo clear to reset)\n"
         "/briefing - Get a daily summary of calendar + tasks\n"
+        "/logs [min] - Download recent logs (default 5 min)\n"
         "/help - Show this message\n\n"
         f"{status}"
     )
@@ -645,6 +669,26 @@ async def show_todos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Todo list cleared.")
         return
     await update.message.reply_text(format_todo_list(todos))
+
+
+async def send_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/logs [minutes] — send recent logs as a text file attachment."""
+    if not is_authorized(update.effective_user.id):
+        return
+    minutes = 5
+    if context.args:
+        try:
+            minutes = max(1, min(int(context.args[0]), 60))
+        except ValueError:
+            pass
+    lines = _ring_handler.get_recent(seconds=minutes * 60)
+    if not lines:
+        await update.message.reply_text(f"No logs in the last {minutes} minute(s).")
+        return
+    content = "\n".join(lines)
+    buf = io.BytesIO(content.encode("utf-8"))
+    buf.name = f"teleclaude_logs_{minutes}min.txt"
+    await update.message.reply_document(document=buf, caption=f"Last {minutes} min — {len(lines)} lines")
 
 
 def _execute_tool_call(block, repo, chat_id) -> str:
@@ -1083,6 +1127,7 @@ def main() -> None:
     app.add_handler(CommandHandler("agent", toggle_agent))
     app.add_handler(CommandHandler("todo", show_todos))
     app.add_handler(CommandHandler("briefing", trigger_briefing))
+    app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE
          | filters.Sticker.STATIC | filters.LOCATION | filters.CONTACT
