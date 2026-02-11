@@ -12,3 +12,4 @@ build/
 credentials.json
 token.json
 data/
+workspaces/

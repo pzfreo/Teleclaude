@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 
@@ -193,6 +194,22 @@ try:
 except Exception as e:
     logger.warning("Gmail: failed to load (%s)", e)
     EMAIL_TOOLS = []
+
+# Claude Code CLI
+claude_code_mgr = None
+try:
+    from claude_code import ClaudeCodeManager
+    token = os.getenv("GITHUB_TOKEN", "")
+    if token and shutil.which(os.getenv("CLAUDE_CLI_PATH", "") or "claude"):
+        claude_code_mgr = ClaudeCodeManager(token)
+        logger.info("Claude Code CLI: enabled (path=%s)", claude_code_mgr.cli_path)
+    else:
+        if not token:
+            logger.info("Claude Code CLI: disabled (no GITHUB_TOKEN)")
+        else:
+            logger.info("Claude Code CLI: disabled (claude not found in PATH)")
+except Exception as e:
+    logger.warning("Claude Code CLI: failed to load (%s)", e)
 
 # ── Bot config ───────────────────────────────────────────────────────
 
@@ -664,7 +681,21 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         active_repos[chat_id] = repo
         save_active_repo(chat_id, repo)
         set_active_branch(chat_id, None)  # reset branch on repo switch
-        await update.message.reply_text(f"Active repo set to: {repo} (default branch: {default_branch})")
+        msg = f"Active repo set to: {repo} (default branch: {default_branch})"
+        if claude_code_mgr and claude_code_mgr.available:
+            msg += "\nCloning workspace in background..."
+        await update.message.reply_text(msg)
+
+        # Background clone for Claude Code
+        if claude_code_mgr and claude_code_mgr.available:
+            async def _clone_notify():
+                try:
+                    await claude_code_mgr.ensure_clone(repo)
+                    await update.message.reply_text(f"Workspace ready: {repo}")
+                except Exception as e:
+                    logger.error("Background clone failed: %s", e)
+                    await update.message.reply_text(f"Clone failed: {e}")
+            asyncio.create_task(_clone_notify())
     except Exception as e:
         await update.message.reply_text(f"Can't access {repo}: {e}")
 
@@ -682,6 +713,8 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     save_plan_mode(chat_id, False)
     save_agent_mode(chat_id, False)
     set_active_branch(chat_id, None)
+    if claude_code_mgr:
+        claude_code_mgr.new_session(chat_id)
     await update.message.reply_text("Conversation cleared. Starting fresh.")
 
 
@@ -746,14 +779,26 @@ async def toggle_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_agent_mode[chat_id] = new_mode
     save_agent_mode(chat_id, new_mode)
     if new_mode:
-        await update.message.reply_text(
-            "Agent mode ON. I'll work autonomously:\n"
-            "- Extended thinking for deeper reasoning\n"
-            "- Up to 30 tool rounds per message\n"
-            "- Full repo exploration before changes\n"
-            "- CI/test checks after changes\n"
-            "- Proactive issue investigation"
-        )
+        repo = get_active_repo(chat_id)
+        use_cli = repo and claude_code_mgr and claude_code_mgr.available
+        if use_cli:
+            await update.message.reply_text(
+                "Agent mode ON (Claude Code CLI).\n"
+                "Messages will route through claude CLI with:\n"
+                "- Native file editing, bash, and git\n"
+                "- Session continuity across messages\n"
+                "- 10-minute timeout per request\n"
+                "Set /repo or /branch, then send coding tasks."
+            )
+        else:
+            await update.message.reply_text(
+                "Agent mode ON. I'll work autonomously:\n"
+                "- Extended thinking for deeper reasoning\n"
+                "- Up to 30 tool rounds per message\n"
+                "- Full repo exploration before changes\n"
+                "- CI/test checks after changes\n"
+                "- Proactive issue investigation"
+            )
     else:
         await update.message.reply_text("Agent mode OFF. Back to normal conversational mode.")
 
@@ -845,7 +890,16 @@ async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if 0 <= idx < len(branches):
                 branch = branches[idx]
                 set_active_branch(chat_id, branch)
-                await update.message.reply_text(f"Active branch set to: {branch}")
+                msg = f"Active branch set to: {branch}"
+                if claude_code_mgr and claude_code_mgr.available:
+                    ws = claude_code_mgr.workspace_path(repo)
+                    if (ws / ".git").is_dir():
+                        try:
+                            await claude_code_mgr.checkout_branch(repo, branch)
+                            msg += " (checked out locally)"
+                        except Exception as e:
+                            msg += f" (local checkout failed: {e})"
+                await update.message.reply_text(msg)
                 return
             else:
                 await update.message.reply_text(f"Invalid number. Use 1-{len(branches)}.")
@@ -855,8 +909,21 @@ async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
 
     # Literal branch name
-    set_active_branch(chat_id, context.args[0])
-    await update.message.reply_text(f"Active branch set to: {context.args[0]}")
+    branch_name = context.args[0]
+    set_active_branch(chat_id, branch_name)
+    msg = f"Active branch set to: {branch_name}"
+
+    # Checkout in local clone if available
+    if claude_code_mgr and claude_code_mgr.available and repo:
+        ws = claude_code_mgr.workspace_path(repo)
+        if (ws / ".git").is_dir():
+            try:
+                await claude_code_mgr.checkout_branch(repo, branch_name)
+                msg += " (checked out locally)"
+            except Exception as e:
+                msg += f" (local checkout failed: {e})"
+
+    await update.message.reply_text(msg)
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1040,6 +1107,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _process_message(chat_id, user_content, update, context)
 
 
+async def _process_claude_code_message(
+    chat_id: int, user_content, repo: str,
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Process a message via Claude Code CLI instead of the API tool loop."""
+    bot = context.bot
+
+    # Extract plain text — Claude Code CLI doesn't support images
+    if isinstance(user_content, str):
+        prompt = user_content
+    elif isinstance(user_content, list):
+        text_parts = [b["text"] for b in user_content if isinstance(b, dict) and b.get("type") == "text"]
+        has_images = any(isinstance(b, dict) and b.get("type") in ("image", "document") for b in user_content)
+        prompt = "\n".join(text_parts)
+        if has_images:
+            await bot.send_message(chat_id=chat_id,
+                                   text="(Images/documents can't be sent to Claude Code — processing text only)")
+    else:
+        return
+
+    if not prompt.strip():
+        await bot.send_message(chat_id=chat_id, text="No text to process.")
+        return
+
+    branch = get_active_branch(chat_id)
+    model = get_model(chat_id)
+
+    # Typing indicator + progress
+    stop_typing = asyncio.Event()
+    start_time = time.time()
+    progress_tools: list[str] = []
+    progress_status = {"round": 0, "max": 1, "tools": progress_tools}
+    typing_task = asyncio.create_task(
+        keep_typing(update.effective_chat, stop_typing, start_time, bot, progress_status)
+    )
+
+    tool_counter = 0
+
+    async def on_progress(tool_name: str):
+        nonlocal tool_counter
+        tool_counter += 1
+        progress_tools.append(tool_name)
+        progress_status["round"] = tool_counter
+
+    try:
+        result = await claude_code_mgr.run(
+            chat_id=chat_id,
+            repo=repo,
+            prompt=prompt,
+            branch=branch,
+            model=model,
+            on_progress=on_progress,
+        )
+    except Exception as e:
+        logger.error("Claude Code run failed: %s", e, exc_info=True)
+        result = f"Claude Code error: {e}"
+
+    stop_typing.set()
+    await typing_task
+
+    # Send result
+    await send_long_message(chat_id, result or "(no response)", bot)
+
+    # Append lightweight summary to conversation history for context continuity
+    history = get_conversation(chat_id)
+    history.append({"role": "user", "content": prompt})
+    summary = result if len(result) <= 2000 else result[:2000] + "\n... (truncated in history)"
+    history.append({"role": "assistant", "content": f"[Via Claude Code CLI]\n{summary}"})
+    save_state(chat_id)
+
+
 async def _process_message(chat_id: int, user_content, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Core message processing, runs under per-chat lock.
 
@@ -1096,6 +1234,12 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
         )
 
     agent_mode = get_agent_mode(chat_id)
+
+    # Route to Claude Code CLI when agent mode + repo + CLI available
+    if agent_mode and repo and claude_code_mgr and claude_code_mgr.available:
+        await _process_claude_code_message(chat_id, user_content, repo, update, context)
+        return
+
     if agent_mode:
         system += (
             "\n\nAGENT MODE IS ON. You are an autonomous coding agent. Work like Claude Code:"
@@ -1301,6 +1445,8 @@ async def notify_startup(app: Application) -> None:
         integrations.append("Calendar")
     if email_client:
         integrations.append("Gmail")
+    if claude_code_mgr and claude_code_mgr.available:
+        integrations.append("Claude Code CLI")
 
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     enabled = ", ".join(integrations) if integrations else "none"
@@ -1377,13 +1523,14 @@ def main() -> None:
     app.post_init = notify_startup
 
     logger.info(
-        "Teleclaude started — model: %s | github: %s | search: %s | tasks: %s | calendar: %s | email: %s",
+        "Teleclaude started — model: %s | github: %s | search: %s | tasks: %s | calendar: %s | email: %s | claude-code: %s",
         DEFAULT_MODEL,
         "on" if gh_client else "off",
         "on" if web_client else "off",
         "on" if tasks_client else "off",
         "on" if calendar_client else "off",
         "on" if email_client else "off",
+        "on" if (claude_code_mgr and claude_code_mgr.available) else "off",
     )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
