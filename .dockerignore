@@ -1,0 +1,17 @@
+.env
+.git
+.gitignore
+.dockerignore
+data/
+workspaces/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+credentials.json
+token.json
+deploy.sh
+README.md
+LICENSE

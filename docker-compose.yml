@@ -1,0 +1,12 @@
+services:
+  teleclaude:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - teleclaude-data:/app/data
+      - teleclaude-workspaces:/app/workspaces
+
+volumes:
+  teleclaude-data:
+  teleclaude-workspaces:
