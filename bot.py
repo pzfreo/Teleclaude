@@ -1037,12 +1037,13 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
     except Exception:
         tz = datetime.timezone.utc
     now = datetime.datetime.now(tz)
-    context_lines = [
-        f"\n\nCurrent date and time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}",
-        f"Timezone: {USER_TIMEZONE}",
-        f"Model: {get_model(chat_id)}",
-    ]
-    system = SYSTEM_PROMPT + "\n".join(context_lines)
+    date_str = now.strftime('%A, %B %d, %Y at %I:%M %p')
+    system = (
+        f"Today is {date_str} ({USER_TIMEZONE}). "
+        "This is authoritative — trust this date for all scheduling and calendar references.\n\n"
+        + SYSTEM_PROMPT
+        + f"\n\nModel: {get_model(chat_id)}"
+    )
     if repo:
         branch = get_active_branch(chat_id)
         system += f"\n\nActive repository: {repo}"
