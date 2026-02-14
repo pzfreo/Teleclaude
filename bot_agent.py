@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
+DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
 
 AVAILABLE_MODELS = {
     "opus": "claude-opus-4-6",

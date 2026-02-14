@@ -220,7 +220,6 @@ Tool usage:
 - Use Google Calendar to check schedule, create events, or manage the user's calendar.
 - For time-specific events, use the user's timezone unless they specify otherwise.
 - You can send emails via Gmail but NEVER send an email without explicitly confirming the recipient, subject, and body with the user first.
-- For multi-step tasks, use the update_todo_list tool to track progress.
 - When plan mode is on, always outline your plan first and wait for user approval before executing.
 - You can upload binary files (images, etc.) to GitHub repos using the upload_binary_file tool.
 - If a GitHub tool says "No active repo", tell the user to set one with /repo owner/name.
@@ -240,9 +239,10 @@ For coding tasks that need filesystem access (reading/writing files, running tes
 TODO_TOOL = {
     "name": "update_todo_list",
     "description": (
-        "Update the task/todo list for the current session. Use this proactively to "
-        "track progress on multi-step tasks. Each todo has a content string and a "
-        "status: pending, in_progress, or completed. Send the full updated list each time."
+        "Update the task/todo list. ONLY use this when the user explicitly asks to track tasks, "
+        "or during plan mode to track plan steps. Do NOT proactively create or maintain todos — "
+        "most conversations don't need task tracking. Send the full updated list each time. "
+        "Remove completed items instead of keeping them around."
     ),
     "input_schema": {
         "type": "object",
@@ -492,12 +492,14 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
 def trim_history(chat_id: int) -> None:
     history = get_conversation(chat_id)
     if len(history) > MAX_HISTORY * 2:
-        conversations[chat_id] = history[-(MAX_HISTORY * 2) :]
+        del history[:len(history) - MAX_HISTORY * 2]
     # Sanitize to fix any broken tool_use/tool_result pairs
-    conversations[chat_id] = _sanitize_history(conversations.get(chat_id, []))
-    msgs = conversations[chat_id]
-    cutoff = max(0, len(msgs) - _KEEP_IMAGES_LAST_N)
-    for i, msg in enumerate(msgs):
+    # IMPORTANT: modify in-place to preserve list reference held by _process_message
+    sanitized = _sanitize_history(history)
+    history.clear()
+    history.extend(sanitized)
+    cutoff = max(0, len(history) - _KEEP_IMAGES_LAST_N)
+    for i, msg in enumerate(history):
         msg["content"] = _trim_content(msg.get("content"), keep_images=(i >= cutoff))
 
 
@@ -1019,7 +1021,7 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
     trim_history(chat_id)
 
     repo = get_active_repo(chat_id)
-    tools = [TODO_TOOL]  # always available
+    tools = [TODO_TOOL]
     if gh_client:
         tools.extend(GITHUB_TOOLS)
     if web_client:
@@ -1038,9 +1040,16 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
         tz = datetime.timezone.utc
     now = datetime.datetime.now(tz)
     date_str = now.strftime('%A, %B %d, %Y at %I:%M %p')
+    # Pre-compute upcoming days so the model doesn't do bad date math
+    upcoming = []
+    for i in range(1, 8):
+        d = now + datetime.timedelta(days=i)
+        upcoming.append(d.strftime('%A %b %d'))
+    upcoming_str = ", ".join(upcoming)
     system = (
         f"Today is {date_str} ({USER_TIMEZONE}). "
-        "This is authoritative — trust this date for all scheduling and calendar references.\n\n"
+        f"Coming days: {upcoming_str}. "
+        "These dates are authoritative — use them for all scheduling references.\n\n"
         + SYSTEM_PROMPT
         + f"\n\nModel: {get_model(chat_id)}"
     )
@@ -1050,13 +1059,11 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
         if branch:
             system += f"\nActive branch: {branch} — use this branch for file changes unless the user specifies otherwise."
 
-    # Inject current todo list into context
-    todos = get_todos(chat_id)
-    if todos:
-        system += f"\n\nCurrent todo list:\n{format_todo_list(todos)}"
-
-    # Plan mode
+    # Plan mode: inject existing todos and planning instructions
     if get_plan_mode(chat_id):
+        todos = get_todos(chat_id)
+        if todos:
+            system += f"\n\nCurrent todo list:\n{format_todo_list(todos)}"
         system += (
             "\n\nPLAN MODE IS ON. Before making any changes (file edits, PRs, emails, etc.), "
             "first outline a numbered plan of what you intend to do and ask the user to confirm. "
