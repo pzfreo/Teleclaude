@@ -29,7 +29,8 @@ jobs:
       - name: Type check (mypy)
         run: |
           mypy bot.py bot_agent.py persistence.py shared.py github_tools.py web_tools.py \
-               claude_code.py calendar_tools.py tasks_tools.py email_tools.py webhooks.py
+               claude_code.py calendar_tools.py tasks_tools.py email_tools.py webhooks.py \
+               streaming.py
 
       - name: Security audit (pip-audit)
         run: |

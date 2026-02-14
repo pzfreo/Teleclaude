@@ -4,7 +4,21 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anthropic
 import pytest
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+# Reusable RateLimitError that forces _process_message to fall back to _call_anthropic
+_STREAM_FALLBACK_ERROR = anthropic.RateLimitError(
+    message="mock", response=MagicMock(status_code=429, headers={}), body=None
+)
+
+
+def _patch_stream_fallback():
+    """Patch _stream_round to raise RateLimitError so tests exercise the non-streaming path."""
+    return patch("bot._stream_round", new_callable=AsyncMock, side_effect=_STREAM_FALLBACK_ERROR)
+
 
 # ── Helpers to build mock Telegram Update objects ──────────────────────
 
@@ -515,6 +529,7 @@ class TestProcessMessage:
         mock_response.content = [text_block]
 
         with (
+            _patch_stream_fallback(),
             patch("bot._call_anthropic", new_callable=AsyncMock, return_value=mock_response),
             patch("bot.save_state"),
             patch("bot.send_long_message", new_callable=AsyncMock) as mock_send,
@@ -555,6 +570,7 @@ class TestProcessMessage:
         resp2.content = [text_block]
 
         with (
+            _patch_stream_fallback(),
             patch("bot._call_anthropic", new_callable=AsyncMock, side_effect=[resp1, resp2]),
             patch("bot._execute_tool_call", return_value="search results here"),
             patch("bot.save_state"),
@@ -597,6 +613,7 @@ class TestProcessMessage:
         big_result = "x" * 20000
 
         with (
+            _patch_stream_fallback(),
             patch("bot._call_anthropic", new_callable=AsyncMock, side_effect=[resp1, resp2]),
             patch("bot._execute_tool_call", return_value=big_result),
             patch("bot.save_state"),
@@ -637,6 +654,7 @@ class TestProcessMessage:
         )
 
         with (
+            _patch_stream_fallback(),
             patch("bot._call_anthropic", new_callable=AsyncMock, side_effect=err),
             patch("bot.save_state"),
             patch("bot.send_long_message", new_callable=AsyncMock) as mock_send,
@@ -672,6 +690,7 @@ class TestProcessMessage:
         resp.content = [tool_block]
 
         with (
+            _patch_stream_fallback(),
             patch("bot._call_anthropic", new_callable=AsyncMock, return_value=resp),
             patch("bot._execute_tool_call", return_value="result"),
             patch("bot.save_state"),

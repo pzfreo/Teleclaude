@@ -283,6 +283,7 @@ TYPING_INTERVAL = 4  # seconds between typing indicator refreshes
 PROGRESS_INTERVAL = 15  # seconds before sending a progress message
 
 api_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+async_api_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 # Build tool name sets for dispatch
 _github_tool_names = {t["name"] for t in GITHUB_TOOLS}
@@ -326,6 +327,46 @@ async def _call_anthropic(**kwargs) -> anthropic.types.Message:
             else:
                 raise
     raise RuntimeError("Unreachable: retry loop completed without returning or raising")
+
+
+async def _stream_round(
+    kwargs: dict,
+    chat_id: int,
+    bot,
+    stop_typing: asyncio.Event,
+) -> tuple[anthropic.types.Message, str | None]:
+    """Execute one API round with streaming.
+
+    Returns (final_message, streamed_text_or_none).
+    If text was streamed to Telegram, streamed_text is the full text.
+    If no text was produced, streamed_text is None.
+
+    Raises anthropic.RateLimitError or anthropic.InternalServerError
+    on transient failures for the caller to catch and fall back.
+    """
+    from streaming import StreamingResponder
+
+    responder = StreamingResponder(bot, chat_id)
+    first_text = True
+
+    async with async_api_client.messages.stream(**kwargs) as stream:
+        async for event in stream:
+            if (
+                event.type == "content_block_delta"
+                and hasattr(event.delta, "type")
+                and event.delta.type == "text_delta"
+            ):
+                if first_text:
+                    stop_typing.set()
+                    first_text = False
+                await responder.feed(event.delta.text)
+
+        final_message = await stream.get_final_message()
+
+    await responder.finalize()
+
+    streamed_text = responder.full_text if responder.full_text else None
+    return final_message, streamed_text
 
 
 def get_model(chat_id: int) -> str:
@@ -1137,16 +1178,24 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
             if tools:
                 kwargs["tools"] = tools
 
-            response = await _call_anthropic(**kwargs)
+            # Attempt streaming; fall back to non-streaming on transient errors
+            streamed_text = None
+            try:
+                response, streamed_text = await _stream_round(kwargs, chat_id, bot, stop_typing)
+            except (anthropic.RateLimitError, anthropic.InternalServerError) as stream_err:
+                logger.warning("Streaming failed (%s), falling back to non-streaming", stream_err)
+                response = await _call_anthropic(**kwargs)
 
             if response.stop_reason != "tool_use":
-                text_parts = [b.text for b in response.content if b.type == "text"]
-                reply = "\n".join(text_parts) if text_parts else "(no response)"
                 history.append({"role": "assistant", "content": response.content})
                 save_state(chat_id)
                 stop_typing.set()
                 await typing_task
-                await send_long_message(chat_id, reply, bot)
+                if streamed_text is None:
+                    # Non-streaming fallback
+                    text_parts = [b.text for b in response.content if b.type == "text"]
+                    reply = "\n".join(text_parts) if text_parts else "(no response)"
+                    await send_long_message(chat_id, reply, bot)
                 return
 
             # Tool use round

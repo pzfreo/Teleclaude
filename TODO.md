@@ -81,24 +81,17 @@ Every item in this TODO must satisfy these standards before merging to `main`. T
 
 ## Tier 3 — UX Improvements (inspired by linuz90/claude-telegram-bot)
 
-### 8. Streaming responses ⭐ HIGH IMPACT
-- **Issue:** API bot buffers the full response before sending to Telegram. Users stare at "typing..." for 10-30 seconds with no feedback. This is the biggest UX gap vs competitors.
-- **Current state:** Agent bot streams from CLI but accumulates the result. API bot uses `client.messages.create()` synchronously.
-- **Approach:**
-  1. Switch API bot to `client.messages.stream()` (Anthropic streaming API)
-  2. Send initial Telegram message on first token, then `edit_message_text()` every ~1 second as tokens arrive
-  3. Handle Telegram's rate limits (max 30 edits/sec per chat, practically ~1-2/sec)
-  4. Handle markdown formatting mid-stream (partial code blocks, etc.)
-  5. Fall back to full-response on edit failures
-- **Complexity:** Medium — main challenges are Telegram rate limiting and partial markdown rendering.
-- **Files:** `bot.py` (API call path), potentially new `streaming.py` helper
-- **Tests:** Create `tests/test_streaming.py`:
-  - Mock `client.messages.stream()` to yield token chunks. Verify accumulated text is correct.
-  - Mock `bot.edit_message_text()` — verify it's called at throttled intervals (~1s), not per-token.
-  - Test partial markdown safety: unclosed code block mid-stream should be temporarily closed before edit.
-  - Test fallback: simulate `telegram.error.BadRequest` on edit → verify falls back to full-response send.
-  - Test tool_use during stream: verify stream pauses, tool executes, stream resumes.
-  - Add `streaming.py` to mypy CI command.
+### 8. ✅ Streaming responses
+- **Status:** Implemented. API bot now uses `AsyncAnthropic.messages.stream()` for progressive Telegram message updates.
+- **Files:** New `streaming.py` module (`StreamingResponder` class), `bot.py` (`async_api_client`, `_stream_round()`).
+- **How it works:**
+  1. `_stream_round()` opens an async stream, iterates events, feeds text deltas to `StreamingResponder`
+  2. `StreamingResponder` sends initial Telegram message on first token, then `edit_message_text()` every ~1 second
+  3. Partial markdown safety: `_close_unclosed_code_blocks()` closes unclosed ``` markers before each edit
+  4. Auto-splits into new message at ~3900 chars (before 4096 Telegram limit)
+  5. Falls back to non-streaming `_call_anthropic()` on `RateLimitError`/`InternalServerError`
+  6. Tool_use responses detected mid-stream; tool dispatch unchanged
+- **Tests:** `tests/test_streaming.py` (22 tests) — `StreamingResponder` unit tests (throttling, splitting, fallback, idempotent finalize), `_close_unclosed_code_blocks` helper, `_stream_round` integration tests (text/tool_use/mixed responses, typing indicator, error propagation).
 
 ### 9. Inline keyboard buttons for user choices ⭐ HIGH IMPACT
 - **Issue:** Confirmations and choices are currently text-based ("reply yes/no"). linuz90 has an `ask_user` MCP tool that renders tappable inline keyboard buttons — much better mobile UX.
@@ -217,11 +210,10 @@ Every item in this TODO must satisfy these standards before merging to `main`. T
 - **Plan mode:** Multi-step task planning with TODO tracking
 
 ### Where linuz90 wins
-- **Streaming responses:** Real-time output vs wait-for-complete
 - **MCP extensibility:** Plug-in architecture vs hardcoded modules
 - **Voice support:** Whisper transcription for voice memos
 - **Inline buttons:** Tappable choices vs text-based confirmations
 - **Message queuing:** Explicit queue management with interrupt support
 
 ### Strategy
-Close the UX gap (Tier 3) while maintaining the integration depth advantage. Streaming responses (#8) and inline buttons (#9) are the highest-ROI improvements. MCP (#12) is architecturally interesting but lower priority — our native tools are a stronger differentiator than plugin breadth.
+Continue closing the UX gap (Tier 3) while maintaining the integration depth advantage. Streaming (#8) is done. Inline buttons (#9) is the next highest-ROI improvement. MCP (#12) is architecturally interesting but lower priority — our native tools are a stronger differentiator than plugin breadth.
