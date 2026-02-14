@@ -50,8 +50,8 @@ Every item in this TODO must satisfy these standards before merging to `main`. T
 - **Tests:** `tests/test_claude_code.py::TestPathTraversal` — tests `../` in owner, `../../` in repo name, absolute path escape, valid repos pass.
 
 ### 3. ✅ Request timeouts on all external API calls
-- **Files:** `github_tools.py` (`DEFAULT_TIMEOUT = 30`), `web_tools.py` (`DDGS(timeout=30)`), `calendar_tools.py` / `tasks_tools.py` / `email_tools.py` (`Request(timeout=30)`)
-- **Status:** Fixed. All HTTP clients use explicit timeouts.
+- **Files:** `github_tools.py` (`DEFAULT_TIMEOUT = 30`), `web_tools.py` (`DDGS(timeout=30)`), `calendar_tools.py` / `tasks_tools.py` / `email_tools.py` (use default `Request()` timeout — `google.auth.transport.requests.Request` doesn't accept a `timeout` kwarg)
+- **Status:** Fixed. All HTTP clients use explicit timeouts where the API supports it.
 - **Tests:** `tests/test_github_tools.py::TestTimeouts` — verifies timeout passed to GET/POST/PUT/PATCH/DELETE, `Timeout` exception handled gracefully.
 
 ### 4. ✅ Deprecated `datetime.utcnow()` removed

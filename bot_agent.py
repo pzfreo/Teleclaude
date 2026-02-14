@@ -72,10 +72,12 @@ AVAILABLE_MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
 }
 
+
 def _check_required_config() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN is not set.")
         sys.exit(1)
+
 
 if not GITHUB_TOKEN:
     logger.warning("GITHUB_TOKEN is not set — Claude Code will have no GitHub access.")

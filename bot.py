@@ -85,6 +85,7 @@ AVAILABLE_MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
 }
 
+
 def _check_required_config() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN is not set. Bot cannot start.")
@@ -92,6 +93,7 @@ def _check_required_config() -> None:
     if not ANTHROPIC_API_KEY:
         logger.error("ANTHROPIC_API_KEY is not set. Bot cannot start.")
         sys.exit(1)
+
 
 # ── Optional integrations (each loads gracefully) ────────────────────
 

@@ -219,6 +219,12 @@ tests/              # pytest test suite
 
 5. **Don't put tokens in URLs or logs.** Use credential helpers for git, env vars for everything else. The httpx logger is silenced specifically to prevent bot token leakage.
 
+9. **Don't call `sys.exit()` at module level.** Both `bot.py` and `bot_agent.py` validate required config (tokens) in `_check_required_config()`, called from `main()` — not at import time. Module-level `sys.exit()` prevents tests from importing the module. If you add new required config, validate it in `_check_required_config()`.
+
+10. **Don't pass unsupported kwargs to library constructors.** `google.auth.transport.requests.Request()` does not accept a `timeout` parameter despite what some examples suggest. Always check type stubs / mypy before adding kwargs — CI mypy will catch mismatches that local mypy may miss due to different library versions.
+
+11. **Deploy workflow needs `contents: write` permission.** The deploy workflow bumps `VERSION` and pushes back to the repo. This requires `permissions: contents: write` at the workflow level. Without it, `github-actions[bot]` gets a 403 on `git push`.
+
 6. **Don't send long messages without splitting.** Always use `send_long_message()` for any text that might exceed 4096 chars.
 
 7. **Don't assume integrations are available.** Check `gh_client`, `tasks_client`, etc. before using them. They may be `None` if credentials aren't configured.
