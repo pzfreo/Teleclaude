@@ -23,7 +23,7 @@ class GoogleCalendarClient:
             client_secret=client_secret,
             token_uri="https://oauth2.googleapis.com/token",
         )
-        creds.refresh(Request(timeout=30))
+        creds.refresh(Request())
         self.service = build("calendar", "v3", credentials=creds)
 
     def list_events(self, days_ahead: int = 7, max_results: int = 20, calendar_id: str = "primary") -> list[dict]:
