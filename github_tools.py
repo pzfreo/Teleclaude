@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 class GitHubClient:
     """Thin wrapper around GitHub's REST API."""
 
+    DEFAULT_TIMEOUT = 30  # seconds
+
     def __init__(self, token: str):
         self.token = token
         self.session = requests.Session()
@@ -25,22 +27,22 @@ class GitHubClient:
         self.base = "https://api.github.com"
 
     def _get(self, path: str, params: dict | None = None) -> Any:
-        resp = self.session.get(f"{self.base}{path}", params=params)
+        resp = self.session.get(f"{self.base}{path}", params=params, timeout=self.DEFAULT_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
     def _post(self, path: str, json: dict) -> Any:
-        resp = self.session.post(f"{self.base}{path}", json=json)
+        resp = self.session.post(f"{self.base}{path}", json=json, timeout=self.DEFAULT_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
     def _put(self, path: str, json: dict) -> Any:
-        resp = self.session.put(f"{self.base}{path}", json=json)
+        resp = self.session.put(f"{self.base}{path}", json=json, timeout=self.DEFAULT_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
     def _patch(self, path: str, json: dict) -> Any:
-        resp = self.session.patch(f"{self.base}{path}", json=json)
+        resp = self.session.patch(f"{self.base}{path}", json=json, timeout=self.DEFAULT_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
@@ -162,6 +164,7 @@ class GitHubClient:
         resp = self.session.delete(
             f"{self.base}/repos/{repo}/contents/{path}",
             json={"message": message, "sha": sha, "branch": branch},
+            timeout=self.DEFAULT_TIMEOUT,
         )
         resp.raise_for_status()
         return f"Deleted {path} on {branch}"
@@ -229,6 +232,7 @@ class GitHubClient:
         resp = self.session.post(
             f"{self.base}/repos/{repo}/actions/workflows/{workflow_id}/dispatches",
             json=payload,
+            timeout=self.DEFAULT_TIMEOUT,
         )
         resp.raise_for_status()
         return f"Workflow '{workflow_id}' triggered on {ref}"
@@ -264,6 +268,7 @@ class GitHubClient:
         resp = self.session.get(
             f"{self.base}/repos/{repo}/pulls/{number}",
             headers={"Accept": "application/vnd.github.v3.diff"},
+            timeout=self.DEFAULT_TIMEOUT,
         )
         resp.raise_for_status()
         return resp.text[:15000]  # cap at 15k chars

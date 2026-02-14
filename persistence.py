@@ -3,6 +3,7 @@
 import json
 import logging
 import sqlite3
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,16 @@ def init_db() -> None:
             plan_mode INTEGER NOT NULL DEFAULT 0,
             agent_mode INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            chat_id INTEGER,
+            user_id INTEGER,
+            event TEXT NOT NULL,
+            detail TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_audit_log_chat_id ON audit_log(chat_id);
         """)
     # Migrations for existing databases
     _migrate(conn)
@@ -214,3 +225,40 @@ def _serialize(obj):
     if hasattr(obj, "__dict__"):
         return obj.__dict__
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+# ── Audit logging ────────────────────────────────────────────────────
+
+
+def audit_log(event: str, *, chat_id: int | None = None, user_id: int | None = None, detail: str = "") -> None:
+    """Write a structured audit log entry to the database."""
+    try:
+        conn = _connect()
+        conn.execute(
+            "INSERT INTO audit_log (timestamp, chat_id, user_id, event, detail) VALUES (?, ?, ?, ?, ?)",
+            (time.time(), chat_id, user_id, event, detail),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.debug("Audit log write failed", exc_info=True)
+
+
+def get_audit_log(limit: int = 100, chat_id: int | None = None) -> list[dict]:
+    """Read recent audit log entries."""
+    conn = _connect()
+    if chat_id is not None:
+        rows = conn.execute(
+            "SELECT id, timestamp, chat_id, user_id, event, detail FROM audit_log WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+            (chat_id, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, timestamp, chat_id, user_id, event, detail FROM audit_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "timestamp": r[1], "chat_id": r[2], "user_id": r[3], "event": r[4], "detail": r[5]}
+        for r in rows
+    ]

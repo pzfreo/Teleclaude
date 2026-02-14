@@ -27,6 +27,7 @@ from telegram.ext import (
 
 from claude_code import ClaudeCodeManager
 from persistence import (
+    audit_log,
     clear_conversation,
     init_db,
     load_active_branch,
@@ -225,10 +226,15 @@ def _save_attachment(chat_id: int, data: bytes, mime: str, label: str = "") -> s
     shared_dir = claude_code_mgr.workspace_root / ".shared" / str(chat_id)
     shared_dir.mkdir(parents=True, exist_ok=True)
     ext = _MIME_TO_EXT.get(mime, "")
-    name = f"{label}_{int(time.time())}{ext}" if label else f"{int(time.time())}{ext}"
-    path = shared_dir / name
+    # Sanitize label to prevent path traversal
+    safe_label = label.replace("/", "_").replace("\\", "_").replace("..", "_")
+    name = f"{safe_label}_{int(time.time())}{ext}" if safe_label else f"{int(time.time())}{ext}"
+    path = (shared_dir / name).resolve()
+    # Verify the resolved path is still inside the shared dir
+    if not str(path).startswith(str(shared_dir.resolve())):
+        raise ValueError(f"Path traversal blocked in attachment save: {name!r}")
     path.write_bytes(data)
-    return str(path.resolve())
+    return str(path)
 
 
 async def _download_telegram_file(file_obj, bot) -> bytes:
@@ -501,6 +507,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         paths_str = "\n".join(f"  - {p}" for p in attachment_paths)
         prompt += f"\n\nAttached files (saved to disk, you can read them):\n{paths_str}"
 
+    user_id = update.effective_user.id if update.effective_user else None
+    text_preview = (text[:80] + "...") if len(text) > 80 else text
+    audit_log("agent_message", chat_id=chat_id, user_id=user_id, detail=text_preview)
+
     lock = _chat_locks[chat_id]
     if lock.locked():
         try:
@@ -583,11 +593,26 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
 # ── Startup ───────────────────────────────────────────────────────────
 
 
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "0"))  # 0 = disabled
+
+
 async def notify_startup(app: Application) -> None:
     if not ALLOWED_USER_IDS:
         return
     now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
     msg = f"Teleclaude Agent v{VERSION} started at {now}\nModel: {DEFAULT_MODEL}\nCLI: {claude_code_mgr.cli_path}"
+
+    # Start webhook server if configured
+    if WEBHOOK_PORT:
+        try:
+            from webhooks import start_webhook_server
+
+            runner = await start_webhook_server(app.bot, ALLOWED_USER_IDS, WEBHOOK_PORT)
+            app.bot_data["webhook_runner"] = runner
+            msg += f"\nWebhooks: port {WEBHOOK_PORT}"
+        except Exception as e:
+            logger.error("Failed to start webhook server: %s", e)
+
     for user_id in ALLOWED_USER_IDS:
         try:
             repo = get_active_repo(user_id)

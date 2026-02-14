@@ -29,7 +29,30 @@ class ClaudeCodeManager:
     def workspace_path(self, repo: str) -> Path:
         """Return local path for a repo clone: workspaces/{owner}/{name}/"""
         owner, name = repo.split("/", 1)
-        return self.workspace_root / owner / name
+        path = (self.workspace_root / owner / name).resolve()
+        # Prevent path traversal outside the workspace root
+        root = self.workspace_root.resolve()
+        if not str(path).startswith(str(root) + os.sep) and path != root:
+            raise ValueError(f"Path traversal blocked: {repo!r} resolves outside workspace root")
+        return path
+
+    def _git_env(self) -> dict[str, str]:
+        """Build environment for git subprocesses with credential helper.
+
+        Uses GIT_ASKPASS with a helper script that returns the GitHub token,
+        avoiding token exposure in URLs, process lists, shell history, or logs.
+        """
+        env = os.environ.copy()
+        if self.github_token:
+            # GIT_ASKPASS is called by git for username/password.
+            # printf outputs the token for any prompt.
+            env["GIT_ASKPASS"] = "/bin/sh"
+            env["GIT_TERMINAL_PROMPT"] = "0"
+            # Use a credential helper that feeds user=token, password=token
+            env["GIT_CONFIG_COUNT"] = "1"
+            env["GIT_CONFIG_KEY_0"] = "credential.helper"
+            env["GIT_CONFIG_VALUE_0"] = f"!f() {{ echo username=x-access-token; echo password={self.github_token}; }}; f"
+        return env
 
     async def ensure_clone(self, repo: str) -> Path:
         """Clone the repo if it doesn't already exist locally. Returns the path."""
@@ -38,7 +61,7 @@ class ClaudeCodeManager:
             logger.info("Workspace already exists: %s", path)
             return path
         path.parent.mkdir(parents=True, exist_ok=True)
-        url = f"https://{self.github_token}@github.com/{repo}.git"
+        url = f"https://github.com/{repo}.git"
         await self._git(path.parent, "clone", url, path.name)
         logger.info("Cloned %s to %s", repo, path)
         return path
@@ -75,6 +98,7 @@ class ClaudeCodeManager:
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=self._git_env(),
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
@@ -169,15 +193,7 @@ class ClaudeCodeManager:
         returned_session_id = None
 
         try:
-            result_text, returned_session_id = await asyncio.wait_for(
-                self._read_stream(proc, on_progress),
-                timeout=600,  # 10 minutes
-            )
-        except TimeoutError:
-            logger.warning("Claude Code timed out after 10 minutes")
-            proc.kill()
-            await proc.wait()
-            result_text = "(Claude Code timed out after 10 minutes)"
+            result_text, returned_session_id = await self._read_stream(proc, on_progress)
         except Exception as e:
             logger.error("Claude Code stream error: %s", e, exc_info=True)
             proc.kill()

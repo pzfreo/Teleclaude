@@ -16,7 +16,7 @@ class WebSearchClient:
 
     def search(self, query: str, max_results: int = 5) -> list[dict]:
         """Search the web and return results."""
-        with DDGS() as ddgs:
+        with DDGS(timeout=30) as ddgs:
             raw = list(ddgs.text(query, max_results=max_results))
         return [
             {

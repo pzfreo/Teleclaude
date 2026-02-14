@@ -29,6 +29,7 @@ from telegram.ext import (
 )
 
 from persistence import (
+    audit_log,
     clear_conversation,
     init_db,
     load_active_branch,
@@ -829,18 +830,24 @@ def _execute_tool_call(block, repo, chat_id) -> str:
             todos = block.input.get("todos", [])
             chat_todos[chat_id] = todos
             save_todos(chat_id, todos)
+            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
             return format_todo_list(todos)
         if block.name == "web_search" and execute_web_tool:
+            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: {block.input.get('query', '')[:100]}")
             return execute_web_tool(web_client, block.name, block.input)
         elif block.name in _tasks_tool_names and execute_tasks_tool:
+            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
             return execute_tasks_tool(tasks_client, block.name, block.input)
         elif block.name in _calendar_tool_names and execute_calendar_tool:
+            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
             return execute_calendar_tool(calendar_client, block.name, block.input)
         elif block.name in _email_tool_names and execute_email_tool:
+            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: to={block.input.get('to', '')}")
             return execute_email_tool(email_client, block.name, block.input)
         elif block.name in _github_tool_names and execute_github_tool:
             if not repo:
                 return "No active repo. Ask the user to set one with /repo owner/name first."
+            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name} on {repo}")
             result = execute_github_tool(gh_client, repo, block.name, block.input)
             # Auto-track branch
             if block.name == "create_branch":
@@ -853,6 +860,7 @@ def _execute_tool_call(block, repo, chat_id) -> str:
         return f"Tool '{block.name}' is not available."
     except Exception as e:
         logger.error("Tool '%s' crashed: %s", block.name, e, exc_info=True)
+        audit_log("tool_error", chat_id=chat_id, detail=f"{block.name}: {e}")
         return f"Tool error: {e}"
 
 
@@ -1017,11 +1025,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
 
     # Build user content from text + any attachments
     user_content = await _build_user_content(update, context.bot)
     if not user_content:
         return
+
+    text_preview = (user_content[:80] + "...") if isinstance(user_content, str) and len(user_content) > 80 else ""
+    audit_log("message", chat_id=chat_id, user_id=user_id, detail=text_preview if isinstance(user_content, str) else "multimodal")
 
     lock = _chat_locks[chat_id]
     if lock.locked():

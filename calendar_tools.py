@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from google.auth.transport.requests import Request
@@ -23,14 +23,14 @@ class GoogleCalendarClient:
             client_secret=client_secret,
             token_uri="https://oauth2.googleapis.com/token",
         )
-        creds.refresh(Request())
+        creds.refresh(Request(timeout=30))
         self.service = build("calendar", "v3", credentials=creds)
 
     def list_events(self, days_ahead: int = 7, max_results: int = 20, calendar_id: str = "primary") -> list[dict]:
         """List upcoming events."""
-        now = datetime.utcnow()
-        time_min = now.isoformat() + "Z"
-        time_max = (now + timedelta(days=days_ahead)).isoformat() + "Z"
+        now = datetime.now(tz=timezone.utc)
+        time_min = now.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+        time_max = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
         results = (
             self.service.events()

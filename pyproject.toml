@@ -5,13 +5,14 @@ description = "Chat with Claude on Telegram. Code against GitHub."
 requires-python = ">=3.12"
 dependencies = [
     "python-telegram-bot[job-queue]==21.6",
-    "anthropic>=0.49.0",
+    "anthropic>=0.79.0",
     "python-dotenv==1.0.1",
     "requests>=2.31.0",
     "ddgs>=7.0.0",
     "google-api-python-client>=2.100.0",
     "google-auth>=2.23.0",
     "google-auth-oauthlib>=1.1.0",
+    "aiohttp>=3.9.0",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +35,7 @@ build-backend = "setuptools.build_meta"
 py-modules = [
     "bot", "bot_agent", "persistence", "shared", "github_tools", "web_tools",
     "calendar_tools", "tasks_tools", "email_tools", "claude_code",
-    "setup_google",
+    "setup_google", "webhooks",
 ]
 
 [tool.setuptools.dynamic]
@@ -108,6 +109,7 @@ module = [
     "google.*",
     "googleapiclient.*",
     "google_auth_oauthlib.*",
+    "aiohttp.*",
 ]
 ignore_missing_imports = true
 
@@ -137,3 +139,4 @@ omit = [
 [tool.coverage.report]
 show_missing = true
 skip_empty = true
+fail_under = 40

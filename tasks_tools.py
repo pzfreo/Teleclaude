@@ -22,7 +22,7 @@ class GoogleTasksClient:
             client_secret=client_secret,
             token_uri="https://oauth2.googleapis.com/token",
         )
-        creds.refresh(Request())
+        creds.refresh(Request(timeout=30))
         self.service = build("tasks", "v1", credentials=creds)
 
     def list_tasklists(self) -> list[dict]:

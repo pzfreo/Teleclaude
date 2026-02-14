@@ -23,7 +23,7 @@ class GmailSendClient:
             client_secret=client_secret,
             token_uri="https://oauth2.googleapis.com/token",
         )
-        creds.refresh(Request())
+        creds.refresh(Request(timeout=30))
         self.service = build("gmail", "v1", credentials=creds)
 
     def send_email(self, to: str, subject: str, body: str, cc: str = "", bcc: str = "") -> dict:

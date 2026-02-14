@@ -59,17 +59,30 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-## Deploy to Railway
+## Deploy to DigitalOcean
 
-1. Push this repo to GitHub
-2. Go to [railway.app](https://railway.app) and create a new project from your repo
-3. Add environment variables in the Railway dashboard:
-   - `TELEGRAM_BOT_TOKEN`
-   - `ANTHROPIC_API_KEY`
-   - `GITHUB_TOKEN`
-   - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (if using Google integrations)
-   - (and any optional ones from `.env.example`)
-4. Railway will auto-detect the `Procfile` and deploy
+The included `deploy.sh` script handles creating, deploying, and managing a droplet.
+
+```bash
+# First time: create a droplet and deploy
+./deploy.sh create
+
+# Update an existing deployment
+./deploy.sh
+
+# Other commands
+./deploy.sh logs      # Tail container logs
+./deploy.sh ssh       # SSH into the droplet
+./deploy.sh env       # Push updated .env files
+./deploy.sh destroy   # Tear down the droplet
+```
+
+**Prerequisites:**
+- `doctl` CLI authenticated with your DigitalOcean account
+- An SSH key added to your DigitalOcean account
+- `.env` file with your tokens (copy `.env.example`)
+
+CI/CD is also configured via `.github/workflows/deploy.yml` — pushes to `main` auto-deploy to the droplet. Set `DROPLET_SSH_KEY` and `DROPLET_IP` as GitHub Actions secrets.
 
 ## Usage
 
