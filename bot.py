@@ -263,8 +263,9 @@ CLAUDE_CODE_TOOL = {
         "web search — use the dedicated tools for those.\n\n"
         "Context sharing: Include all relevant context from the conversation in "
         "your prompt — prior decisions, requirements discussed, error messages, "
-        "architectural choices, etc. The CLI cannot see conversation history or "
-        "images, so describe any visual content (screenshots, diagrams) in text. "
+        "architectural choices, etc. The CLI cannot see conversation history, "
+        "so be thorough. If the user sent images or documents, include the "
+        "file paths from the system context — the CLI can read them directly. "
         "The CLI maintains its own session, so follow-up coding tasks will have "
         "context from previous coding calls."
     ),
@@ -723,6 +724,7 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     conversations[chat_id] = []
     chat_todos[chat_id] = []
     chat_plan_mode[chat_id] = False
+    chat_attachments.pop(chat_id, None)
     clear_conversation(chat_id)
     save_todos(chat_id, [])
     save_plan_mode(chat_id, False)
@@ -951,6 +953,34 @@ def _execute_tool_call(block, repo, chat_id) -> str:
 _IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 _SUPPORTED_DOC_MIMES = _IMAGE_MIME_TYPES | {"application/pdf"}
 
+_MIME_TO_EXT = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+    "image/webp": ".webp", "application/pdf": ".pdf",
+}
+
+# Track saved attachment paths per chat for Claude Code access
+chat_attachments: dict[int, list[str]] = {}
+
+
+def _save_attachment(chat_id: int, data: bytes, mime: str, label: str = "") -> str:
+    """Save attachment to shared directory, return the absolute path."""
+    if claude_code_mgr:
+        shared_dir = claude_code_mgr.workspace_root / ".shared" / str(chat_id)
+    else:
+        shared_dir = _Path("workspaces/.shared") / str(chat_id)
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    ext = _MIME_TO_EXT.get(mime, "")
+    name = f"{label}_{int(time.time())}{ext}" if label else f"{int(time.time())}{ext}"
+    path = shared_dir / name
+    path.write_bytes(data)
+    if chat_id not in chat_attachments:
+        chat_attachments[chat_id] = []
+    abs_path = str(path.resolve())
+    chat_attachments[chat_id].append(abs_path)
+    # Keep only last 20 attachments tracked
+    chat_attachments[chat_id] = chat_attachments[chat_id][-20:]
+    return abs_path
+
 
 async def _download_telegram_file(file_obj, bot) -> bytes:
     """Download a Telegram file and return its bytes."""
@@ -967,6 +997,8 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
     content_blocks = []
     text = msg.text or msg.caption or ""
 
+    chat_id = msg.chat_id
+
     # Photos (Telegram sends multiple sizes; take the largest)
     if msg.photo:
         try:
@@ -976,6 +1008,7 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
                 "type": "image",
                 "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(data).decode()},
             })
+            _save_attachment(chat_id, data, "image/jpeg", "photo")
         except Exception as e:
             logger.warning("Failed to download photo: %s", e)
             text += "\n[Photo attached but could not be downloaded]"
@@ -989,6 +1022,7 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
                 "type": "image",
                 "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(data).decode()},
             })
+            _save_attachment(chat_id, data, media_type, "sticker")
             if not text:
                 text = f"[Sticker: {msg.sticker.emoji or 'unknown'}]"
         except Exception as e:
@@ -1011,6 +1045,7 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
                         "type": "document",
                         "source": {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(data).decode()},
                     })
+                _save_attachment(chat_id, data, mime, fname.rsplit(".", 1)[0])
             elif mime.startswith("text/") or fname.endswith((".txt", ".py", ".js", ".ts", ".json", ".md", ".csv", ".yaml", ".yml", ".toml", ".xml", ".html", ".css", ".sh", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".rb", ".sql", ".log")):
                 data = await _download_telegram_file(msg.document, bot)
                 file_text = data.decode("utf-8", errors="replace")
@@ -1177,6 +1212,14 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
             "the conversation in your prompt (the CLI can't see chat history or images). "
             "For non-coding tasks, use the dedicated tools."
         )
+        # Tell Claude about saved attachments so it can pass paths to the CLI
+        attachments = chat_attachments.get(chat_id, [])
+        if attachments:
+            paths = "\n".join(f"  - {p}" for p in attachments[-5:])
+            system += (
+                f"\n\nRecent attachments saved to disk (the CLI can read these directly):\n{paths}\n"
+                "When delegating tasks that reference these files, include the file paths in your prompt."
+            )
 
     max_rounds = MAX_TOOL_ROUNDS
 
