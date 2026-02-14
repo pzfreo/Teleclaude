@@ -77,6 +77,9 @@ def _check_required_config() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN is not set.")
         sys.exit(1)
+    if not cli_path:
+        logger.error("Claude CLI not found in PATH. Agent bot cannot function.")
+        sys.exit(1)
 
 
 if not GITHUB_TOKEN:
@@ -107,15 +110,12 @@ TYPING_INTERVAL = 4
 
 claude_code_mgr = None
 cli_path = os.getenv("CLAUDE_CLI_PATH", "") or shutil.which("claude")
-if GITHUB_TOKEN and cli_path:
+if cli_path:
     claude_code_mgr = ClaudeCodeManager(GITHUB_TOKEN, cli_path=cli_path)
-    logger.info("Claude Code CLI: enabled (path=%s)", claude_code_mgr.cli_path)
-elif not cli_path:
-    logger.error("Claude CLI not found in PATH. Agent bot cannot function.")
-    sys.exit(1)
-else:
-    claude_code_mgr = ClaudeCodeManager(GITHUB_TOKEN, cli_path=cli_path)
-    logger.info("Claude Code CLI: enabled without GITHUB_TOKEN")
+    if GITHUB_TOKEN:
+        logger.info("Claude Code CLI: enabled (path=%s)", claude_code_mgr.cli_path)
+    else:
+        logger.info("Claude Code CLI: enabled without GITHUB_TOKEN")
 
 # ── State ─────────────────────────────────────────────────────────────
 
