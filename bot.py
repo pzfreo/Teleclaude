@@ -38,8 +38,6 @@ from persistence import (
     save_todos,
     load_plan_mode,
     save_plan_mode,
-    load_agent_mode,
-    save_agent_mode,
     load_model,
     save_model,
     load_active_branch,
@@ -254,6 +252,34 @@ You are a knowledgeable assistant across many domains — not just coding. You c
 
 # ── Internal tools (always available) ─────────────────────────────────
 
+CLAUDE_CODE_TOOL = {
+    "name": "run_claude_code",
+    "description": (
+        "Delegate a coding task to Claude Code, which has full filesystem access "
+        "to the active repository clone — it can read, write, and create files, "
+        "run bash commands, execute tests, and use git. Use this for any task "
+        "that requires interacting with the codebase.\n\n"
+        "Do NOT use this for non-coding tasks like calendar, email, tasks, or "
+        "web search — use the dedicated tools for those.\n\n"
+        "Context sharing: Include all relevant context from the conversation in "
+        "your prompt — prior decisions, requirements discussed, error messages, "
+        "architectural choices, etc. The CLI cannot see conversation history or "
+        "images, so describe any visual content (screenshots, diagrams) in text. "
+        "The CLI maintains its own session, so follow-up coding tasks will have "
+        "context from previous coding calls."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "Complete task description with all relevant context",
+            }
+        },
+        "required": ["prompt"],
+    },
+}
+
 TODO_TOOL = {
     "name": "update_todo_list",
     "description": (
@@ -292,7 +318,6 @@ for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
 MAX_HISTORY = 50
 MAX_TELEGRAM_LENGTH = 4096
 MAX_TOOL_ROUNDS = 15
-MAX_TOOL_ROUNDS_AGENT = 30
 TYPING_INTERVAL = 4  # seconds between typing indicator refreshes
 PROGRESS_INTERVAL = 15  # seconds before sending a progress message
 
@@ -311,8 +336,6 @@ active_branches: dict[int, str] = {}
 chat_models: dict[int, str] = {}
 chat_todos: dict[int, list[dict]] = {}
 chat_plan_mode: dict[int, bool] = {}
-chat_agent_mode: dict[int, bool] = {}
-
 # Per-chat locks to prevent concurrent message handling corruption
 _chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 
@@ -361,12 +384,6 @@ def get_plan_mode(chat_id: int) -> bool:
     if chat_id not in chat_plan_mode:
         chat_plan_mode[chat_id] = load_plan_mode(chat_id)
     return chat_plan_mode[chat_id]
-
-
-def get_agent_mode(chat_id: int) -> bool:
-    if chat_id not in chat_agent_mode:
-        chat_agent_mode[chat_id] = load_agent_mode(chat_id)
-    return chat_agent_mode[chat_id]
 
 
 def format_todo_list(todos: list[dict]) -> str:
@@ -604,7 +621,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/new - Start a fresh conversation\n"
         "/model - Show or switch Claude model (opus/sonnet/haiku)\n"
         "/plan - Toggle plan mode (outline before executing)\n"
-        "/agent - Toggle agent mode (autonomous + extended thinking)\n"
         "/todo - Show current task list (/todo clear to reset)\n"
         "/briefing - Get a daily summary of calendar + tasks\n"
         "/logs [min] - Download recent logs (default 5 min)\n"
@@ -707,11 +723,9 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     conversations[chat_id] = []
     chat_todos[chat_id] = []
     chat_plan_mode[chat_id] = False
-    chat_agent_mode[chat_id] = False
     clear_conversation(chat_id)
     save_todos(chat_id, [])
     save_plan_mode(chat_id, False)
-    save_agent_mode(chat_id, False)
     set_active_branch(chat_id, None)
     if claude_code_mgr:
         claude_code_mgr.new_session(chat_id)
@@ -768,39 +782,6 @@ async def toggle_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     else:
         await update.message.reply_text("Plan mode OFF. I'll execute tasks directly.")
-
-
-async def toggle_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
-        return
-    chat_id = update.effective_chat.id
-    current = get_agent_mode(chat_id)
-    new_mode = not current
-    chat_agent_mode[chat_id] = new_mode
-    save_agent_mode(chat_id, new_mode)
-    if new_mode:
-        repo = get_active_repo(chat_id)
-        use_cli = repo and claude_code_mgr and claude_code_mgr.available
-        if use_cli:
-            await update.message.reply_text(
-                "Agent mode ON (Claude Code CLI).\n"
-                "Messages will route through claude CLI with:\n"
-                "- Native file editing, bash, and git\n"
-                "- Session continuity across messages\n"
-                "- 10-minute timeout per request\n"
-                "Set /repo or /branch, then send coding tasks."
-            )
-        else:
-            await update.message.reply_text(
-                "Agent mode ON. I'll work autonomously:\n"
-                "- Extended thinking for deeper reasoning\n"
-                "- Up to 30 tool rounds per message\n"
-                "- Full repo exploration before changes\n"
-                "- CI/test checks after changes\n"
-                "- Proactive issue investigation"
-            )
-    else:
-        await update.message.reply_text("Agent mode OFF. Back to normal conversational mode.")
 
 
 async def show_todos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1107,49 +1088,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _process_message(chat_id, user_content, update, context)
 
 
-async def _process_claude_code_message(
-    chat_id: int, user_content, repo: str,
-    update: Update, context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """Process a message via Claude Code CLI instead of the API tool loop."""
-    bot = context.bot
-
-    # Extract plain text — Claude Code CLI doesn't support images
-    if isinstance(user_content, str):
-        prompt = user_content
-    elif isinstance(user_content, list):
-        text_parts = [b["text"] for b in user_content if isinstance(b, dict) and b.get("type") == "text"]
-        has_images = any(isinstance(b, dict) and b.get("type") in ("image", "document") for b in user_content)
-        prompt = "\n".join(text_parts)
-        if has_images:
-            await bot.send_message(chat_id=chat_id,
-                                   text="(Images/documents can't be sent to Claude Code — processing text only)")
-    else:
-        return
-
-    if not prompt.strip():
-        await bot.send_message(chat_id=chat_id, text="No text to process.")
-        return
-
+async def _execute_claude_code_tool(block, repo, chat_id, progress):
+    """Execute a run_claude_code tool call via Claude Code CLI."""
+    prompt = block.input.get("prompt", "")
     branch = get_active_branch(chat_id)
     model = get_model(chat_id)
 
-    # Typing indicator + progress
-    stop_typing = asyncio.Event()
-    start_time = time.time()
-    progress_tools: list[str] = []
-    progress_status = {"round": 0, "max": 1, "tools": progress_tools}
-    typing_task = asyncio.create_task(
-        keep_typing(update.effective_chat, stop_typing, start_time, bot, progress_status)
-    )
-
-    tool_counter = 0
-
-    async def on_progress(tool_name: str):
-        nonlocal tool_counter
-        tool_counter += 1
-        progress_tools.append(tool_name)
-        progress_status["round"] = tool_counter
+    async def on_progress(tool_name):
+        progress["tools"].append(f"cc:{tool_name}")
 
     try:
         result = await claude_code_mgr.run(
@@ -1164,18 +1110,7 @@ async def _process_claude_code_message(
         logger.error("Claude Code run failed: %s", e, exc_info=True)
         result = f"Claude Code error: {e}"
 
-    stop_typing.set()
-    await typing_task
-
-    # Send result
-    await send_long_message(chat_id, result or "(no response)", bot)
-
-    # Append lightweight summary to conversation history for context continuity
-    history = get_conversation(chat_id)
-    history.append({"role": "user", "content": prompt})
-    summary = result if len(result) <= 2000 else result[:2000] + "\n... (truncated in history)"
-    history.append({"role": "assistant", "content": f"[Via Claude Code CLI]\n{summary}"})
-    save_state(chat_id)
+    return result or "(no output)"
 
 
 async def _process_message(chat_id: int, user_content, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1233,29 +1168,17 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
             "Only proceed after they approve. Use the update_todo_list tool to track the plan steps."
         )
 
-    agent_mode = get_agent_mode(chat_id)
-
-    # Route to Claude Code CLI when agent mode + repo + CLI available
-    if agent_mode and repo and claude_code_mgr and claude_code_mgr.available:
-        await _process_claude_code_message(chat_id, user_content, repo, update, context)
-        return
-
-    if agent_mode:
+    # Add Claude Code tool when repo is set and CLI is available
+    if repo and claude_code_mgr and claude_code_mgr.available:
+        tools.append(CLAUDE_CODE_TOOL)
         system += (
-            "\n\nAGENT MODE IS ON. You are an autonomous coding agent. Work like Claude Code:"
-            "\n- Think deeply about the problem before acting."
-            "\n- For coding tasks: explore the repo structure first (use get_tree), read relevant files, "
-            "understand the codebase, then make changes."
-            "\n- Always use update_todo_list to track your progress on multi-step tasks."
-            "\n- After making code changes, check if the repo has CI workflows and review their status."
-            "\n- If CI fails, read the logs, diagnose, and fix the issue."
-            "\n- Be thorough — investigate related files, not just the one that was mentioned."
-            "\n- When fixing bugs: find the root cause, don't just patch symptoms."
-            "\n- When adding features: consider edge cases, error handling, and test coverage."
-            "\n- Report back concisely when done with a summary of what you did."
+            "\n\nWhen run_claude_code is available, use it for any task involving the codebase — "
+            "reading files, making changes, running tests, git operations. Include full context from "
+            "the conversation in your prompt (the CLI can't see chat history or images). "
+            "For non-coding tasks, use the dedicated tools."
         )
 
-    max_rounds = MAX_TOOL_ROUNDS_AGENT if agent_mode else MAX_TOOL_ROUNDS
+    max_rounds = MAX_TOOL_ROUNDS
 
     # Shared progress status — the tool loop writes, keep_typing reads
     progress = {"round": 0, "max": max_rounds, "tools": [], "last_update_round": -1}
@@ -1273,16 +1196,12 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
 
             kwargs = {
                 "model": get_model(chat_id),
-                "max_tokens": 16384 if agent_mode else 4096,
+                "max_tokens": 8192,
                 "system": system,
                 "messages": history,
             }
             if tools:
                 kwargs["tools"] = tools
-
-            # Extended thinking in agent mode
-            if agent_mode:
-                kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
 
             response = await _call_anthropic(**kwargs)
 
@@ -1305,11 +1224,16 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
                 if block.type == "tool_use":
                     logger.info("Tool call [%d]: %s(%s)", round_num + 1, block.name, json.dumps(block.input)[:200])
                     progress["tools"].append(block.name)
-                    result = await loop.run_in_executor(
-                        None, _execute_tool_call, block, repo, chat_id
-                    )
-                    if len(result) > 10000:
-                        result = result[:10000] + "\n... (truncated)"
+                    if block.name == "run_claude_code":
+                        result = await _execute_claude_code_tool(block, repo, chat_id, progress)
+                    else:
+                        result = await loop.run_in_executor(
+                            None, _execute_tool_call, block, repo, chat_id
+                        )
+                    # Claude Code results get higher limit to preserve detail
+                    max_result = 50000 if block.name == "run_claude_code" else 10000
+                    if len(result) > max_result:
+                        result = result[:max_result] + "\n... (truncated)"
                     tool_results.append(
                         {"type": "tool_result", "tool_use_id": block.id, "content": result}
                     )
@@ -1457,15 +1381,12 @@ async def notify_startup(app: Application) -> None:
             repo = get_active_repo(user_id)
             branch = get_active_branch(user_id)
             todos = get_todos(user_id)
-            agent = get_agent_mode(user_id)
             user_msg = msg
             if repo:
                 repo_line = f"\nActive repo: {repo}"
                 if branch:
                     repo_line += f" ({branch})"
                 user_msg += repo_line
-            if agent:
-                user_msg += "\nAgent mode: ON"
             if todos:
                 pending = sum(1 for t in todos if t.get("status") != "completed")
                 done = len(todos) - pending
@@ -1488,7 +1409,6 @@ def main() -> None:
     app.add_handler(CommandHandler("new", new_conversation))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("plan", toggle_plan))
-    app.add_handler(CommandHandler("agent", toggle_agent))
     app.add_handler(CommandHandler("todo", show_todos))
     app.add_handler(CommandHandler("todos", show_todos))
     app.add_handler(CommandHandler("briefing", trigger_briefing))
