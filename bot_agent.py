@@ -72,9 +72,10 @@ AVAILABLE_MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
 }
 
-if not TELEGRAM_BOT_TOKEN:
-    logger.error("TELEGRAM_BOT_TOKEN is not set.")
-    sys.exit(1)
+def _check_required_config() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN is not set.")
+        sys.exit(1)
 
 if not GITHUB_TOKEN:
     logger.warning("GITHUB_TOKEN is not set — Claude Code will have no GitHub access.")
@@ -626,6 +627,7 @@ async def notify_startup(app: Application) -> None:
 
 
 def main() -> None:
+    _check_required_config()
     init_db()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
