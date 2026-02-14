@@ -32,9 +32,7 @@ class TestGmailSendClient:
     def test_send_email_with_cc_bcc(self):
         client, svc = self._make_client()
         svc.users().messages().send().execute.return_value = {"id": "msg2"}
-        result = client.send_email(
-            "to@example.com", "Subject", "Body", cc="cc@example.com", bcc="bcc@example.com"
-        )
+        result = client.send_email("to@example.com", "Subject", "Body", cc="cc@example.com", bcc="bcc@example.com")
         assert result["id"] == "msg2"
 
 
@@ -49,11 +47,15 @@ class TestExecuteTool:
             "to": "test@example.com",
             "subject": "Hello",
         }
-        result = execute_tool(client, "send_email", {
-            "to": "test@example.com",
-            "subject": "Hello",
-            "body": "Hi there",
-        })
+        result = execute_tool(
+            client,
+            "send_email",
+            {
+                "to": "test@example.com",
+                "subject": "Hello",
+                "body": "Hi there",
+            },
+        )
         parsed = json.loads(result)
         assert parsed["status"] == "sent"
 
@@ -69,9 +71,13 @@ class TestExecuteTool:
 
         client = MagicMock()
         client.send_email.side_effect = RuntimeError("SMTP error")
-        result = execute_tool(client, "send_email", {
-            "to": "x@y.com",
-            "subject": "Test",
-            "body": "Body",
-        })
+        result = execute_tool(
+            client,
+            "send_email",
+            {
+                "to": "x@y.com",
+                "subject": "Test",
+                "body": "Body",
+            },
+        )
         assert "Gmail error" in result

@@ -1033,7 +1033,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     text_preview = (user_content[:80] + "...") if isinstance(user_content, str) and len(user_content) > 80 else ""
-    audit_log("message", chat_id=chat_id, user_id=user_id, detail=text_preview if isinstance(user_content, str) else "multimodal")
+    audit_log(
+        "message",
+        chat_id=chat_id,
+        user_id=user_id,
+        detail=text_preview if isinstance(user_content, str) else "multimodal",
+    )
 
     lock = _chat_locks[chat_id]
     if lock.locked():

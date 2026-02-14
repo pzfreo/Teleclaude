@@ -156,7 +156,7 @@ tests/              # pytest test suite
 - **Mocking:** Always mock external APIs (Telegram, Anthropic, Google, GitHub). Use `unittest.mock.AsyncMock` for async methods, `MagicMock` for sync.
 - **File naming:** `tests/test_{module}.py` mirrors the source module
 - **Test classes:** Group related tests in classes (`TestSomething`). No `setUp`/`tearDown` — use pytest fixtures.
-- **Coverage floor:** `fail_under` in `pyproject.toml [tool.coverage.report]`. Currently 40, incrementally raising.
+- **Coverage floor:** `fail_under` in `pyproject.toml [tool.coverage.report]`. Currently 55, incrementally raising.
 
 ### Writing new tool modules
 1. Follow the pattern in existing modules (export `TOOLS` list + `Client` class + `execute_tool` function)

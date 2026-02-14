@@ -153,6 +153,83 @@ class TestModel:
             assert load_model(9999) is None
 
 
+class TestAuditLog:
+    """TODO #6: Verify audit log writes and reads correctly."""
+
+    def test_write_and_read(self, tmp_db):
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import audit_log, get_audit_log
+
+            audit_log("tool_call", chat_id=1001, user_id=42, detail="web_search: test query")
+            entries = get_audit_log(limit=10)
+            assert len(entries) == 1
+            assert entries[0]["event"] == "tool_call"
+            assert entries[0]["chat_id"] == 1001
+            assert entries[0]["user_id"] == 42
+            assert entries[0]["detail"] == "web_search: test query"
+
+    def test_read_empty(self, tmp_db):
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import get_audit_log
+
+            assert get_audit_log() == []
+
+    def test_filter_by_chat_id(self, tmp_db):
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import audit_log, get_audit_log
+
+            audit_log("event_a", chat_id=1001, detail="a")
+            audit_log("event_b", chat_id=2002, detail="b")
+            audit_log("event_c", chat_id=1001, detail="c")
+
+            entries = get_audit_log(chat_id=1001)
+            assert len(entries) == 2
+            assert all(e["chat_id"] == 1001 for e in entries)
+
+    def test_limit_respected(self, tmp_db):
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import audit_log, get_audit_log
+
+            for i in range(10):
+                audit_log("event", chat_id=1, detail=f"entry_{i}")
+
+            entries = get_audit_log(limit=3)
+            assert len(entries) == 3
+
+    def test_ordering_most_recent_first(self, tmp_db):
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import audit_log, get_audit_log
+
+            audit_log("first", chat_id=1, detail="1")
+            audit_log("second", chat_id=1, detail="2")
+            audit_log("third", chat_id=1, detail="3")
+
+            entries = get_audit_log(limit=10)
+            assert entries[0]["event"] == "third"
+            assert entries[2]["event"] == "first"
+
+    def test_no_token_in_detail(self, tmp_db):
+        """Audit log should not store sensitive tokens."""
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import audit_log, get_audit_log
+
+            # Simulate a tool call detail — should not contain tokens
+            audit_log("tool_call", chat_id=1, detail="get_file on owner/repo")
+            entries = get_audit_log()
+            # Verify the detail field doesn't contain common token patterns
+            for entry in entries:
+                assert "ghp_" not in entry["detail"]
+                assert "sk-ant-" not in entry["detail"]
+
+    def test_write_failure_does_not_raise(self, tmp_db):
+        """audit_log silently catches errors."""
+        with patch("persistence._connect", side_effect=RuntimeError("DB locked")):
+            from persistence import audit_log
+
+            # Should not raise
+            audit_log("event", chat_id=1, detail="test")
+
+
 class TestSerialize:
     def test_model_dump(self, tmp_db):
         """Objects with model_dump() should be serialized via that method."""

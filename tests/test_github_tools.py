@@ -6,6 +6,53 @@ from unittest.mock import MagicMock
 
 import requests
 
+from github_tools import GitHubClient
+
+
+class TestTimeouts:
+    """TODO #3: Verify all HTTP methods pass timeout."""
+
+    def test_get_passes_timeout(self, github_client, mock_github_session):
+        mock_github_session.get.return_value = mock_github_session._make_response({"default_branch": "main"})
+        github_client.get_default_branch("owner/repo")
+        _, kwargs = mock_github_session.get.call_args
+        assert kwargs.get("timeout") == GitHubClient.DEFAULT_TIMEOUT
+
+    def test_post_passes_timeout(self, github_client, mock_github_session):
+        mock_github_session.get.return_value = mock_github_session._make_response({"object": {"sha": "abc"}})
+        mock_github_session.post.return_value = mock_github_session._make_response({"ref": "refs/heads/new"})
+        github_client.create_branch("owner/repo", "new", "main")
+        _, kwargs = mock_github_session.post.call_args
+        assert kwargs.get("timeout") == GitHubClient.DEFAULT_TIMEOUT
+
+    def test_put_passes_timeout(self, github_client, mock_github_session):
+        mock_github_session.put.return_value = mock_github_session._make_response({"content": {}})
+        github_client.create_or_update_file("o/r", "f.py", "code", "msg", "main")
+        _, kwargs = mock_github_session.put.call_args
+        assert kwargs.get("timeout") == GitHubClient.DEFAULT_TIMEOUT
+
+    def test_patch_passes_timeout(self, github_client, mock_github_session):
+        mock_github_session.patch.return_value = mock_github_session._make_response({})
+        github_client._patch("/test", json={})
+        _, kwargs = mock_github_session.patch.call_args
+        assert kwargs.get("timeout") == GitHubClient.DEFAULT_TIMEOUT
+
+    def test_timeout_error_is_raised(self, github_client, mock_github_session):
+        from github_tools import execute_tool
+
+        mock_github_session.get.side_effect = requests.exceptions.Timeout("Connection timed out")
+        result = execute_tool(github_client, "owner/repo", "get_file", {"path": "test.py"})
+        assert "Error:" in result
+        assert "timed out" in result.lower() or "Timeout" in result
+
+    def test_delete_passes_timeout(self, github_client, mock_github_session):
+        """delete_file uses session.delete directly — verify timeout."""
+        mock_github_session.get.return_value = mock_github_session._make_response({"sha": "abc123"})
+        mock_github_session.delete.return_value = mock_github_session._make_response({})
+        github_client.delete_file("o/r", "f.py", "remove file", "main")
+        _, kwargs = mock_github_session.delete.call_args
+        assert kwargs.get("timeout") == GitHubClient.DEFAULT_TIMEOUT
+
 
 class TestGitHubClient:
     def test_get_file(self, github_client, mock_github_session):

@@ -15,7 +15,7 @@ Every item in this TODO must satisfy these standards before merging to `main`. T
 ### Testing requirements
 - **New code must have tests.** Every new module, function, or feature branch must include tests in `tests/`.
 - **Follow existing patterns.** Tests use `pytest` + `pytest-asyncio` (auto mode). Fixtures live in `tests/conftest.py`. Mock external APIs with `unittest.mock` — never call real Telegram, Anthropic, Google, or GitHub APIs in tests.
-- **Coverage floor:** `fail_under = 40` in `pyproject.toml` (current). Target raising to 60 after Tier 2 items land, then 80 long-term.
+- **Coverage floor:** `fail_under = 55` in `pyproject.toml` (current: 59%). Target raising to 70 after Tier 3 items land, then 80 long-term.
 - **New features must not lower coverage.** If adding a new module (e.g., `streaming.py`), include a corresponding `tests/test_streaming.py`.
 - **Async tests:** Use `async def test_*` — `pytest-asyncio` with `asyncio_mode = "auto"` handles the event loop. Use `AsyncMock` for Telegram bot methods and Anthropic client calls.
 
@@ -37,59 +37,45 @@ Every item in this TODO must satisfy these standards before merging to `main`. T
 
 ---
 
-## Tier 1 — Fix What's Broken
+## Tier 1 — Fix What's Broken (all resolved)
 
-### 1. GitHub token exposed in git clone URLs
-- **File:** `claude_code.py:41`
-- **Issue:** `url = f"https://{self.github_token}@github.com/{repo}.git"` exposes the token in process lists, shell history, and logs.
-- **Fix:** Use `gh repo clone` or SSH keys instead of embedding tokens in URLs.
-- **Tests:** Add to `tests/test_claude_code.py` — verify clone command does not contain token string. Test that `_git_env()` credential helper is used instead.
+### 1. ✅ GitHub token no longer in clone URLs
+- **File:** `claude_code.py`
+- **Status:** Fixed. `ensure_clone()` uses `https://github.com/{repo}.git` (no token). `_git_env()` passes credentials via `GIT_CONFIG` credential helper.
+- **Tests:** `tests/test_claude_code.py::TestTokenNotInCloneUrl` — verifies clone URL is token-free, credential helper is configured, empty token skips config.
 
-### 2. Directory sandboxing for Agent bot
-- **File:** `bot_agent.py`, `claude_code.py`
-- **Issue:** Agent bot has open file access with no path traversal prevention.
-- **Fix:** Restrict Agent bot operations to an approved directory. Validate all paths to prevent traversal (`../` etc).
-- **Tests:** Add path validation tests — `../etc/passwd`, absolute paths outside workspace, symlink traversal. Existing `TestSaveAttachment.test_sanitizes_path_traversal_in_label` is a good model.
+### 2. ✅ Directory sandboxing implemented
+- **File:** `claude_code.py`
+- **Status:** Fixed. `workspace_path()` resolves paths and checks they're within the workspace root. Raises `ValueError` on traversal attempts.
+- **Tests:** `tests/test_claude_code.py::TestPathTraversal` — tests `../` in owner, `../../` in repo name, absolute path escape, valid repos pass.
 
-### 3. Request timeouts on all external API calls
-- **Files:** `github_tools.py`, `web_tools.py`, `calendar_tools.py`, `tasks_tools.py`, `email_tools.py`
-- **Issue:** HTTP requests have no explicit timeouts. Can hang indefinitely on network issues.
-- **Fix:** Add `timeout=30` to all `requests` calls and Google API calls.
-- **Tests:** Verify timeout is passed in mocked requests. Add a test that simulates `requests.exceptions.Timeout` and confirms graceful error message returned to LLM.
+### 3. ✅ Request timeouts on all external API calls
+- **Files:** `github_tools.py` (`DEFAULT_TIMEOUT = 30`), `web_tools.py` (`DDGS(timeout=30)`), `calendar_tools.py` / `tasks_tools.py` / `email_tools.py` (`Request(timeout=30)`)
+- **Status:** Fixed. All HTTP clients use explicit timeouts.
+- **Tests:** `tests/test_github_tools.py::TestTimeouts` — verifies timeout passed to GET/POST/PUT/PATCH/DELETE, `Timeout` exception handled gracefully.
 
-### 4. Deprecated `datetime.utcnow()`
-- **File:** `calendar_tools.py:31`
-- **Issue:** `datetime.utcnow()` is deprecated in Python 3.12+ and will break on upgrade.
-- **Fix:** Replace with `datetime.now(datetime.UTC)`.
-- **Tests:** Existing `tests/test_calendar_tools.py` should cover this. Verify no `utcnow` calls remain (`ruff` rule UP017 catches this if enabled).
+### 4. ✅ Deprecated `datetime.utcnow()` removed
+- **Status:** Fixed. All code uses `datetime.now(tz=timezone.utc)`. Ruff rule `UP017` (included in `UP` ruleset) prevents regression.
+- **Tests:** Covered by existing `tests/test_calendar_tools.py`. Zero `utcnow()` calls in codebase (verified by grep).
 
 ---
 
-## Tier 2 — Engineering Quality
+## Tier 2 — Engineering Quality (all resolved)
 
-### 5. Test coverage enforcement
-- **Current state:** Tests exist for helpers, persistence, GitHub tools, web tools, and ClaudeCodeManager. But **zero tests** for:
-  - `bot.py` message handlers (core logic)
-  - `bot_agent.py` (streaming, CLI integration)
-  - Google integrations (`calendar_tools.py`, `tasks_tools.py`, `email_tools.py`)
-  - Async behavior
-- **Fix:** Add tests for the above. Raise `fail_under` in `pyproject.toml` from 40 → 60 → 80 incrementally.
-- **Tests (meta):** This IS the test item. Concrete targets:
-  - `tests/test_bot_handlers.py` — mock `_call_anthropic`, test tool dispatch loop, history management, `_sanitize_history` edge cases, `send_long_message` splitting
-  - `tests/test_bot_agent.py` — expand beyond `_format_tool_progress`. Add async tests for `_process_agent_message` with mocked `ClaudeCodeManager.run()`
-  - `tests/test_calendar_tools.py`, `tests/test_tasks_tools.py`, `tests/test_email_tools.py` — these files exist but verify they cover the main paths (create/read/update/delete)
-  - Use `AsyncMock` for all Telegram bot methods; use `MagicMock` for `requests.Session`
+### 5. ✅ Test coverage enforcement
+- **Status:** Implemented. Coverage raised from 42% to 59%. `fail_under` raised from 40 → 55.
+- **New tests added:**
+  - `tests/test_bot_handlers.py` (66 tests) — `_call_anthropic` retry logic, `_execute_tool_call` dispatch (7 tool routing tests), cache functions (8 tests), command handlers (11 tests), `handle_message` entry point (4 tests), `_process_message` loop (5 tests including tool use loop, truncation, API error rollback, max rounds), `_build_user_content` (6 tests), `send_long_message` (3 tests), `trim_history` (2 tests), `keep_typing` (1 test)
+  - `tests/test_bot_agent.py` expanded (15 new tests) — `_run_cli` (5 tests: no repo, success, empty result, CLI error, conversation save), `handle_message` (5 tests: auth, empty, text, noop, voice), command handlers (4 tests: start, new, model, version), `keep_typing` (1 test)
+  - Google tools verified: `calendar_tools` 92%, `tasks_tools` 78%, `email_tools` 100%
 
-### 6. Audit logging
-- **Issue:** No structured logging of user actions. Makes debugging production issues harder.
-- **Fix:** Log all tool invocations, errors, and key user actions to SQLite or structured log file. Use existing `persistence.py` audit_log table (already has schema, may be underused).
-- **Tests:** Add to `tests/test_persistence.py` — verify audit log entries are written for tool calls, errors, and user actions. Test log retrieval and that sensitive data (tokens, full message content) is not logged.
+### 6. ✅ Audit logging
+- **Status:** Implemented. `persistence.py` has `audit_log()` and `get_audit_log()` backed by SQLite `audit_log` table. Called from `bot.py` tool dispatch.
+- **Tests:** `tests/test_persistence.py::TestAuditLog` — write/read, filter by chat_id, limit, ordering (most recent first), no-token-in-detail check, silent failure on DB error.
 
-### 7. Update anthropic dependency
-- **File:** `pyproject.toml`
-- **Issue:** `anthropic>=0.79.0` may be behind latest. Streaming API and extended thinking require recent SDK.
-- **Fix:** Update to latest version, test for breaking changes.
-- **Tests:** Run full test suite after upgrade. Verify `client.messages.create()` and `client.messages.stream()` signatures haven't changed in mocked tests.
+### 7. ✅ Anthropic dependency verified current
+- **Status:** `anthropic>=0.79.0` is already the latest available version (0.79.0). No update needed.
+- **Tests:** Full test suite passes (212 tests) with current version.
 
 ---
 

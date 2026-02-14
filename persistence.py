@@ -259,6 +259,5 @@ def get_audit_log(limit: int = 100, chat_id: int | None = None) -> list[dict]:
         ).fetchall()
     conn.close()
     return [
-        {"id": r[0], "timestamp": r[1], "chat_id": r[2], "user_id": r[3], "event": r[4], "detail": r[5]}
-        for r in rows
+        {"id": r[0], "timestamp": r[1], "chat_id": r[2], "user_id": r[3], "event": r[4], "detail": r[5]} for r in rows
     ]

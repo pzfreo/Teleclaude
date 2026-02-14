@@ -51,7 +51,9 @@ class ClaudeCodeManager:
             # Use a credential helper that feeds user=token, password=token
             env["GIT_CONFIG_COUNT"] = "1"
             env["GIT_CONFIG_KEY_0"] = "credential.helper"
-            env["GIT_CONFIG_VALUE_0"] = f"!f() {{ echo username=x-access-token; echo password={self.github_token}; }}; f"
+            env["GIT_CONFIG_VALUE_0"] = (
+                f"!f() {{ echo username=x-access-token; echo password={self.github_token}; }}; f"
+            )
         return env
 
     async def ensure_clone(self, repo: str) -> Path:

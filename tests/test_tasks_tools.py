@@ -24,9 +24,7 @@ class TestGoogleTasksClient:
 
     def test_list_tasklists(self):
         client, svc = self._make_client()
-        svc.tasklists().list().execute.return_value = {
-            "items": [{"id": "tl1", "title": "My Tasks"}]
-        }
+        svc.tasklists().list().execute.return_value = {"items": [{"id": "tl1", "title": "My Tasks"}]}
         result = client.list_tasklists()
         assert len(result) == 1
         assert result[0]["title"] == "My Tasks"
