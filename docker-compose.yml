@@ -5,10 +5,19 @@ services:
     env_file: .env
     volumes:
       - teleclaude-data:/app/data
+
+  teleclaude-agent:
+    build: .
+    restart: unless-stopped
+    env_file: .env.agent
+    command: ["python", "bot_agent.py"]
+    volumes:
+      - teleclaude-agent-data:/app/data
       - teleclaude-workspaces:/app/workspaces
       - teleclaude-claude-config:/home/teleclaude/.claude
 
 volumes:
   teleclaude-data:
+  teleclaude-agent-data:
   teleclaude-workspaces:
   teleclaude-claude-config:

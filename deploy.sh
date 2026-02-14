@@ -110,9 +110,15 @@ case "$COMMAND" in
         echo "==> Copying project files..."
         copy_files "$IP"
 
-        echo "==> Copying .env..."
+        echo "==> Copying .env files..."
         scp -o StrictHostKeyChecking=accept-new .env "${SSH_USER}@${IP}:${REMOTE_DIR}/.env"
         ssh_run "$IP" "chmod 600 ${REMOTE_DIR}/.env"
+        if [ -f .env.agent ]; then
+            scp -o StrictHostKeyChecking=accept-new .env.agent "${SSH_USER}@${IP}:${REMOTE_DIR}/.env.agent"
+            ssh_run "$IP" "chmod 600 ${REMOTE_DIR}/.env.agent"
+        else
+            echo "WARNING: No .env.agent file found. Agent bot won't start without it."
+        fi
 
         # Build and start
         echo "==> Building and starting..."
@@ -153,6 +159,13 @@ case "$COMMAND" in
             ssh_run "$HOST" "chmod 600 ${REMOTE_DIR}/.env"
         else
             echo "WARNING: No .env file found. Create one on the server at ${REMOTE_DIR}/.env"
+        fi
+        if [ -f .env.agent ]; then
+            echo "==> Copying .env.agent..."
+            scp -o StrictHostKeyChecking=accept-new .env.agent "${SSH_USER}@${HOST}:${REMOTE_DIR}/.env.agent"
+            ssh_run "$HOST" "chmod 600 ${REMOTE_DIR}/.env.agent"
+        else
+            echo "WARNING: No .env.agent file found. Agent bot won't start without it."
         fi
 
         echo "==> Building and starting..."
@@ -197,7 +210,7 @@ case "$COMMAND" in
         echo "==> Opening Claude Code login in container..."
         echo "    A URL will appear — open it in your browser to authenticate."
         echo ""
-        ssh -t "${SSH_USER}@${HOST}" "cd ${REMOTE_DIR} && docker compose exec teleclaude claude login"
+        ssh -t "${SSH_USER}@${HOST}" "cd ${REMOTE_DIR} && docker compose exec teleclaude-agent claude login"
         ;;
 
     destroy)
@@ -208,13 +221,20 @@ case "$COMMAND" in
         ;;
 
     env)
-        # Push updated .env to server without redeploying
+        # Push updated .env files to server without redeploying
         HOST="${1:-$(get_ip)}"
         if [ -z "$HOST" ]; then echo "No droplet IP."; exit 1; fi
-        if [ ! -f .env ]; then echo "No .env file found."; exit 1; fi
-        scp -o StrictHostKeyChecking=accept-new .env "${SSH_USER}@${HOST}:${REMOTE_DIR}/.env"
-        ssh_run "$HOST" "chmod 600 ${REMOTE_DIR}/.env"
-        echo "==> .env updated. Run ./deploy.sh to restart with new values."
+        if [ -f .env ]; then
+            scp -o StrictHostKeyChecking=accept-new .env "${SSH_USER}@${HOST}:${REMOTE_DIR}/.env"
+            ssh_run "$HOST" "chmod 600 ${REMOTE_DIR}/.env"
+            echo "==> .env updated."
+        fi
+        if [ -f .env.agent ]; then
+            scp -o StrictHostKeyChecking=accept-new .env.agent "${SSH_USER}@${HOST}:${REMOTE_DIR}/.env.agent"
+            ssh_run "$HOST" "chmod 600 ${REMOTE_DIR}/.env.agent"
+            echo "==> .env.agent updated."
+        fi
+        echo "Run ./deploy.sh to restart with new values."
         ;;
 
     *)

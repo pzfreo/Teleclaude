@@ -11,7 +11,6 @@ import io
 import json
 import logging
 import os
-import shutil
 import sys
 import time
 
@@ -193,22 +192,6 @@ except Exception as e:
     logger.warning("Gmail: failed to load (%s)", e)
     EMAIL_TOOLS = []
 
-# Claude Code CLI
-claude_code_mgr = None
-try:
-    from claude_code import ClaudeCodeManager
-    token = os.getenv("GITHUB_TOKEN", "")
-    if token and shutil.which(os.getenv("CLAUDE_CLI_PATH", "") or "claude"):
-        claude_code_mgr = ClaudeCodeManager(token)
-        logger.info("Claude Code CLI: enabled (path=%s)", claude_code_mgr.cli_path)
-    else:
-        if not token:
-            logger.info("Claude Code CLI: disabled (no GITHUB_TOKEN)")
-        else:
-            logger.info("Claude Code CLI: disabled (claude not found in PATH)")
-except Exception as e:
-    logger.warning("Claude Code CLI: failed to load (%s)", e)
-
 # ── Bot config ───────────────────────────────────────────────────────
 
 USER_TIMEZONE = os.getenv("TIMEZONE", "UTC")
@@ -248,38 +231,11 @@ Attachments:
 - If a user sends an image and wants it saved to a repo, use upload_binary_file with the base64 data from the image.
 - Voice messages and video are not yet supported — ask the user to type instead.
 
-You are a knowledgeable assistant across many domains — not just coding. You can help with writing, research, brainstorming, analysis, math, and general questions."""
+You are a knowledgeable assistant across many domains — not just coding. You can help with writing, research, brainstorming, analysis, math, and general questions.
+
+For coding tasks that need filesystem access (reading/writing files, running tests, git operations), tell the user to use the Agent bot instead — this bot handles API-based tasks like GitHub PRs/issues, web search, calendar, tasks, and email."""
 
 # ── Internal tools (always available) ─────────────────────────────────
-
-CLAUDE_CODE_TOOL = {
-    "name": "run_claude_code",
-    "description": (
-        "Delegate a coding task to Claude Code, which has full filesystem access "
-        "to the active repository clone — it can read, write, and create files, "
-        "run bash commands, execute tests, and use git. Use this for any task "
-        "that requires interacting with the codebase.\n\n"
-        "Do NOT use this for non-coding tasks like calendar, email, tasks, or "
-        "web search — use the dedicated tools for those.\n\n"
-        "Context sharing: Include all relevant context from the conversation in "
-        "your prompt — prior decisions, requirements discussed, error messages, "
-        "architectural choices, etc. The CLI cannot see conversation history, "
-        "so be thorough. If the user sent images or documents, include the "
-        "file paths from the system context — the CLI can read them directly. "
-        "The CLI maintains its own session, so follow-up coding tasks will have "
-        "context from previous coding calls."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "prompt": {
-                "type": "string",
-                "description": "Complete task description with all relevant context",
-            }
-        },
-        "required": ["prompt"],
-    },
-}
 
 TODO_TOOL = {
     "name": "update_todo_list",
@@ -698,21 +654,7 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         active_repos[chat_id] = repo
         save_active_repo(chat_id, repo)
         set_active_branch(chat_id, None)  # reset branch on repo switch
-        msg = f"Active repo set to: {repo} (default branch: {default_branch})"
-        if claude_code_mgr and claude_code_mgr.available:
-            msg += "\nCloning workspace in background..."
-        await update.message.reply_text(msg)
-
-        # Background clone for Claude Code
-        if claude_code_mgr and claude_code_mgr.available:
-            async def _clone_notify():
-                try:
-                    await claude_code_mgr.ensure_clone(repo)
-                    await update.message.reply_text(f"Workspace ready: {repo}")
-                except Exception as e:
-                    logger.error("Background clone failed: %s", e)
-                    await update.message.reply_text(f"Clone failed: {e}")
-            asyncio.create_task(_clone_notify())
+        await update.message.reply_text(f"Active repo set to: {repo} (default branch: {default_branch})")
     except Exception as e:
         await update.message.reply_text(f"Can't access {repo}: {e}")
 
@@ -724,13 +666,10 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     conversations[chat_id] = []
     chat_todos[chat_id] = []
     chat_plan_mode[chat_id] = False
-    chat_attachments.pop(chat_id, None)
     clear_conversation(chat_id)
     save_todos(chat_id, [])
     save_plan_mode(chat_id, False)
     set_active_branch(chat_id, None)
-    if claude_code_mgr:
-        claude_code_mgr.new_session(chat_id)
     await update.message.reply_text("Conversation cleared. Starting fresh.")
 
 
@@ -873,16 +812,7 @@ async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if 0 <= idx < len(branches):
                 branch = branches[idx]
                 set_active_branch(chat_id, branch)
-                msg = f"Active branch set to: {branch}"
-                if claude_code_mgr and claude_code_mgr.available:
-                    ws = claude_code_mgr.workspace_path(repo)
-                    if (ws / ".git").is_dir():
-                        try:
-                            await claude_code_mgr.checkout_branch(repo, branch)
-                            msg += " (checked out locally)"
-                        except Exception as e:
-                            msg += f" (local checkout failed: {e})"
-                await update.message.reply_text(msg)
+                await update.message.reply_text(f"Active branch set to: {branch}")
                 return
             else:
                 await update.message.reply_text(f"Invalid number. Use 1-{len(branches)}.")
@@ -894,19 +824,7 @@ async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Literal branch name
     branch_name = context.args[0]
     set_active_branch(chat_id, branch_name)
-    msg = f"Active branch set to: {branch_name}"
-
-    # Checkout in local clone if available
-    if claude_code_mgr and claude_code_mgr.available and repo:
-        ws = claude_code_mgr.workspace_path(repo)
-        if (ws / ".git").is_dir():
-            try:
-                await claude_code_mgr.checkout_branch(repo, branch_name)
-                msg += " (checked out locally)"
-            except Exception as e:
-                msg += f" (local checkout failed: {e})"
-
-    await update.message.reply_text(msg)
+    await update.message.reply_text(f"Active branch set to: {branch_name}")
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -953,35 +871,6 @@ def _execute_tool_call(block, repo, chat_id) -> str:
 _IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 _SUPPORTED_DOC_MIMES = _IMAGE_MIME_TYPES | {"application/pdf"}
 
-_MIME_TO_EXT = {
-    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
-    "image/webp": ".webp", "application/pdf": ".pdf",
-}
-
-# Track saved attachment paths per chat for Claude Code access
-chat_attachments: dict[int, list[str]] = {}
-
-
-def _save_attachment(chat_id: int, data: bytes, mime: str, label: str = "") -> str:
-    """Save attachment to shared directory, return the absolute path."""
-    if claude_code_mgr:
-        shared_dir = claude_code_mgr.workspace_root / ".shared" / str(chat_id)
-    else:
-        shared_dir = _Path("workspaces/.shared") / str(chat_id)
-    shared_dir.mkdir(parents=True, exist_ok=True)
-    ext = _MIME_TO_EXT.get(mime, "")
-    name = f"{label}_{int(time.time())}{ext}" if label else f"{int(time.time())}{ext}"
-    path = shared_dir / name
-    path.write_bytes(data)
-    if chat_id not in chat_attachments:
-        chat_attachments[chat_id] = []
-    abs_path = str(path.resolve())
-    chat_attachments[chat_id].append(abs_path)
-    # Keep only last 20 attachments tracked
-    chat_attachments[chat_id] = chat_attachments[chat_id][-20:]
-    return abs_path
-
-
 async def _download_telegram_file(file_obj, bot) -> bytes:
     """Download a Telegram file and return its bytes."""
     tg_file = await bot.get_file(file_obj.file_id)
@@ -997,8 +886,6 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
     content_blocks = []
     text = msg.text or msg.caption or ""
 
-    chat_id = msg.chat_id
-
     # Photos (Telegram sends multiple sizes; take the largest)
     if msg.photo:
         try:
@@ -1008,7 +895,6 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
                 "type": "image",
                 "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(data).decode()},
             })
-            _save_attachment(chat_id, data, "image/jpeg", "photo")
         except Exception as e:
             logger.warning("Failed to download photo: %s", e)
             text += "\n[Photo attached but could not be downloaded]"
@@ -1022,7 +908,6 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
                 "type": "image",
                 "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(data).decode()},
             })
-            _save_attachment(chat_id, data, media_type, "sticker")
             if not text:
                 text = f"[Sticker: {msg.sticker.emoji or 'unknown'}]"
         except Exception as e:
@@ -1045,7 +930,6 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
                         "type": "document",
                         "source": {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(data).decode()},
                     })
-                _save_attachment(chat_id, data, mime, fname.rsplit(".", 1)[0])
             elif mime.startswith("text/") or fname.endswith((".txt", ".py", ".js", ".ts", ".json", ".md", ".csv", ".yaml", ".yml", ".toml", ".xml", ".html", ".css", ".sh", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".rb", ".sql", ".log")):
                 data = await _download_telegram_file(msg.document, bot)
                 file_text = data.decode("utf-8", errors="replace")
@@ -1123,31 +1007,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _process_message(chat_id, user_content, update, context)
 
 
-async def _execute_claude_code_tool(block, repo, chat_id, progress):
-    """Execute a run_claude_code tool call via Claude Code CLI."""
-    prompt = block.input.get("prompt", "")
-    branch = get_active_branch(chat_id)
-    model = get_model(chat_id)
-
-    async def on_progress(tool_name):
-        progress["tools"].append(f"cc:{tool_name}")
-
-    try:
-        result = await claude_code_mgr.run(
-            chat_id=chat_id,
-            repo=repo,
-            prompt=prompt,
-            branch=branch,
-            model=model,
-            on_progress=on_progress,
-        )
-    except Exception as e:
-        logger.error("Claude Code run failed: %s", e, exc_info=True)
-        result = f"Claude Code error: {e}"
-
-    return result or "(no output)"
-
-
 async def _process_message(chat_id: int, user_content, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Core message processing, runs under per-chat lock.
 
@@ -1203,24 +1062,6 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
             "Only proceed after they approve. Use the update_todo_list tool to track the plan steps."
         )
 
-    # Add Claude Code tool when repo is set and CLI is available
-    if repo and claude_code_mgr and claude_code_mgr.available:
-        tools.append(CLAUDE_CODE_TOOL)
-        system += (
-            "\n\nWhen run_claude_code is available, use it for any task involving the codebase — "
-            "reading files, making changes, running tests, git operations. Include full context from "
-            "the conversation in your prompt (the CLI can't see chat history or images). "
-            "For non-coding tasks, use the dedicated tools."
-        )
-        # Tell Claude about saved attachments so it can pass paths to the CLI
-        attachments = chat_attachments.get(chat_id, [])
-        if attachments:
-            paths = "\n".join(f"  - {p}" for p in attachments[-5:])
-            system += (
-                f"\n\nRecent attachments saved to disk (the CLI can read these directly):\n{paths}\n"
-                "When delegating tasks that reference these files, include the file paths in your prompt."
-            )
-
     max_rounds = MAX_TOOL_ROUNDS
 
     # Shared progress status — the tool loop writes, keep_typing reads
@@ -1239,7 +1080,7 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
 
             kwargs = {
                 "model": get_model(chat_id),
-                "max_tokens": 8192,
+                "max_tokens": 4096,
                 "system": system,
                 "messages": history,
             }
@@ -1267,16 +1108,11 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
                 if block.type == "tool_use":
                     logger.info("Tool call [%d]: %s(%s)", round_num + 1, block.name, json.dumps(block.input)[:200])
                     progress["tools"].append(block.name)
-                    if block.name == "run_claude_code":
-                        result = await _execute_claude_code_tool(block, repo, chat_id, progress)
-                    else:
-                        result = await loop.run_in_executor(
-                            None, _execute_tool_call, block, repo, chat_id
-                        )
-                    # Claude Code results get higher limit to preserve detail
-                    max_result = 50000 if block.name == "run_claude_code" else 10000
-                    if len(result) > max_result:
-                        result = result[:max_result] + "\n... (truncated)"
+                    result = await loop.run_in_executor(
+                        None, _execute_tool_call, block, repo, chat_id
+                    )
+                    if len(result) > 10000:
+                        result = result[:10000] + "\n... (truncated)"
                     tool_results.append(
                         {"type": "tool_result", "tool_use_id": block.id, "content": result}
                     )
@@ -1412,8 +1248,6 @@ async def notify_startup(app: Application) -> None:
         integrations.append("Calendar")
     if email_client:
         integrations.append("Gmail")
-    if claude_code_mgr and claude_code_mgr.available:
-        integrations.append("Claude Code CLI")
 
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     enabled = ", ".join(integrations) if integrations else "none"
@@ -1486,14 +1320,13 @@ def main() -> None:
     app.post_init = notify_startup
 
     logger.info(
-        "Teleclaude started — model: %s | github: %s | search: %s | tasks: %s | calendar: %s | email: %s | claude-code: %s",
+        "Teleclaude started — model: %s | github: %s | search: %s | tasks: %s | calendar: %s | email: %s",
         DEFAULT_MODEL,
         "on" if gh_client else "off",
         "on" if web_client else "off",
         "on" if tasks_client else "off",
         "on" if calendar_client else "off",
         "on" if email_client else "off",
-        "on" if (claude_code_mgr and claude_code_mgr.available) else "off",
     )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

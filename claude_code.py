@@ -128,6 +128,7 @@ class ClaudeCodeManager:
         # Build CLI command
         cmd = [self.cli_path, "-p",
                "--output-format", "stream-json",
+               "--verbose",
                "--dangerously-skip-permissions"]
 
         if model:
@@ -210,16 +211,15 @@ class ClaudeCodeManager:
             event_type = event.get("type")
 
             if event_type == "assistant":
-                # Look for tool_use blocks to report progress
+                # Report tool_use blocks with context for progress display
                 message = event.get("message", {})
                 content = message.get("content", [])
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "tool_use":
-                            tool_name = block.get("name", "tool")
                             if on_progress:
                                 try:
-                                    await on_progress(tool_name)
+                                    await on_progress(block)
                                 except Exception:
                                     pass
 
