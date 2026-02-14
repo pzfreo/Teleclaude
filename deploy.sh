@@ -190,6 +190,16 @@ case "$COMMAND" in
         ssh "${SSH_USER}@${HOST}"
         ;;
 
+    login)
+        # Authenticate Claude Code CLI inside the container
+        HOST="${1:-$(get_ip)}"
+        if [ -z "$HOST" ]; then echo "No droplet IP."; exit 1; fi
+        echo "==> Opening Claude Code login in container..."
+        echo "    A URL will appear — open it in your browser to authenticate."
+        echo ""
+        ssh -t "${SSH_USER}@${HOST}" "cd ${REMOTE_DIR} && docker compose exec teleclaude claude login"
+        ;;
+
     destroy)
         echo "==> Destroying droplet: $DROPLET_NAME..."
         doctl compute droplet delete "$DROPLET_NAME" --force
@@ -212,6 +222,7 @@ case "$COMMAND" in
         echo "  ./deploy.sh create              # Create droplet + deploy"
         echo "  ./deploy.sh setup <ip>           # Setup existing server"
         echo "  ./deploy.sh [<ip>]               # Deploy update"
+        echo "  ./deploy.sh login                # Authenticate Claude Code (Max plan)"
         echo "  ./deploy.sh env                  # Push .env update"
         echo "  ./deploy.sh logs                 # Tail logs"
         echo "  ./deploy.sh ssh                  # SSH into droplet"

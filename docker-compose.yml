@@ -6,7 +6,9 @@ services:
     volumes:
       - teleclaude-data:/app/data
       - teleclaude-workspaces:/app/workspaces
+      - teleclaude-claude-config:/root/.claude
 
 volumes:
   teleclaude-data:
   teleclaude-workspaces:
+  teleclaude-claude-config:
