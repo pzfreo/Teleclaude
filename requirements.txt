@@ -1,3 +1,5 @@
+# Canonical deps live in pyproject.toml [project.dependencies].
+# Keep this file in sync for Docker layer caching.
 python-telegram-bot[job-queue]==21.6
 anthropic>=0.49.0
 python-dotenv==1.0.1

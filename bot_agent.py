@@ -1,6 +1,7 @@
 """Teleclaude Agent — every message pipes straight to Claude Code CLI."""
 
 from pathlib import Path as _Path
+
 VERSION = (_Path(__file__).parent / "VERSION").read_text().strip()
 
 import asyncio
@@ -26,38 +27,29 @@ from telegram.ext import (
 
 from claude_code import ClaudeCodeManager
 from persistence import (
-    init_db,
-    load_conversation,
-    save_conversation,
     clear_conversation,
-    load_active_repo,
-    save_active_repo,
-    load_model,
-    save_model,
+    init_db,
     load_active_branch,
+    load_active_repo,
+    load_conversation,
+    load_model,
     save_active_branch,
+    save_active_repo,
+    save_conversation,
+    save_model,
+)
+from shared import (
+    RingBufferHandler,
+    download_telegram_file,
+    send_long_message,
+)
+from shared import (
+    is_authorized as _is_authorized,
 )
 
 load_dotenv()
 
-
-class _RingBufferHandler(logging.Handler):
-    """Keeps the last N log records in a deque for on-demand retrieval."""
-
-    def __init__(self, capacity: int = 5000):
-        super().__init__()
-        self._buf: collections.deque[logging.LogRecord] = collections.deque(maxlen=capacity)
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self._buf.append(record)
-
-    def get_recent(self, seconds: int = 300) -> list[str]:
-        cutoff = time.time() - seconds
-        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        return [formatter.format(r) for r in self._buf if r.created >= cutoff]
-
-
-_ring_handler = _RingBufferHandler()
+_ring_handler = RingBufferHandler()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -96,6 +88,7 @@ for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
 gh_client = None
 try:
     from github_tools import GitHubClient
+
     if GITHUB_TOKEN:
         gh_client = GitHubClient(GITHUB_TOKEN)
         logger.info("GitHub client: enabled (for /repo listing)")
@@ -128,15 +121,16 @@ chat_models: dict[int, str] = {}
 _chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 
 _MIME_TO_EXT = {
-    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
-    "image/webp": ".webp", "application/pdf": ".pdf",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "application/pdf": ".pdf",
 }
 
 
 def is_authorized(user_id: int) -> bool:
-    if not ALLOWED_USER_IDS:
-        return True
-    return user_id in ALLOWED_USER_IDS
+    return _is_authorized(user_id, ALLOWED_USER_IDS)
 
 
 def get_model(chat_id: int) -> str:
@@ -172,15 +166,6 @@ def set_active_branch(chat_id: int, branch: str | None) -> None:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
-
-async def send_long_message(chat_id: int, text: str, bot) -> None:
-    if not text:
-        return
-    for i in range(0, len(text), MAX_TELEGRAM_LENGTH):
-        try:
-            await bot.send_message(chat_id=chat_id, text=text[i : i + MAX_TELEGRAM_LENGTH])
-        except TelegramError as e:
-            logger.warning("Failed to send message chunk to %d: %s", chat_id, e)
 
 
 def _format_tool_progress(block: dict) -> str | None:
@@ -231,7 +216,7 @@ async def keep_typing(chat, stop_event: asyncio.Event, bot):
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=TYPING_INTERVAL)
             break
-        except asyncio.TimeoutError:
+        except TimeoutError:
             continue
 
 
@@ -247,11 +232,11 @@ def _save_attachment(chat_id: int, data: bytes, mime: str, label: str = "") -> s
 
 
 async def _download_telegram_file(file_obj, bot) -> bytes:
-    tg_file = await bot.get_file(file_obj.file_id)
-    return bytes(await tg_file.download_as_bytearray())
+    return await download_telegram_file(file_obj, bot)
 
 
 # ── Commands ──────────────────────────────────────────────────────────
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
@@ -345,6 +330,7 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             logger.error("Clone failed: %s", e)
             await update.message.reply_text(f"Clone failed: {e}")
+
     asyncio.create_task(_clone_notify())
 
 
@@ -402,9 +388,7 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not context.args:
         model = get_model(chat_id)
         shortcuts = ", ".join(AVAILABLE_MODELS.keys())
-        await update.message.reply_text(
-            f"Current model: {model}\nSwitch with: /model <name>\nShortcuts: {shortcuts}"
-        )
+        await update.message.reply_text(f"Current model: {model}\nSwitch with: /model <name>\nShortcuts: {shortcuts}")
         return
 
     choice = context.args[0].lower().strip()
@@ -454,6 +438,7 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ── Message handling ──────────────────────────────────────────────────
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user or not update.effective_chat:
@@ -561,9 +546,7 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
 
     # Typing indicator
     stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(
-        keep_typing(update.effective_chat, stop_typing, bot)
-    )
+    typing_task = asyncio.create_task(keep_typing(update.effective_chat, stop_typing, bot))
 
     try:
         result = await claude_code_mgr.run(
@@ -585,21 +568,25 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
         result = "(no output)"
 
     # Save to conversation history for persistence
-    save_conversation(chat_id, [
-        *load_conversation(chat_id),
-        {"role": "user", "content": prompt},
-        {"role": "assistant", "content": result},
-    ])
+    save_conversation(
+        chat_id,
+        [
+            *load_conversation(chat_id),
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": result},
+        ],
+    )
 
     await send_long_message(chat_id, result, bot)
 
 
 # ── Startup ───────────────────────────────────────────────────────────
 
+
 async def notify_startup(app: Application) -> None:
     if not ALLOWED_USER_IDS:
         return
-    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
     msg = f"Teleclaude Agent v{VERSION} started at {now}\nModel: {DEFAULT_MODEL}\nCLI: {claude_code_mgr.cli_path}"
     for user_id in ALLOWED_USER_IDS:
         try:
@@ -627,13 +614,24 @@ def main() -> None:
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-    app.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE
-         | filters.Sticker.STATIC | filters.LOCATION | filters.CONTACT
-         | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE)
-        & ~filters.COMMAND,
-        handle_message,
-    ))
+    app.add_handler(
+        MessageHandler(
+            (
+                filters.TEXT
+                | filters.PHOTO
+                | filters.Document.ALL
+                | filters.VOICE
+                | filters.Sticker.STATIC
+                | filters.LOCATION
+                | filters.CONTACT
+                | filters.AUDIO
+                | filters.VIDEO
+                | filters.VIDEO_NOTE
+            )
+            & ~filters.COMMAND,
+            handle_message,
+        )
+    )
 
     app.post_init = notify_startup
 

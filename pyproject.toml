@@ -1,0 +1,139 @@
+[project]
+name = "teleclaude"
+dynamic = ["version"]
+description = "Chat with Claude on Telegram. Code against GitHub."
+requires-python = ">=3.12"
+dependencies = [
+    "python-telegram-bot[job-queue]==21.6",
+    "anthropic>=0.49.0",
+    "python-dotenv==1.0.1",
+    "requests>=2.31.0",
+    "ddgs>=7.0.0",
+    "google-api-python-client>=2.100.0",
+    "google-auth>=2.23.0",
+    "google-auth-oauthlib>=1.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=24.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0",
+    "types-requests>=2.31.0",
+    "pre-commit>=4.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "bot", "bot_agent", "persistence", "shared", "github_tools", "web_tools",
+    "calendar_tools", "tasks_tools", "email_tools", "claude_code",
+    "setup_google",
+]
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
+
+# ── Black ────────────────────────────────────────────────────────────
+[tool.black]
+line-length = 120
+target-version = ["py312"]
+
+# ── Ruff ─────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort (import ordering)
+    "UP",   # pyupgrade (modernize syntax)
+    "B",    # flake8-bugbear (common bugs)
+    "SIM",  # flake8-simplify
+    "RUF",  # ruff-specific rules
+    "C4",   # flake8-comprehensions
+    "PIE",  # flake8-pie (misc lints)
+]
+ignore = [
+    "E501",   # line too long (Black handles formatting)
+    "E402",   # module import not at top — VERSION is read before imports (intentional)
+    "SIM105", # contextlib.suppress — try/except/pass is clearer in async Telegram handlers
+    "SIM108", # use ternary operator (readability preference)
+    "SIM102", # nested if — readability preference in some cases
+    "RUF006", # store asyncio.create_task reference — fire-and-forget is intentional
+]
+
+[tool.ruff.lint.per-file-ignores]
+"setup_google.py" = ["T201"]   # print is intentional in setup script
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "persistence",
+    "shared",
+    "github_tools",
+    "web_tools",
+    "calendar_tools",
+    "tasks_tools",
+    "email_tools",
+    "claude_code",
+]
+
+# ── Mypy ─────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = false
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = [
+    "ddgs.*",
+    "telegram.*",
+    "telegram.ext.*",
+    "telegram.error.*",
+    "anthropic.*",
+    "google.*",
+    "googleapiclient.*",
+    "google_auth_oauthlib.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["bot", "bot_agent"]
+# Telegram Update fields (message, effective_user, effective_chat) are Optional
+# but handlers guard with early returns. Suppress the noisy union-attr warnings.
+disable_error_code = ["union-attr", "arg-type"]
+
+# ── Pytest ───────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "--strict-markers -v --tb=short"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+
+# ── Coverage ─────────────────────────────────────────────────────────
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "setup_google.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true

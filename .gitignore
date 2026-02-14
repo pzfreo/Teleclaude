@@ -10,6 +10,10 @@ env/
 dist/
 build/
 .mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
 credentials.json
 token.json
 data/

@@ -1,6 +1,7 @@
 """GitHub API tools that Claude can call via tool_use."""
 
 import base64
+import json
 import logging
 from typing import Any
 
@@ -23,22 +24,22 @@ class GitHubClient:
         )
         self.base = "https://api.github.com"
 
-    def _get(self, path: str, params: dict | None = None) -> dict | list:
+    def _get(self, path: str, params: dict | None = None) -> Any:
         resp = self.session.get(f"{self.base}{path}", params=params)
         resp.raise_for_status()
         return resp.json()
 
-    def _post(self, path: str, json: dict) -> dict:
+    def _post(self, path: str, json: dict) -> Any:
         resp = self.session.post(f"{self.base}{path}", json=json)
         resp.raise_for_status()
         return resp.json()
 
-    def _put(self, path: str, json: dict) -> dict:
+    def _put(self, path: str, json: dict) -> Any:
         resp = self.session.put(f"{self.base}{path}", json=json)
         resp.raise_for_status()
         return resp.json()
 
-    def _patch(self, path: str, json: dict) -> dict:
+    def _patch(self, path: str, json: dict) -> Any:
         resp = self.session.patch(f"{self.base}{path}", json=json)
         resp.raise_for_status()
         return resp.json()
@@ -92,9 +93,7 @@ class GitHubClient:
         sha = ref_data["object"]["sha"]
         return self._post(f"/repos/{repo}/git/refs", json={"ref": f"refs/heads/{branch_name}", "sha": sha})
 
-    def create_pull_request(
-        self, repo: str, title: str, body: str, head: str, base: str = "main"
-    ) -> dict:
+    def create_pull_request(self, repo: str, title: str, body: str, head: str, base: str = "main") -> dict:
         """Create a pull request."""
         data = self._post(
             f"/repos/{repo}/pulls",
@@ -119,25 +118,19 @@ class GitHubClient:
             "title": data["title"],
             "body": data.get("body", ""),
             "state": data["state"],
-            "labels": [l["name"] for l in data.get("labels", [])],
+            "labels": [lbl["name"] for lbl in data.get("labels", [])],
             "url": data["html_url"],
         }
 
     def list_pull_requests(self, repo: str, state: str = "open", limit: int = 10) -> list[dict]:
         """List pull requests."""
         items = self._get(f"/repos/{repo}/pulls", params={"state": state, "per_page": limit})
-        return [
-            {"number": i["number"], "title": i["title"], "state": i["state"], "url": i["html_url"]}
-            for i in items
-        ]
+        return [{"number": i["number"], "title": i["title"], "state": i["state"], "url": i["html_url"]} for i in items]
 
     def search_code(self, repo: str, query: str) -> list[dict]:
         """Search for code in a repo."""
         data = self._get("/search/code", params={"q": f"{query} repo:{repo}"})
-        return [
-            {"path": i["path"], "name": i["name"], "url": i["html_url"]}
-            for i in data.get("items", [])[:10]
-        ]
+        return [{"path": i["path"], "name": i["name"], "url": i["html_url"]} for i in data.get("items", [])[:10]]
 
     def get_default_branch(self, repo: str) -> str:
         """Get the default branch name for a repo."""
@@ -275,9 +268,7 @@ class GitHubClient:
         resp.raise_for_status()
         return resp.text[:15000]  # cap at 15k chars
 
-    def commit_multiple_files(
-        self, repo: str, branch: str, message: str, files: list[dict]
-    ) -> dict:
+    def commit_multiple_files(self, repo: str, branch: str, message: str, files: list[dict]) -> dict:
         """Create a single atomic commit with multiple file changes.
 
         Uses the Git Trees API. Each entry in files should have:
@@ -298,19 +289,23 @@ class GitHubClient:
         for f in files:
             if f.get("action") == "delete":
                 # To delete, we create a blob-less entry (sha=None)
-                tree_entries.append({
-                    "path": f["path"],
-                    "mode": "100644",
-                    "type": "blob",
-                    "sha": None,
-                })
+                tree_entries.append(
+                    {
+                        "path": f["path"],
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": None,
+                    }
+                )
             else:
-                tree_entries.append({
-                    "path": f["path"],
-                    "mode": "100644",
-                    "type": "blob",
-                    "content": f["content"],
-                })
+                tree_entries.append(
+                    {
+                        "path": f["path"],
+                        "mode": "100644",
+                        "type": "blob",
+                        "content": f["content"],
+                    }
+                )
 
         # Create the new tree
         new_tree = self._post(
@@ -630,9 +625,8 @@ GITHUB_TOOLS = [
 
 def execute_tool(gh: GitHubClient, repo: str, tool_name: str, tool_input: dict) -> str:
     """Execute a GitHub tool call and return the result as a string."""
-    import json
-
     try:
+        result: Any
         if tool_name == "get_file":
             result = gh.get_file(repo, tool_input["path"], tool_input.get("ref"))
         elif tool_name == "list_directory":

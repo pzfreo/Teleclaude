@@ -37,9 +37,7 @@ class GmailSendClient:
             message["bcc"] = bcc
 
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
-        result = self.service.users().messages().send(
-            userId="me", body={"raw": raw}
-        ).execute()
+        result = self.service.users().messages().send(userId="me", body={"raw": raw}).execute()
         return {"id": result["id"], "status": "sent", "to": to, "subject": subject}
 
 

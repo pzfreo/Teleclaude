@@ -20,8 +20,7 @@ def _connect() -> sqlite3.Connection:
 def init_db() -> None:
     """Create tables if they don't exist."""
     conn = _connect()
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS conversations (
             chat_id INTEGER PRIMARY KEY,
             messages TEXT NOT NULL DEFAULT '[]'
@@ -39,8 +38,7 @@ def init_db() -> None:
             plan_mode INTEGER NOT NULL DEFAULT 0,
             agent_mode INTEGER NOT NULL DEFAULT 0
         );
-        """
-    )
+        """)
     # Migrations for existing databases
     _migrate(conn)
     conn.close()
@@ -72,9 +70,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
 def load_conversation(chat_id: int) -> list[dict]:
     """Load conversation history for a chat."""
     conn = _connect()
-    row = conn.execute(
-        "SELECT messages FROM conversations WHERE chat_id = ?", (chat_id,)
-    ).fetchone()
+    row = conn.execute("SELECT messages FROM conversations WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
     if row:
         return json.loads(row[0])
@@ -105,9 +101,7 @@ def clear_conversation(chat_id: int) -> None:
 def load_active_repo(chat_id: int) -> str | None:
     """Load active repo for a chat."""
     conn = _connect()
-    row = conn.execute(
-        "SELECT repo FROM active_repos WHERE chat_id = ?", (chat_id,)
-    ).fetchone()
+    row = conn.execute("SELECT repo FROM active_repos WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
     return row[0] if row else None
 
@@ -125,9 +119,7 @@ def save_active_repo(chat_id: int, repo: str) -> None:
 
 def load_active_branch(chat_id: int) -> str | None:
     conn = _connect()
-    row = conn.execute(
-        "SELECT branch FROM active_repos WHERE chat_id = ?", (chat_id,)
-    ).fetchone()
+    row = conn.execute("SELECT branch FROM active_repos WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
     return row[0] if row and row[0] else None
 
@@ -144,9 +136,7 @@ def save_active_branch(chat_id: int, branch: str | None) -> None:
 
 def load_todos(chat_id: int) -> list[dict]:
     conn = _connect()
-    row = conn.execute(
-        "SELECT todos FROM todo_lists WHERE chat_id = ?", (chat_id,)
-    ).fetchone()
+    row = conn.execute("SELECT todos FROM todo_lists WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
     return json.loads(row[0]) if row else []
 
@@ -163,9 +153,7 @@ def save_todos(chat_id: int, todos: list[dict]) -> None:
 
 def load_plan_mode(chat_id: int) -> bool:
     conn = _connect()
-    row = conn.execute(
-        "SELECT plan_mode FROM chat_modes WHERE chat_id = ?", (chat_id,)
-    ).fetchone()
+    row = conn.execute("SELECT plan_mode FROM chat_modes WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
     return bool(row[0]) if row else False
 
@@ -183,9 +171,7 @@ def save_plan_mode(chat_id: int, enabled: bool) -> None:
 
 def load_agent_mode(chat_id: int) -> bool:
     conn = _connect()
-    row = conn.execute(
-        "SELECT agent_mode FROM chat_modes WHERE chat_id = ?", (chat_id,)
-    ).fetchone()
+    row = conn.execute("SELECT agent_mode FROM chat_modes WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
     return bool(row[0]) if row else False
 
@@ -205,9 +191,7 @@ def save_agent_mode(chat_id: int, enabled: bool) -> None:
 def load_model(chat_id: int) -> str | None:
     """Load persisted model choice for a chat. Returns None if not set."""
     conn = _connect()
-    row = conn.execute(
-        "SELECT model FROM chat_modes WHERE chat_id = ?", (chat_id,)
-    ).fetchone()
+    row = conn.execute("SELECT model FROM chat_modes WHERE chat_id = ?", (chat_id,)).fetchone()
     conn.close()
     return row[0] if row and row[0] else None
 

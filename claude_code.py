@@ -14,11 +14,9 @@ logger = logging.getLogger(__name__)
 class ClaudeCodeManager:
     """Manages local clones and Claude Code CLI sessions."""
 
-    def __init__(self, github_token: str, workspace_root: str | None = None,
-                 cli_path: str | None = None):
+    def __init__(self, github_token: str, workspace_root: str | None = None, cli_path: str | None = None):
         self.github_token = github_token
-        self.workspace_root = Path(workspace_root or os.getenv(
-            "CLAUDE_CODE_WORKSPACE", "workspaces"))
+        self.workspace_root = Path(workspace_root or os.getenv("CLAUDE_CODE_WORKSPACE") or "workspaces")
         self.cli_path = cli_path or os.getenv("CLAUDE_CLI_PATH") or shutil.which("claude")
         self._sessions: dict[int, str] = {}  # chat_id → session_id
 
@@ -72,7 +70,8 @@ class ClaudeCodeManager:
     async def _git(self, cwd: Path, *args: str) -> str:
         """Run a git command as an async subprocess."""
         proc = await asyncio.create_subprocess_exec(
-            "git", *args,
+            "git",
+            *args,
             cwd=str(cwd),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -95,9 +94,15 @@ class ClaudeCodeManager:
 
     # ── CLI invocation ───────────────────────────────────────────────
 
-    async def run(self, chat_id: int, repo: str, prompt: str,
-                  branch: str | None = None, model: str | None = None,
-                  on_progress=None) -> str:
+    async def run(
+        self,
+        chat_id: int,
+        repo: str,
+        prompt: str,
+        branch: str | None = None,
+        model: str | None = None,
+        on_progress=None,
+    ) -> str:
         """Run a prompt through Claude Code CLI and return the result.
 
         Args:
@@ -126,10 +131,8 @@ class ClaudeCodeManager:
         await self.pull_latest(repo)
 
         # Build CLI command
-        cmd = [self.cli_path, "-p",
-               "--output-format", "stream-json",
-               "--verbose",
-               "--dangerously-skip-permissions"]
+        assert self.cli_path is not None, "Claude CLI not found — install it or set CLAUDE_CLI_PATH"
+        cmd = [self.cli_path, "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
 
         if model:
             cmd.extend(["--model", model])
@@ -142,15 +145,16 @@ class ClaudeCodeManager:
             new_id = str(uuid.uuid4())
             cmd.extend(["--session-id", new_id])
 
-        cmd.extend([
-            "--append-system-prompt",
-            "Responding via Telegram. Keep responses concise for mobile reading.",
-        ])
+        cmd.extend(
+            [
+                "--append-system-prompt",
+                "Responding via Telegram. Keep responses concise for mobile reading.",
+            ]
+        )
 
         cmd.append(prompt)
 
-        logger.info("Claude Code: running in %s (session=%s)", repo_dir,
-                     session_id or "new")
+        logger.info("Claude Code: running in %s (session=%s)", repo_dir, session_id or "new")
 
         # Launch subprocess (large limit: CLI emits big JSON lines for tool results)
         proc = await asyncio.create_subprocess_exec(
@@ -169,7 +173,7 @@ class ClaudeCodeManager:
                 self._read_stream(proc, on_progress),
                 timeout=600,  # 10 minutes
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("Claude Code timed out after 10 minutes")
             proc.kill()
             await proc.wait()

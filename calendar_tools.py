@@ -3,6 +3,7 @@
 import json
 import logging
 from datetime import datetime, timedelta
+from typing import Any
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -25,9 +26,7 @@ class GoogleCalendarClient:
         creds.refresh(Request())
         self.service = build("calendar", "v3", credentials=creds)
 
-    def list_events(
-        self, days_ahead: int = 7, max_results: int = 20, calendar_id: str = "primary"
-    ) -> list[dict]:
+    def list_events(self, days_ahead: int = 7, max_results: int = 20, calendar_id: str = "primary") -> list[dict]:
         """List upcoming events."""
         now = datetime.utcnow()
         time_min = now.isoformat() + "Z"
@@ -202,6 +201,7 @@ CALENDAR_TOOLS = [
 def execute_tool(client: GoogleCalendarClient, tool_name: str, tool_input: dict) -> str:
     """Execute a Google Calendar tool call."""
     try:
+        result: Any
         if tool_name == "list_calendar_events":
             result = client.list_events(
                 tool_input.get("days_ahead", 7),

@@ -1,6 +1,7 @@
 """Teleclaude - Chat with Claude on Telegram. Code against GitHub."""
 
 from pathlib import Path as _Path
+
 VERSION = (_Path(__file__).parent / "VERSION").read_text().strip()
 
 import asyncio
@@ -13,6 +14,7 @@ import logging
 import os
 import sys
 import time
+from typing import Any
 
 import anthropic
 from dotenv import load_dotenv
@@ -27,43 +29,34 @@ from telegram.ext import (
 )
 
 from persistence import (
-    init_db,
-    load_conversation,
-    save_conversation,
     clear_conversation,
-    load_active_repo,
-    save_active_repo,
-    load_todos,
-    save_todos,
-    load_plan_mode,
-    save_plan_mode,
-    load_model,
-    save_model,
+    init_db,
     load_active_branch,
+    load_active_repo,
+    load_conversation,
+    load_model,
+    load_plan_mode,
+    load_todos,
     save_active_branch,
+    save_active_repo,
+    save_conversation,
+    save_model,
+    save_plan_mode,
+    save_todos,
+)
+from shared import (
+    RingBufferHandler,
+    download_telegram_file,
+    send_long_message,
+)
+from shared import (
+    is_authorized as _is_authorized,
 )
 
 load_dotenv()
 
 
-class _RingBufferHandler(logging.Handler):
-    """Keeps the last N log records in a deque for on-demand retrieval."""
-
-    def __init__(self, capacity: int = 5000):
-        super().__init__()
-        self._buf: collections.deque[logging.LogRecord] = collections.deque(maxlen=capacity)
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self._buf.append(record)
-
-    def get_recent(self, seconds: int = 300) -> list[str]:
-        """Return formatted log lines from the last `seconds` seconds."""
-        cutoff = time.time() - seconds
-        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        return [formatter.format(r) for r in self._buf if r.created >= cutoff]
-
-
-_ring_handler = _RingBufferHandler()
+_ring_handler = RingBufferHandler()
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -103,10 +96,12 @@ if not ANTHROPIC_API_KEY:
 
 # GitHub
 gh_client = None
-GITHUB_TOOLS = []
+GITHUB_TOOLS: list[dict[str, Any]] = []
 execute_github_tool = None
 try:
-    from github_tools import GITHUB_TOOLS, GitHubClient, execute_tool as _execute_github
+    from github_tools import GITHUB_TOOLS, GitHubClient
+    from github_tools import execute_tool as _execute_github
+
     token = os.getenv("GITHUB_TOKEN", "")
     if token:
         gh_client = GitHubClient(token)
@@ -121,10 +116,12 @@ except Exception as e:
 
 # Web search
 web_client = None
-WEB_TOOLS = []
+WEB_TOOLS: list[dict[str, Any]] = []
 execute_web_tool = None
 try:
-    from web_tools import WEB_TOOLS, WebSearchClient, execute_tool as _execute_web
+    from web_tools import WEB_TOOLS, WebSearchClient
+    from web_tools import execute_tool as _execute_web
+
     web_client = WebSearchClient()
     execute_web_tool = _execute_web
     logger.info("Web search: enabled")
@@ -134,10 +131,12 @@ except Exception as e:
 
 # Google Tasks
 tasks_client = None
-TASKS_TOOLS = []
+TASKS_TOOLS: list[dict[str, Any]] = []
 execute_tasks_tool = None
 try:
-    from tasks_tools import TASKS_TOOLS, GoogleTasksClient, execute_tool as _execute_tasks
+    from tasks_tools import TASKS_TOOLS, GoogleTasksClient
+    from tasks_tools import execute_tool as _execute_tasks
+
     client_id = os.getenv("GOOGLE_CLIENT_ID", "")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
     refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN", "")
@@ -154,10 +153,12 @@ except Exception as e:
 
 # Google Calendar
 calendar_client = None
-CALENDAR_TOOLS = []
+CALENDAR_TOOLS: list[dict[str, Any]] = []
 execute_calendar_tool = None
 try:
-    from calendar_tools import CALENDAR_TOOLS, GoogleCalendarClient, execute_tool as _execute_calendar
+    from calendar_tools import CALENDAR_TOOLS, GoogleCalendarClient
+    from calendar_tools import execute_tool as _execute_calendar
+
     client_id = os.getenv("GOOGLE_CLIENT_ID", "")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
     refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN", "")
@@ -174,10 +175,12 @@ except Exception as e:
 
 # Gmail (send only)
 email_client = None
-EMAIL_TOOLS = []
+EMAIL_TOOLS: list[dict[str, Any]] = []
 execute_email_tool = None
 try:
-    from email_tools import EMAIL_TOOLS, GmailSendClient, execute_tool as _execute_email
+    from email_tools import EMAIL_TOOLS, GmailSendClient
+    from email_tools import execute_tool as _execute_email
+
     client_id = os.getenv("GOOGLE_CLIENT_ID", "")
     client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
     refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN", "")
@@ -321,6 +324,7 @@ async def _call_anthropic(**kwargs) -> anthropic.types.Message:
                 await asyncio.sleep(wait)
             else:
                 raise
+    raise RuntimeError("Unreachable: retry loop completed without returning or raising")
 
 
 def get_model(chat_id: int) -> str:
@@ -355,9 +359,7 @@ def format_todo_list(todos: list[dict]) -> str:
 
 
 def is_authorized(user_id: int) -> bool:
-    if not ALLOWED_USER_IDS:
-        return True
-    return user_id in ALLOWED_USER_IDS
+    return _is_authorized(user_id, ALLOWED_USER_IDS)
 
 
 def get_conversation(chat_id: int) -> list:
@@ -397,7 +399,7 @@ def set_active_branch(chat_id: int, branch: str | None) -> None:
 MAX_CONTENT_SIZE = 20000  # max chars per content string in history
 
 
-def _trim_content(content, keep_images: bool = True) -> any:
+def _trim_content(content, keep_images: bool = True) -> Any:
     """Truncate oversized content blocks when reloading history.
 
     When keep_images is False, replace image/document blocks with text placeholders
@@ -441,10 +443,7 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
     # Strip thinking blocks from assistant content (they can't be replayed)
     for msg in history:
         if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
-            msg["content"] = [
-                b for b in msg["content"]
-                if not (isinstance(b, dict) and b.get("type") == "thinking")
-            ]
+            msg["content"] = [b for b in msg["content"] if not (isinstance(b, dict) and b.get("type") == "thinking")]
 
     # Walk backwards and remove orphaned tool_use/tool_result pairs
     sanitized = []
@@ -455,8 +454,7 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
         # Check if this assistant message has tool_use blocks
         if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
             tool_use_ids = {
-                b["id"] for b in msg["content"]
-                if isinstance(b, dict) and b.get("type") == "tool_use" and "id" in b
+                b["id"] for b in msg["content"] if isinstance(b, dict) and b.get("type") == "tool_use" and "id" in b
             }
 
             if tool_use_ids:
@@ -465,7 +463,8 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
                     next_msg = history[i + 1]
                     if next_msg.get("role") == "user" and isinstance(next_msg.get("content"), list):
                         result_ids = {
-                            b.get("tool_use_id") for b in next_msg["content"]
+                            b.get("tool_use_id")
+                            for b in next_msg["content"]
                             if isinstance(b, dict) and b.get("type") == "tool_result"
                         }
                         if tool_use_ids <= result_ids:
@@ -492,7 +491,7 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
 def trim_history(chat_id: int) -> None:
     history = get_conversation(chat_id)
     if len(history) > MAX_HISTORY * 2:
-        del history[:len(history) - MAX_HISTORY * 2]
+        del history[: len(history) - MAX_HISTORY * 2]
     # Sanitize to fix any broken tool_use/tool_result pairs
     # IMPORTANT: modify in-place to preserve list reference held by _process_message
     sanitized = _sanitize_history(history)
@@ -506,17 +505,6 @@ def trim_history(chat_id: int) -> None:
 def save_state(chat_id: int) -> None:
     """Persist current conversation to SQLite."""
     save_conversation(chat_id, get_conversation(chat_id))
-
-
-async def send_long_message(chat_id: int, text: str, bot) -> None:
-    """Send a message, splitting if it exceeds Telegram's limit."""
-    if not text:
-        return
-    for i in range(0, len(text), MAX_TELEGRAM_LENGTH):
-        try:
-            await bot.send_message(chat_id=chat_id, text=text[i : i + MAX_TELEGRAM_LENGTH])
-        except TelegramError as e:
-            logger.warning("Failed to send message chunk to %d: %s", chat_id, e)
 
 
 async def keep_typing(chat, stop_event: asyncio.Event, start_time: float, bot, status: dict):
@@ -554,7 +542,7 @@ async def keep_typing(chat, stop_event: asyncio.Event, start_time: float, bot, s
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=TYPING_INTERVAL)
             break
-        except asyncio.TimeoutError:
+        except TimeoutError:
             continue
 
 
@@ -791,9 +779,7 @@ async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             header = f"Branches on {repo}:"
             if current:
                 header += f"\n(active: {current})"
-            await update.message.reply_text(
-                f"{header}\n" + "\n".join(lines) + "\n\n/branch <number> or /branch <name>"
-            )
+            await update.message.reply_text(f"{header}\n" + "\n".join(lines) + "\n\n/branch <number> or /branch <name>")
         except Exception as e:
             await update.message.reply_text(f"Failed to list branches: {e}")
         return
@@ -873,10 +859,10 @@ def _execute_tool_call(block, repo, chat_id) -> str:
 _IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 _SUPPORTED_DOC_MIMES = _IMAGE_MIME_TYPES | {"application/pdf"}
 
+
 async def _download_telegram_file(file_obj, bot) -> bytes:
     """Download a Telegram file and return its bytes."""
-    tg_file = await bot.get_file(file_obj.file_id)
-    return bytes(await tg_file.download_as_bytearray())
+    return await download_telegram_file(file_obj, bot)
 
 
 async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
@@ -893,10 +879,12 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
         try:
             photo = msg.photo[-1]  # highest resolution
             data = await _download_telegram_file(photo, bot)
-            content_blocks.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(data).decode()},
-            })
+            content_blocks.append(
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(data).decode()},
+                }
+            )
         except Exception as e:
             logger.warning("Failed to download photo: %s", e)
             text += "\n[Photo attached but could not be downloaded]"
@@ -906,10 +894,12 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
         try:
             data = await _download_telegram_file(msg.sticker, bot)
             media_type = "image/webp"
-            content_blocks.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(data).decode()},
-            })
+            content_blocks.append(
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(data).decode()},
+                }
+            )
             if not text:
                 text = f"[Sticker: {msg.sticker.emoji or 'unknown'}]"
         except Exception as e:
@@ -923,16 +913,50 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
             if mime in _SUPPORTED_DOC_MIMES:
                 data = await _download_telegram_file(msg.document, bot)
                 if mime in _IMAGE_MIME_TYPES:
-                    content_blocks.append({
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": mime, "data": base64.b64encode(data).decode()},
-                    })
+                    content_blocks.append(
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": mime, "data": base64.b64encode(data).decode()},
+                        }
+                    )
                 elif mime == "application/pdf":
-                    content_blocks.append({
-                        "type": "document",
-                        "source": {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(data).decode()},
-                    })
-            elif mime.startswith("text/") or fname.endswith((".txt", ".py", ".js", ".ts", ".json", ".md", ".csv", ".yaml", ".yml", ".toml", ".xml", ".html", ".css", ".sh", ".rs", ".go", ".java", ".c", ".cpp", ".h", ".rb", ".sql", ".log")):
+                    content_blocks.append(
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": base64.b64encode(data).decode(),
+                            },
+                        }
+                    )
+            elif mime.startswith("text/") or fname.endswith(
+                (
+                    ".txt",
+                    ".py",
+                    ".js",
+                    ".ts",
+                    ".json",
+                    ".md",
+                    ".csv",
+                    ".yaml",
+                    ".yml",
+                    ".toml",
+                    ".xml",
+                    ".html",
+                    ".css",
+                    ".sh",
+                    ".rs",
+                    ".go",
+                    ".java",
+                    ".c",
+                    ".cpp",
+                    ".h",
+                    ".rb",
+                    ".sql",
+                    ".log",
+                )
+            ):
                 data = await _download_telegram_file(msg.document, bot)
                 file_text = data.decode("utf-8", errors="replace")
                 if len(file_text) > MAX_CONTENT_SIZE:
@@ -1035,16 +1059,17 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
 
     try:
         import zoneinfo
-        tz = zoneinfo.ZoneInfo(USER_TIMEZONE)
+
+        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
     except Exception:
-        tz = datetime.timezone.utc
+        tz = datetime.UTC
     now = datetime.datetime.now(tz)
-    date_str = now.strftime('%A, %B %d, %Y at %I:%M %p')
+    date_str = now.strftime("%A, %B %d, %Y at %I:%M %p")
     # Pre-compute upcoming days so the model doesn't do bad date math
     upcoming = []
     for i in range(1, 8):
         d = now + datetime.timedelta(days=i)
-        upcoming.append(d.strftime('%A %b %d'))
+        upcoming.append(d.strftime("%A %b %d"))
     upcoming_str = ", ".join(upcoming)
     system = (
         f"Today is {date_str} ({USER_TIMEZONE}). "
@@ -1057,7 +1082,9 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
         branch = get_active_branch(chat_id)
         system += f"\n\nActive repository: {repo}"
         if branch:
-            system += f"\nActive branch: {branch} — use this branch for file changes unless the user specifies otherwise."
+            system += (
+                f"\nActive branch: {branch} — use this branch for file changes unless the user specifies otherwise."
+            )
 
     # Plan mode: inject existing todos and planning instructions
     if get_plan_mode(chat_id):
@@ -1073,14 +1100,12 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
     max_rounds = MAX_TOOL_ROUNDS
 
     # Shared progress status — the tool loop writes, keep_typing reads
-    progress = {"round": 0, "max": max_rounds, "tools": [], "last_update_round": -1}
+    progress: dict[str, Any] = {"round": 0, "max": max_rounds, "tools": [], "last_update_round": -1}
 
     # Start typing indicator in background
     stop_typing = asyncio.Event()
     start_time = time.time()
-    typing_task = asyncio.create_task(
-        keep_typing(update.effective_chat, stop_typing, start_time, bot, progress)
-    )
+    typing_task = asyncio.create_task(keep_typing(update.effective_chat, stop_typing, start_time, bot, progress))
 
     try:
         for round_num in range(max_rounds):
@@ -1116,14 +1141,10 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
                 if block.type == "tool_use":
                     logger.info("Tool call [%d]: %s(%s)", round_num + 1, block.name, json.dumps(block.input)[:200])
                     progress["tools"].append(block.name)
-                    result = await loop.run_in_executor(
-                        None, _execute_tool_call, block, repo, chat_id
-                    )
+                    result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
                     if len(result) > 10000:
                         result = result[:10000] + "\n... (truncated)"
-                    tool_results.append(
-                        {"type": "tool_result", "tool_use_id": block.id, "content": result}
-                    )
+                    tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
 
             history.append({"role": "user", "content": tool_results})
             # Save after each tool round in case of crash
@@ -1166,9 +1187,10 @@ async def generate_briefing(bot, chat_id: int) -> None:
 
     try:
         import zoneinfo
-        tz = zoneinfo.ZoneInfo(USER_TIMEZONE)
+
+        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
     except Exception:
-        tz = datetime.timezone.utc
+        tz = datetime.UTC
     now = datetime.datetime.now(tz)
 
     briefing_prompt = (
@@ -1198,7 +1220,7 @@ async def generate_briefing(bot, chat_id: int) -> None:
             await send_long_message(chat_id, reply, bot)
             return
 
-        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "assistant", "content": response.content})  # type: ignore[dict-item]
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
@@ -1212,7 +1234,7 @@ async def generate_briefing(bot, chat_id: int) -> None:
                 except Exception as e:
                     result = f"Tool error: {e}"
                 tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
-        messages.append({"role": "user", "content": tool_results})
+        messages.append({"role": "user", "content": tool_results})  # type: ignore[dict-item]
 
     await bot.send_message(chat_id=chat_id, text="Briefing generation hit tool limit.")
 
@@ -1257,7 +1279,7 @@ async def notify_startup(app: Application) -> None:
     if email_client:
         integrations.append("Gmail")
 
-    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
     enabled = ", ".join(integrations) if integrations else "none"
     msg = f"Teleclaude v{VERSION} restarted at {now}\nModel: {DEFAULT_MODEL}\nIntegrations: {enabled}"
 
@@ -1300,13 +1322,24 @@ def main() -> None:
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-    app.add_handler(MessageHandler(
-        (filters.TEXT | filters.PHOTO | filters.Document.ALL | filters.VOICE
-         | filters.Sticker.STATIC | filters.LOCATION | filters.CONTACT
-         | filters.AUDIO | filters.VIDEO | filters.VIDEO_NOTE)
-        & ~filters.COMMAND,
-        handle_message,
-    ))
+    app.add_handler(
+        MessageHandler(
+            (
+                filters.TEXT
+                | filters.PHOTO
+                | filters.Document.ALL
+                | filters.VOICE
+                | filters.Sticker.STATIC
+                | filters.LOCATION
+                | filters.CONTACT
+                | filters.AUDIO
+                | filters.VIDEO
+                | filters.VIDEO_NOTE
+            )
+            & ~filters.COMMAND,
+            handle_message,
+        )
+    )
 
     # Schedule daily briefing
     if DAILY_BRIEFING_TIME and ALLOWED_USER_IDS:
@@ -1315,9 +1348,10 @@ def main() -> None:
         else:
             try:
                 import zoneinfo
-                tz = zoneinfo.ZoneInfo(USER_TIMEZONE)
+
+                tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
             except Exception:
-                tz = datetime.timezone.utc
+                tz = datetime.UTC
             hour, minute = (int(x) for x in DAILY_BRIEFING_TIME.split(":"))
             briefing_time = datetime.time(hour=hour, minute=minute, tzinfo=tz)
             app.job_queue.run_daily(scheduled_briefing, time=briefing_time)

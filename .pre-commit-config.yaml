@@ -1,0 +1,21 @@
+repos:
+  - repo: https://github.com/psf/black
+    rev: "24.10.0"
+    hooks:
+      - id: black
+        language_version: python3.12
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: "v0.8.0"
+    hooks:
+      - id: ruff
+        args: [--fix]
+
+  - repo: local
+    hooks:
+      - id: version-bump
+        name: Auto-bump version
+        entry: bash -c 'if ! git diff --cached --name-only | grep -q "^VERSION$"; then ./bump fix && git add VERSION; fi'
+        language: system
+        pass_filenames: false
+        always_run: true

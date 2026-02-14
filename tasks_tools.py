@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime
+from typing import Any
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -28,17 +28,12 @@ class GoogleTasksClient:
     def list_tasklists(self) -> list[dict]:
         """List all task lists."""
         results = self.service.tasklists().list(maxResults=20).execute()
-        return [
-            {"id": tl["id"], "title": tl["title"]}
-            for tl in results.get("items", [])
-        ]
+        return [{"id": tl["id"], "title": tl["title"]} for tl in results.get("items", [])]
 
     def list_tasks(self, tasklist_id: str = "@default", show_completed: bool = False) -> list[dict]:
         """List tasks in a task list."""
         results = (
-            self.service.tasks()
-            .list(tasklist=tasklist_id, showCompleted=show_completed, maxResults=100)
-            .execute()
+            self.service.tasks().list(tasklist=tasklist_id, showCompleted=show_completed, maxResults=100).execute()
         )
         tasks = []
         for t in results.get("items", []):
@@ -206,6 +201,7 @@ TASKS_TOOLS = [
 def execute_tool(client: GoogleTasksClient, tool_name: str, tool_input: dict) -> str:
     """Execute a Google Tasks tool call."""
     try:
+        result: Any
         if tool_name == "list_tasklists":
             result = client.list_tasklists()
         elif tool_name == "list_tasks":
