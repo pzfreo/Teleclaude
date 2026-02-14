@@ -1286,7 +1286,7 @@ async def generate_briefing(bot, chat_id: int) -> None:
             await send_long_message(chat_id, reply, bot)
             return
 
-        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "assistant", "content": response.content})  # type: ignore[dict-item]
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
