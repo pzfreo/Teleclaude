@@ -79,8 +79,8 @@ case "$COMMAND" in
 
         echo "==> Creating droplet: $DROPLET_NAME ($DROPLET_SIZE in $DROPLET_REGION)..."
 
-        # Use first available SSH key
-        SSH_KEY_ID=$(doctl compute ssh-key list --format ID --no-header | head -1)
+        # Use DO_SSH_KEY_ID env var, or fall back to first available
+        SSH_KEY_ID="${DO_SSH_KEY_ID:-$(doctl compute ssh-key list --format ID --no-header | head -1)}"
         if [ -z "$SSH_KEY_ID" ]; then
             echo "ERROR: No SSH keys found on your DO account. Add one first."
             exit 1

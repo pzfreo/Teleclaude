@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
+# Create non-root user (claude CLI refuses --dangerously-skip-permissions as root)
+RUN useradd -m -s /bin/bash teleclaude
+
 # App directory
 WORKDIR /app
 
@@ -22,7 +25,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY *.py VERSION ./
 
+# Ensure app owns its directories
+RUN chown -R teleclaude:teleclaude /app
+
 # Persistent volumes mounted at runtime
 VOLUME ["/app/data", "/app/workspaces"]
+
+USER teleclaude
 
 CMD ["python", "bot.py"]
