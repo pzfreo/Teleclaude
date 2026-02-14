@@ -1,0 +1,39 @@
+name: Deploy to DigitalOcean
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.DROPLET_IP }} >> ~/.ssh/known_hosts
+
+      - name: Copy files to droplet
+        run: |
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            --include='*.py' \
+            --include='Dockerfile' \
+            --include='docker-compose.yml' \
+            --include='requirements.txt' \
+            --include='VERSION' \
+            --exclude='*' \
+            ./ root@${{ secrets.DROPLET_IP }}:/opt/teleclaude/
+
+      - name: Build and restart
+        run: |
+          ssh -i ~/.ssh/deploy_key root@${{ secrets.DROPLET_IP }} \
+            'cd /opt/teleclaude && docker compose up -d --build && docker compose ps'

@@ -151,12 +151,13 @@ class ClaudeCodeManager:
         logger.info("Claude Code: running in %s (session=%s)", repo_dir,
                      session_id or "new")
 
-        # Launch subprocess
+        # Launch subprocess (large limit: CLI emits big JSON lines for tool results)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(repo_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=10 * 1024 * 1024,  # 10 MB line buffer
         )
 
         result_text = ""
