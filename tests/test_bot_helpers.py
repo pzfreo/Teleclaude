@@ -240,3 +240,95 @@ class TestIsAuthorized:
         finally:
             ALLOWED_USER_IDS.clear()
             ALLOWED_USER_IDS.update(original)
+
+
+class TestExtendedThinking:
+    """Tests for _wants_extended_thinking()."""
+
+    def test_think_about(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("think about this problem") is True
+
+    def test_think_through(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("think through the architecture") is True
+
+    def test_think_deeply(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("think deeply about this") is True
+
+    def test_step_by_step(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("think step by step") is True
+
+    def test_reason_through(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("reason through this") is True
+
+    def test_reason_carefully(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("reason carefully about X") is True
+
+    def test_analyze_carefully(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("analyze carefully this code") is True
+
+    def test_case_insensitive(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("THINK ABOUT this") is True
+
+    def test_false_positive_i_think_so(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("I think so") is False
+
+    def test_false_positive_what_do_you_think(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("what do you think?") is False
+
+    def test_false_positive_thinking(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("I was thinking about lunch") is False
+
+    def test_plain_message(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("hello world") is False
+
+    def test_multimodal_content(self):
+        from bot import _wants_extended_thinking
+
+        content = [
+            {"type": "image", "source": {"type": "base64", "data": "abc"}},
+            {"type": "text", "text": "think about this image"},
+        ]
+        assert _wants_extended_thinking(content) is True
+
+    def test_multimodal_no_match(self):
+        from bot import _wants_extended_thinking
+
+        content = [
+            {"type": "image", "source": {"type": "base64", "data": "abc"}},
+            {"type": "text", "text": "what is this?"},
+        ]
+        assert _wants_extended_thinking(content) is False
+
+    def test_empty_string(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking("") is False
+
+    def test_empty_list(self):
+        from bot import _wants_extended_thinking
+
+        assert _wants_extended_thinking([]) is False

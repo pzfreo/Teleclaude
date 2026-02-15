@@ -12,16 +12,18 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import time
 from typing import Any
 
 import anthropic
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -198,6 +200,36 @@ except Exception as e:
     logger.warning("Gmail: failed to load (%s)", e)
     EMAIL_TOOLS = []
 
+# Voice transcription (OpenAI Whisper)
+openai_client = None
+try:
+    import openai as _openai_module
+
+    _openai_api_key = os.getenv("OPENAI_API_KEY", "")
+    if _openai_api_key:
+        openai_client = _openai_module.OpenAI(api_key=_openai_api_key)
+        logger.info("Voice transcription (Whisper): enabled")
+    else:
+        logger.info("Voice transcription: disabled (no OPENAI_API_KEY)")
+except Exception as e:
+    logger.warning("Voice transcription: failed to load (%s)", e)
+
+# MCP (Model Context Protocol) servers
+mcp_manager = None
+MCP_TOOLS: list[dict[str, Any]] = []
+_mcp_config: dict[str, Any] | None = None
+try:
+    from mcp_tools import MCPManager, load_mcp_config
+
+    _mcp_config = load_mcp_config()
+    if _mcp_config:
+        mcp_manager = MCPManager()
+        logger.info("MCP servers: configured (%d server(s) pending init)", len(_mcp_config))
+    else:
+        logger.info("MCP servers: disabled (no MCP_SERVERS env var)")
+except Exception as e:
+    logger.warning("MCP servers: failed to load (%s)", e)
+
 # ── Bot config ───────────────────────────────────────────────────────
 
 USER_TIMEZONE = os.getenv("TIMEZONE", "UTC")
@@ -226,6 +258,7 @@ Tool usage:
 - Use Google Calendar to check schedule, create events, or manage the user's calendar.
 - For time-specific events, use the user's timezone unless they specify otherwise.
 - You can send emails via Gmail but NEVER send an email without explicitly confirming the recipient, subject, and body with the user first.
+- When you need the user to choose between options, use the ask_user tool to present inline buttons.
 - When plan mode is on, always outline your plan first and wait for user approval before executing.
 - You can upload binary files (images, etc.) to GitHub repos using the upload_binary_file tool.
 - If a GitHub tool says "No active repo", tell the user to set one with /repo owner/name.
@@ -234,7 +267,8 @@ Attachments:
 - Users can send photos, documents (images, PDFs, text files), stickers, locations, and contacts.
 - You can see and analyze images. You can read PDFs and text files.
 - If a user sends an image and wants it saved to a repo, use upload_binary_file with the base64 data from the image.
-- Voice messages and video are not yet supported — ask the user to type instead.
+- Voice messages and audio files are automatically transcribed if Whisper is configured.
+- Video is not yet supported — ask the user to type instead.
 
 You are a knowledgeable assistant across many domains — not just coding. You can help with writing, research, brainstorming, analysis, math, and general questions.
 
@@ -272,6 +306,32 @@ TODO_TOOL = {
     },
 }
 
+ASK_USER_TOOL = {
+    "name": "ask_user",
+    "description": (
+        "Ask the user to choose from a set of options via inline buttons. "
+        "Use this when you need the user to make a choice before proceeding. "
+        "Returns the user's selection as text."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "The question to ask the user"},
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "maxItems": 5,
+                "description": "2-5 options for the user to choose from",
+            },
+        },
+        "required": ["question", "options"],
+    },
+}
+
+ASK_USER_TIMEOUT = 300  # seconds to wait for user response
+_ask_user_futures: dict[int, asyncio.Future] = {}
+
 ALLOWED_USER_IDS: set[int] = set()
 for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
     uid = uid.strip()
@@ -302,6 +362,8 @@ chat_todos: dict[int, list[dict]] = {}
 chat_plan_mode: dict[int, bool] = {}
 # Per-chat locks to prevent concurrent message handling corruption
 _chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
+# Per-chat cancel events for ! interrupt
+_cancel_events: dict[int, asyncio.Event] = {}
 
 
 async def _call_anthropic(**kwargs) -> anthropic.types.Message:
@@ -336,6 +398,7 @@ async def _stream_round(
     chat_id: int,
     bot,
     stop_typing: asyncio.Event,
+    cancel: asyncio.Event | None = None,
 ) -> tuple[anthropic.types.Message, str | None]:
     """Execute one API round with streaming.
 
@@ -353,6 +416,8 @@ async def _stream_round(
 
     async with async_api_client.messages.stream(**kwargs) as stream:
         async for event in stream:
+            if cancel and cancel.is_set():
+                raise asyncio.CancelledError("User cancelled request")
             if (
                 event.type == "content_block_delta"
                 and hasattr(event.delta, "type")
@@ -484,10 +549,27 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
     if not history:
         return history
 
-    # Strip thinking blocks from assistant content (they can't be replayed)
+    # Clean assistant content blocks:
+    # - Strip thinking blocks (they can't be replayed)
+    # - Remove SDK-internal fields like parsed_output that the API rejects
+    _KNOWN_TEXT_KEYS = {"type", "text"}
+    _KNOWN_TOOL_USE_KEYS = {"type", "id", "name", "input"}
     for msg in history:
         if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
-            msg["content"] = [b for b in msg["content"] if not (isinstance(b, dict) and b.get("type") == "thinking")]
+            cleaned = []
+            for b in msg["content"]:
+                if not isinstance(b, dict):
+                    cleaned.append(b)
+                    continue
+                if b.get("type") == "thinking":
+                    continue
+                if b.get("type") == "text":
+                    cleaned.append({k: v for k, v in b.items() if k in _KNOWN_TEXT_KEYS})
+                elif b.get("type") == "tool_use":
+                    cleaned.append({k: v for k, v in b.items() if k in _KNOWN_TOOL_USE_KEYS})
+                else:
+                    cleaned.append(b)
+            msg["content"] = cleaned
 
     # Walk backwards and remove orphaned tool_use/tool_result pairs
     sanitized = []
@@ -549,6 +631,26 @@ def trim_history(chat_id: int) -> None:
 def save_state(chat_id: int) -> None:
     """Persist current conversation to SQLite."""
     save_conversation(chat_id, get_conversation(chat_id))
+
+
+_EXTENDED_THINKING_PATTERN = re.compile(
+    r"\b(?:think\s+(?:about|through|deeply|step\s+by\s+step)|"
+    r"reason\s+(?:through|about|carefully)|"
+    r"analyze\s+carefully)\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_extended_thinking(user_content) -> bool:
+    """Check if the user's message contains keywords requesting deeper reasoning."""
+    if isinstance(user_content, str):
+        return bool(_EXTENDED_THINKING_PATTERN.search(user_content))
+    if isinstance(user_content, list):
+        for block in user_content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                if _EXTENDED_THINKING_PATTERN.search(block.get("text", "")):
+                    return True
+    return False
 
 
 async def keep_typing(chat, stop_event: asyncio.Event, start_time: float, bot, status: dict):
@@ -907,6 +1009,77 @@ def _execute_tool_call(block, repo, chat_id) -> str:
         return f"Tool error: {e}"
 
 
+async def _handle_ask_user(block, chat_id: int, bot) -> str:
+    """Send inline keyboard to user and wait for their selection."""
+    question = block.input.get("question", "Please choose:")
+    options = block.input.get("options", [])
+
+    if len(options) < 2:
+        return "Error: ask_user requires at least 2 options."
+    if len(options) > 5:
+        options = options[:5]
+
+    keyboard = []
+    for i, option in enumerate(options):
+        keyboard.append([InlineKeyboardButton(option, callback_data=f"ask_user:{chat_id}:{i}")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=question, reply_markup=reply_markup)
+    except TelegramError as e:
+        return f"Failed to send question: {e}"
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str] = loop.create_future()
+    _ask_user_futures[chat_id] = future
+
+    try:
+        result = await asyncio.wait_for(future, timeout=ASK_USER_TIMEOUT)
+        return f"User selected: {result}"
+    except TimeoutError:
+        return "User did not respond within the timeout period."
+    finally:
+        _ask_user_futures.pop(chat_id, None)
+
+
+async def _ask_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard button presses for ask_user tool."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    parts = query.data.split(":")
+    if len(parts) != 3 or parts[0] != "ask_user":
+        return
+
+    try:
+        chat_id = int(parts[1])
+        option_index = int(parts[2])
+    except (ValueError, IndexError):
+        return
+
+    await query.answer()
+
+    # Get the selected text from the button
+    selected_text = query.data  # fallback
+    if query.message and query.message.reply_markup:
+        rows = query.message.reply_markup.inline_keyboard
+        if 0 <= option_index < len(rows) and rows[option_index]:
+            selected_text = rows[option_index][0].text
+
+    # Edit the message to show the selection (remove buttons)
+    try:
+        original_text = query.message.text or "Question"
+        await query.edit_message_text(f"{original_text}\n\nSelected: {selected_text}")
+    except TelegramError:
+        pass
+
+    # Resolve the future
+    future = _ask_user_futures.get(chat_id)
+    if future and not future.done():
+        future.set_result(selected_text)
+
+
 _IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 _SUPPORTED_DOC_MIMES = _IMAGE_MIME_TYPES | {"application/pdf"}
 
@@ -914,6 +1087,19 @@ _SUPPORTED_DOC_MIMES = _IMAGE_MIME_TYPES | {"application/pdf"}
 async def _download_telegram_file(file_obj, bot) -> bytes:
     """Download a Telegram file and return its bytes."""
     return await download_telegram_file(file_obj, bot)
+
+
+async def _transcribe_voice(file_obj, bot, filename: str = "voice.ogg") -> str:
+    """Transcribe a voice/audio file using OpenAI Whisper API."""
+    data = await _download_telegram_file(file_obj, bot)
+    buf = io.BytesIO(data)
+    buf.name = filename
+    loop = asyncio.get_running_loop()
+    transcript = await loop.run_in_executor(
+        None,
+        lambda: openai_client.audio.transcriptions.create(model="whisper-1", file=buf),
+    )
+    return transcript.text
 
 
 async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
@@ -1021,11 +1207,30 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
 
     # Voice messages
     if msg.voice:
-        text += "\n[Voice message received — voice transcription not supported yet. Please type your message instead.]"
+        if openai_client:
+            try:
+                transcript = await _transcribe_voice(msg.voice, bot, "voice.ogg")
+                text += f"\n[Voice transcription]: {transcript}"
+            except Exception as e:
+                logger.warning("Voice transcription failed: %s", e)
+                text += "\n[Voice message received — transcription failed. Please type your message instead.]"
+        else:
+            text += "\n[Voice message received — voice transcription not configured. Please type your message instead.]"
 
     # Audio files
     if msg.audio:
-        text += f"\n[Audio file: {msg.audio.title or msg.audio.file_name or 'audio'} — audio processing not supported]"
+        if openai_client:
+            try:
+                fname = msg.audio.file_name or "audio.mp3"
+                transcript = await _transcribe_voice(msg.audio, bot, fname)
+                text += f"\n[Audio transcription of {fname}]: {transcript}"
+            except Exception as e:
+                logger.warning("Audio transcription failed: %s", e)
+                text += f"\n[Audio file: {msg.audio.title or msg.audio.file_name or 'audio'} — transcription failed]"
+        else:
+            text += (
+                f"\n[Audio file: {msg.audio.title or msg.audio.file_name or 'audio'} — transcription not configured]"
+            )
 
     # Video
     if msg.video:
@@ -1069,6 +1274,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    raw_text = (update.message.text or "").strip()
+
+    # Handle "!" as cancel/interrupt
+    if raw_text == "!":
+        cancel_event = _cancel_events.get(chat_id)
+        if cancel_event:
+            cancel_event.set()
+            try:
+                await update.message.reply_text("Cancelling...")
+            except TelegramError:
+                pass
+        else:
+            try:
+                await update.message.reply_text("Nothing to cancel.")
+            except TelegramError:
+                pass
+        return
 
     # Build user content from text + any attachments
     user_content = await _build_user_content(update, context.bot)
@@ -1089,14 +1311,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("Queued — I'll get to this once I finish the current request.")
         except TelegramError:
             pass
+
+    cancel = asyncio.Event()
     async with lock:
-        await _process_message(chat_id, user_content, update, context)
+        _cancel_events[chat_id] = cancel
+        try:
+            await _process_message(chat_id, user_content, update, context, cancel=cancel)
+        finally:
+            _cancel_events.pop(chat_id, None)
 
 
-async def _process_message(chat_id: int, user_content, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _process_message(
+    chat_id: int,
+    user_content,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    cancel: asyncio.Event | None = None,
+) -> None:
     """Core message processing, runs under per-chat lock.
 
     user_content can be a plain string or a list of content blocks (multimodal).
+    If cancel event is set, the current request is abandoned and history rolled back.
     """
     bot = context.bot
     history = get_conversation(chat_id)
@@ -1105,7 +1340,7 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
     trim_history(chat_id)
 
     repo = get_active_repo(chat_id)
-    tools = [TODO_TOOL]
+    tools = [TODO_TOOL, ASK_USER_TOOL]
     if gh_client:
         tools.extend(GITHUB_TOOLS)
     if web_client:
@@ -1116,6 +1351,8 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
         tools.extend(CALENDAR_TOOLS)
     if email_client:
         tools.extend(EMAIL_TOOLS)
+    if MCP_TOOLS:
+        tools.extend(MCP_TOOLS)
 
     try:
         import zoneinfo
@@ -1169,9 +1406,18 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
 
     try:
         for round_num in range(max_rounds):
+            # Check for cancel before each round
+            if cancel and cancel.is_set():
+                del history[history_len_before:]
+                save_state(chat_id)
+                stop_typing.set()
+                await typing_task
+                await send_long_message(chat_id, "Request cancelled.", bot)
+                return
+
             progress["round"] = round_num + 1
 
-            kwargs = {
+            kwargs: dict[str, Any] = {
                 "model": get_model(chat_id),
                 "max_tokens": 4096,
                 "system": system,
@@ -1179,11 +1425,22 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
             }
             if tools:
                 kwargs["tools"] = tools
+            # Enable extended thinking on first round if user requested it
+            if round_num == 0 and _wants_extended_thinking(user_content):
+                kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
+                kwargs["max_tokens"] = 16000
 
             # Attempt streaming; fall back to non-streaming on transient errors
             streamed_text = None
             try:
-                response, streamed_text = await _stream_round(kwargs, chat_id, bot, stop_typing)
+                response, streamed_text = await _stream_round(kwargs, chat_id, bot, stop_typing, cancel=cancel)
+            except asyncio.CancelledError:
+                del history[history_len_before:]
+                save_state(chat_id)
+                stop_typing.set()
+                await typing_task
+                await send_long_message(chat_id, "Request cancelled.", bot)
+                return
             except (anthropic.RateLimitError, anthropic.InternalServerError) as stream_err:
                 logger.warning("Streaming failed (%s), falling back to non-streaming", stream_err)
                 response = await _call_anthropic(**kwargs)
@@ -1209,7 +1466,12 @@ async def _process_message(chat_id: int, user_content, update: Update, context: 
                 if block.type == "tool_use":
                     logger.info("Tool call [%d]: %s(%s)", round_num + 1, block.name, json.dumps(block.input)[:200])
                     progress["tools"].append(block.name)
-                    result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
+                    if block.name == "ask_user":
+                        result = await _handle_ask_user(block, chat_id, bot)
+                    elif block.name.startswith("mcp_") and mcp_manager:
+                        result = await mcp_manager.call_tool(block.name, block.input)
+                    else:
+                        result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
                     if len(result) > 10000:
                         result = result[:10000] + "\n... (truncated)"
                     tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
@@ -1288,7 +1550,7 @@ async def generate_briefing(bot, chat_id: int) -> None:
             await send_long_message(chat_id, reply, bot)
             return
 
-        messages.append({"role": "assistant", "content": response.content})  # type: ignore[dict-item]
+        messages.append({"role": "assistant", "content": response.content})
         tool_results = []
         for block in response.content:
             if block.type == "tool_use":
@@ -1329,8 +1591,22 @@ async def trigger_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"Briefing failed: {e}")
 
 
+async def _init_mcp() -> None:
+    """Initialize MCP server connections (requires running event loop)."""
+    global MCP_TOOLS
+    if mcp_manager and _mcp_config:
+        try:
+            await mcp_manager.initialize(_mcp_config)
+            MCP_TOOLS = mcp_manager.tools
+            logger.info("MCP initialized: %d tool(s) available", len(MCP_TOOLS))
+        except Exception as e:
+            logger.warning("MCP initialization failed: %s", e)
+
+
 async def notify_startup(app: Application) -> None:
     """Send a startup message to all allowed users."""
+    await _init_mcp()
+
     if not ALLOWED_USER_IDS:
         logger.info("No ALLOWED_USER_IDS set — skipping startup notification")
         return
@@ -1390,6 +1666,7 @@ def main() -> None:
     app.add_handler(CommandHandler("briefing", trigger_briefing))
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("version", show_version))
+    app.add_handler(CallbackQueryHandler(_ask_user_callback, pattern=r"^ask_user:"))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(
         MessageHandler(

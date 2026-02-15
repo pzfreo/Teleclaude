@@ -219,9 +219,13 @@ def save_model(chat_id: int, model: str) -> None:
 
 
 def _serialize(obj):
-    """JSON serializer for Anthropic content block objects."""
+    """JSON serializer for Anthropic content block objects.
+
+    Uses exclude_none to strip SDK-internal fields (e.g. parsed_output)
+    that the API rejects when sent back in conversation history.
+    """
     if hasattr(obj, "model_dump"):
-        return obj.model_dump()
+        return obj.model_dump(exclude_none=True)
     if hasattr(obj, "__dict__"):
         return obj.__dict__
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
