@@ -33,18 +33,22 @@ from telegram.ext import (
 from persistence import (
     audit_log,
     clear_conversation,
+    delete_schedule,
     init_db,
     load_active_branch,
     load_active_repo,
+    load_all_schedules,
     load_conversation,
     load_model,
     load_plan_mode,
+    load_schedules,
     load_todos,
     save_active_branch,
     save_active_repo,
     save_conversation,
     save_model,
     save_plan_mode,
+    save_schedule,
     save_todos,
 )
 from shared import (
@@ -364,6 +368,8 @@ chat_plan_mode: dict[int, bool] = {}
 _chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 # Per-chat cancel events for ! interrupt
 _cancel_events: dict[int, asyncio.Event] = {}
+# Registered schedule jobs: schedule_id -> Job
+_scheduled_jobs: dict[int, Any] = {}
 
 
 async def _call_anthropic(**kwargs) -> anthropic.types.Message:
@@ -715,6 +721,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model - Show or switch Claude model (opus/sonnet/haiku)\n"
         "/plan - Toggle plan mode (outline before executing)\n"
         "/todo - Show current task list (/todo clear to reset)\n"
+        "/schedule - Manage recurring scheduled prompts\n"
         "/briefing - Get a daily summary of calendar + tasks\n"
         "/logs [min] - Download recent logs (default 5 min)\n"
         "/version - Show bot version\n"
@@ -1503,17 +1510,19 @@ async def _process_message(
         await send_long_message(chat_id, "Something went wrong. Please try again.", bot)
 
 
-async def generate_briefing(bot, chat_id: int) -> None:
-    """Generate and send a daily briefing using Claude with available tools."""
-    tools = []
+async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
+    """Run a prompt through the tool loop with all enabled tools. No conversation history."""
+    tools: list[dict[str, Any]] = []
+    if gh_client:
+        tools.extend(GITHUB_TOOLS)
+    if web_client:
+        tools.extend(WEB_TOOLS)
     if tasks_client:
         tools.extend(TASKS_TOOLS)
     if calendar_client:
         tools.extend(CALENDAR_TOOLS)
-
-    if not tools:
-        await bot.send_message(chat_id=chat_id, text="No calendar or tasks configured — nothing to brief on.")
-        return
+    if email_client:
+        tools.extend(EMAIL_TOOLS)
 
     try:
         import zoneinfo
@@ -1523,30 +1532,34 @@ async def generate_briefing(bot, chat_id: int) -> None:
         tz = datetime.UTC
     now = datetime.datetime.now(tz)
 
-    briefing_prompt = (
-        f"Today is {now.strftime('%A, %B %d, %Y')} ({USER_TIMEZONE}).\n\n"
-        "Give me a concise morning briefing. Check my calendar for today's events "
-        "and my task list for pending items. Format it as:\n"
-        "- A quick summary line (e.g. '3 events, 5 tasks')\n"
-        "- Today's schedule in chronological order\n"
-        "- Top pending tasks\n"
-        "Keep it short and scannable for a phone screen."
+    system = (
+        f"Today is {now.strftime('%A, %B %d, %Y at %I:%M %p')} ({USER_TIMEZONE}).\n\n"
+        "You are Teleclaude running a scheduled prompt. Be concise and useful. "
+        "Keep responses short and scannable for a phone screen."
     )
 
-    messages = [{"role": "user", "content": briefing_prompt}]
+    repo = get_active_repo(chat_id)
+    if repo:
+        system += f"\n\nActive repository: {repo}"
+        branch = get_active_branch(chat_id)
+        if branch:
+            system += f" (branch: {branch})"
 
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+
+    loop = asyncio.get_running_loop()
     for _ in range(10):
         response = await _call_anthropic(
             model=DEFAULT_MODEL,
             max_tokens=2048,
-            system="You are Teleclaude generating a daily briefing. Be concise and useful.",
+            system=system,
             messages=messages,
-            tools=tools,
+            **({"tools": tools} if tools else {}),
         )
 
         if response.stop_reason != "tool_use":
             text_parts = [b.text for b in response.content if b.type == "text"]
-            reply = "\n".join(text_parts) if text_parts else "No briefing available."
+            reply = "\n".join(text_parts) if text_parts else "(No response from scheduled prompt.)"
             await send_long_message(chat_id, reply, bot)
             return
 
@@ -1555,27 +1568,28 @@ async def generate_briefing(bot, chat_id: int) -> None:
         for block in response.content:
             if block.type == "tool_use":
                 try:
-                    if block.name in _tasks_tool_names and execute_tasks_tool:
-                        result = execute_tasks_tool(tasks_client, block.name, block.input)
-                    elif block.name in _calendar_tool_names and execute_calendar_tool:
-                        result = execute_calendar_tool(calendar_client, block.name, block.input)
-                    else:
-                        result = f"Tool '{block.name}' not available for briefing."
+                    result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
                 except Exception as e:
                     result = f"Tool error: {e}"
+                if len(result) > 10000:
+                    result = result[:10000] + "\n... (truncated)"
                 tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
-        messages.append({"role": "user", "content": tool_results})  # type: ignore[dict-item]
+        messages.append({"role": "user", "content": tool_results})
 
-    await bot.send_message(chat_id=chat_id, text="Briefing generation hit tool limit.")
+    await bot.send_message(chat_id=chat_id, text="Scheduled prompt hit tool limit.")
 
 
-async def scheduled_briefing(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Job callback for the daily scheduled briefing."""
-    for user_id in ALLOWED_USER_IDS:
-        try:
-            await generate_briefing(context.bot, user_id)
-        except Exception as e:
-            logger.warning("Failed to send briefing to %d: %s", user_id, e)
+async def generate_briefing(bot, chat_id: int) -> None:
+    """Generate and send a daily briefing using Claude with available tools."""
+    briefing_prompt = (
+        "Give me a concise morning briefing. Check my calendar for today's events "
+        "and my task list for pending items. Format it as:\n"
+        "- A quick summary line (e.g. '3 events, 5 tasks')\n"
+        "- Today's schedule in chronological order\n"
+        "- Top pending tasks\n"
+        "Keep it short and scannable for a phone screen."
+    )
+    await run_scheduled_prompt(bot, chat_id, briefing_prompt)
 
 
 async def trigger_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1589,6 +1603,201 @@ async def trigger_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception as e:
         logger.error("Briefing error: %s", e, exc_info=True)
         await update.message.reply_text(f"Briefing failed: {e}")
+
+
+async def _run_scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job callback for scheduled prompts."""
+    job_data: dict = context.job.data  # type: ignore[assignment]
+    chat_id = job_data["chat_id"]
+    prompt = job_data["prompt"]
+    try:
+        await run_scheduled_prompt(context.bot, chat_id, prompt)
+    except Exception as e:
+        logger.warning("Scheduled job failed for chat %d: %s", chat_id, e)
+
+
+def _register_schedule(job_queue, schedule: dict) -> None:
+    """Register a schedule dict as a JobQueue job."""
+    schedule_id = schedule["id"]
+    chat_id = schedule["chat_id"]
+    interval_type = schedule["interval_type"]
+    interval_value = schedule["interval_value"]
+    prompt = schedule["prompt"]
+    job_data = {"chat_id": chat_id, "prompt": prompt}
+    job_name = f"schedule_{schedule_id}"
+
+    if interval_type == "daily":
+        try:
+            import zoneinfo
+
+            tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
+        except Exception:
+            tz = datetime.UTC
+        hour, minute = (int(x) for x in interval_value.split(":"))
+        run_time = datetime.time(hour=hour, minute=minute, tzinfo=tz)
+        job = job_queue.run_daily(_run_scheduled_job, time=run_time, data=job_data, name=job_name)
+    elif interval_type == "every":
+        # Parse "4h" -> 4 hours
+        match = re.match(r"^(\d+)h$", interval_value)
+        if not match:
+            logger.warning("Invalid interval value for schedule %d: %s", schedule_id, interval_value)
+            return
+        hours = int(match.group(1))
+        job = job_queue.run_repeating(_run_scheduled_job, interval=hours * 3600, data=job_data, name=job_name)
+    else:
+        logger.warning("Unknown interval_type for schedule %d: %s", schedule_id, interval_type)
+        return
+
+    _scheduled_jobs[schedule_id] = job
+    logger.info("Registered schedule %d: %s %s — %s", schedule_id, interval_type, interval_value, prompt[:50])
+
+
+def _unregister_schedule(schedule_id: int) -> None:
+    """Remove a scheduled job from the job queue."""
+    job = _scheduled_jobs.pop(schedule_id, None)
+    if job:
+        job.schedule_removal()
+
+
+async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/schedule command handler."""
+    if not is_authorized(update.effective_user.id):
+        return
+
+    chat_id = update.effective_chat.id
+    args = context.args or []
+
+    if not args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/schedule daily 08:00 Morning briefing\n"
+            "/schedule every 4h Check my tasks\n"
+            "/schedule list\n"
+            "/schedule remove <id>"
+        )
+        return
+
+    subcommand = args[0].lower()
+
+    if subcommand == "list":
+        schedules = load_schedules(chat_id)
+        if not schedules:
+            await update.message.reply_text("No schedules. Create one with /schedule daily or /schedule every.")
+            return
+        lines = []
+        for s in schedules:
+            if s["interval_type"] == "daily":
+                timing = f"daily at {s['interval_value']}"
+            else:
+                timing = f"every {s['interval_value']}"
+            lines.append(f"#{s['id']} — {timing}\n  {s['prompt']}")
+        await update.message.reply_text("\n\n".join(lines))
+        return
+
+    if subcommand == "remove":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /schedule remove <id>")
+            return
+        try:
+            schedule_id = int(args[1].lstrip("#"))
+        except ValueError:
+            await update.message.reply_text("Invalid schedule ID. Use /schedule list to see IDs.")
+            return
+        if delete_schedule(schedule_id, chat_id):
+            _unregister_schedule(schedule_id)
+            await update.message.reply_text(f"Schedule #{schedule_id} removed.")
+        else:
+            await update.message.reply_text(f"Schedule #{schedule_id} not found.")
+        return
+
+    if subcommand == "daily":
+        if len(args) < 3:
+            await update.message.reply_text("Usage: /schedule daily HH:MM <prompt>")
+            return
+        time_str = args[1]
+        if not re.match(r"^\d{1,2}:\d{2}$", time_str):
+            await update.message.reply_text("Invalid time format. Use HH:MM (e.g. 08:00).")
+            return
+        try:
+            hour, minute = (int(x) for x in time_str.split(":"))
+            datetime.time(hour=hour, minute=minute)  # validate
+        except ValueError:
+            await update.message.reply_text("Invalid time. Use HH:MM (e.g. 08:00, 18:30).")
+            return
+        prompt = " ".join(args[2:])
+        schedule_id = save_schedule(chat_id, "daily", time_str, prompt)
+        schedule_row = {
+            "id": schedule_id,
+            "chat_id": chat_id,
+            "interval_type": "daily",
+            "interval_value": time_str,
+            "prompt": prompt,
+        }
+        if context.application.job_queue:
+            _register_schedule(context.application.job_queue, schedule_row)
+        await update.message.reply_text(f"Schedule #{schedule_id} created: daily at {time_str} ({USER_TIMEZONE})")
+        return
+
+    if subcommand == "every":
+        if len(args) < 3:
+            await update.message.reply_text("Usage: /schedule every Nh <prompt> (e.g. every 4h)")
+            return
+        interval = args[1].lower()
+        if not re.match(r"^\d+h$", interval):
+            await update.message.reply_text("Invalid interval. Use Nh format (e.g. 2h, 4h, 12h).")
+            return
+        hours = int(interval[:-1])
+        if hours < 1 or hours > 24:
+            await update.message.reply_text("Interval must be between 1h and 24h.")
+            return
+        prompt = " ".join(args[2:])
+        schedule_id = save_schedule(chat_id, "every", interval, prompt)
+        schedule_row = {
+            "id": schedule_id,
+            "chat_id": chat_id,
+            "interval_type": "every",
+            "interval_value": interval,
+            "prompt": prompt,
+        }
+        if context.application.job_queue:
+            _register_schedule(context.application.job_queue, schedule_row)
+        await update.message.reply_text(f"Schedule #{schedule_id} created: every {interval}")
+        return
+
+    await update.message.reply_text(f"Unknown subcommand: {subcommand}\nUse: daily, every, list, remove")
+
+
+async def _load_schedules_on_startup(app: Application) -> None:
+    """Load all saved schedules from DB and register with job_queue."""
+    if not app.job_queue:
+        logger.warning("JobQueue not available — schedules will not run")
+        return
+
+    # Auto-migrate: if DAILY_BRIEFING_TIME is set and no schedules exist, create one
+    if DAILY_BRIEFING_TIME and ALLOWED_USER_IDS:
+        all_schedules = load_all_schedules()
+        if not all_schedules:
+            briefing_prompt = (
+                "Give me a concise morning briefing. Check my calendar for today's events "
+                "and my task list for pending items. Format it as:\n"
+                "- A quick summary line (e.g. '3 events, 5 tasks')\n"
+                "- Today's schedule in chronological order\n"
+                "- Top pending tasks\n"
+                "Keep it short and scannable for a phone screen."
+            )
+            for user_id in ALLOWED_USER_IDS:
+                save_schedule(user_id, "daily", DAILY_BRIEFING_TIME, briefing_prompt)
+            logger.info("Auto-created daily briefing schedules from DAILY_BRIEFING_TIME=%s", DAILY_BRIEFING_TIME)
+
+    schedules = load_all_schedules()
+    for s in schedules:
+        try:
+            _register_schedule(app.job_queue, s)
+        except Exception as e:
+            logger.warning("Failed to register schedule %d: %s", s["id"], e)
+
+    if schedules:
+        logger.info("Loaded %d schedule(s) from database", len(schedules))
 
 
 async def _init_mcp() -> None:
@@ -1606,6 +1815,7 @@ async def _init_mcp() -> None:
 async def notify_startup(app: Application) -> None:
     """Send a startup message to all allowed users."""
     await _init_mcp()
+    await _load_schedules_on_startup(app)
 
     if not ALLOWED_USER_IDS:
         logger.info("No ALLOWED_USER_IDS set — skipping startup notification")
@@ -1664,6 +1874,7 @@ def main() -> None:
     app.add_handler(CommandHandler("todo", show_todos))
     app.add_handler(CommandHandler("todos", show_todos))
     app.add_handler(CommandHandler("briefing", trigger_briefing))
+    app.add_handler(CommandHandler("schedule", schedule_command))
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CallbackQueryHandler(_ask_user_callback, pattern=r"^ask_user:"))
@@ -1686,24 +1897,6 @@ def main() -> None:
             handle_message,
         )
     )
-
-    # Schedule daily briefing
-    if DAILY_BRIEFING_TIME and ALLOWED_USER_IDS:
-        if app.job_queue is None:
-            logger.warning("JobQueue not available — install python-telegram-bot[job-queue] for daily briefings")
-        else:
-            try:
-                import zoneinfo
-
-                tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-            except Exception:
-                tz = datetime.UTC
-            hour, minute = (int(x) for x in DAILY_BRIEFING_TIME.split(":"))
-            briefing_time = datetime.time(hour=hour, minute=minute, tzinfo=tz)
-            app.job_queue.run_daily(scheduled_briefing, time=briefing_time)
-            logger.info("Daily briefing scheduled at %s %s", DAILY_BRIEFING_TIME, USER_TIMEZONE)
-    elif DAILY_BRIEFING_TIME:
-        logger.info("Daily briefing configured but no ALLOWED_USER_IDS set — skipping")
 
     app.post_init = notify_startup
 

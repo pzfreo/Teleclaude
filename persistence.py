@@ -49,6 +49,16 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_audit_log_chat_id ON audit_log(chat_id);
+        CREATE TABLE IF NOT EXISTS schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            interval_type TEXT NOT NULL,
+            interval_value TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_schedules_chat_id ON schedules(chat_id);
         """)
     # Migrations for existing databases
     _migrate(conn)
@@ -216,6 +226,81 @@ def save_model(chat_id: int, model: str) -> None:
     )
     conn.commit()
     conn.close()
+
+
+# ── Schedules ────────────────────────────────────────────────────────
+
+
+def load_schedules(chat_id: int) -> list[dict]:
+    """Load all enabled schedules for a chat."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, chat_id, interval_type, interval_value, prompt, enabled, created_at "
+        "FROM schedules WHERE chat_id = ? AND enabled = 1 ORDER BY id",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0],
+            "chat_id": r[1],
+            "interval_type": r[2],
+            "interval_value": r[3],
+            "prompt": r[4],
+            "enabled": r[5],
+            "created_at": r[6],
+        }
+        for r in rows
+    ]
+
+
+def load_all_schedules() -> list[dict]:
+    """Load all enabled schedules across all chats."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, chat_id, interval_type, interval_value, prompt, enabled, created_at "
+        "FROM schedules WHERE enabled = 1 ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0],
+            "chat_id": r[1],
+            "interval_type": r[2],
+            "interval_value": r[3],
+            "prompt": r[4],
+            "enabled": r[5],
+            "created_at": r[6],
+        }
+        for r in rows
+    ]
+
+
+def save_schedule(chat_id: int, interval_type: str, interval_value: str, prompt: str) -> int:
+    """Create a new schedule. Returns the new schedule ID."""
+    conn = _connect()
+    cursor = conn.execute(
+        "INSERT INTO schedules (chat_id, interval_type, interval_value, prompt, enabled, created_at) "
+        "VALUES (?, ?, ?, ?, 1, ?)",
+        (chat_id, interval_type, interval_value, prompt, time.time()),
+    )
+    schedule_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return schedule_id  # type: ignore[return-value]
+
+
+def delete_schedule(schedule_id: int, chat_id: int) -> bool:
+    """Delete a schedule by ID, scoped to a chat. Returns True if a row was deleted."""
+    conn = _connect()
+    cursor = conn.execute(
+        "DELETE FROM schedules WHERE id = ? AND chat_id = ?",
+        (schedule_id, chat_id),
+    )
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
 
 
 def _serialize(obj):
