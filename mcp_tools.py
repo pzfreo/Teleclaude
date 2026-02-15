@@ -1,7 +1,11 @@
 """MCP (Model Context Protocol) server support for Teleclaude.
 
-Connects to MCP servers via stdio transport, discovers their tools,
-and converts them to Anthropic tool-use format for the API bot.
+Connects to MCP servers via stdio or Streamable HTTP transport,
+discovers their tools, and converts them to Anthropic tool-use format
+for the API bot.
+
+Stdio servers run as local subprocesses (e.g. npx, uvx).
+HTTP servers connect to remote endpoints via Streamable HTTP.
 """
 
 import json
@@ -9,11 +13,14 @@ import logging
 import os
 from typing import Any
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
 # MCP SDK imports — gracefully handled by the loading block in bot.py
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
 
 
 class MCPManager:
@@ -33,12 +40,16 @@ class MCPManager:
     async def initialize(self, config: dict[str, Any]) -> None:
         """Connect to all configured MCP servers and discover tools.
 
-        Config format (Claude Desktop style):
+        Config format:
         {
-            "server_name": {
+            "local_server": {
                 "command": "npx",
                 "args": ["-y", "package"],
                 "env": {}
+            },
+            "remote_server": {
+                "url": "https://mcp.example.com/mcp",
+                "headers": {"Authorization": "Bearer token"}
             }
         }
         """
@@ -55,7 +66,14 @@ class MCPManager:
         )
 
     async def _connect_server(self, name: str, config: dict[str, Any]) -> None:
-        """Connect to a single MCP server and register its tools."""
+        """Dispatch to the appropriate transport based on config."""
+        if config.get("url") or config.get("type") == "http":
+            await self._connect_http_server(name, config)
+        else:
+            await self._connect_stdio_server(name, config)
+
+    async def _connect_stdio_server(self, name: str, config: dict[str, Any]) -> None:
+        """Connect to a local MCP server via stdio transport."""
         command = config.get("command", "")
         args = config.get("args", [])
         env = config.get("env")
@@ -78,8 +96,35 @@ class MCPManager:
         await session.initialize()
 
         self._sessions[name] = session
+        await self._register_tools(name, session)
 
-        # Discover tools and convert to Anthropic format
+    async def _connect_http_server(self, name: str, config: dict[str, Any]) -> None:
+        """Connect to a remote MCP server via Streamable HTTP transport."""
+        url = config.get("url", "")
+        headers = config.get("headers")
+
+        http_client: httpx.AsyncClient | None = None
+        if headers:
+            http_client = httpx.AsyncClient(headers=headers)
+
+        ctx = streamable_http_client(url, http_client=http_client)
+        streams = await ctx.__aenter__()
+        self._contexts.append(ctx)
+
+        # streamable_http_client returns (read, write, get_session_id)
+        read_stream, write_stream = streams[0], streams[1]
+
+        session = ClientSession(read_stream, write_stream)
+        await session.__aenter__()
+        self._contexts.append(session)
+        await session.initialize()
+
+        self._sessions[name] = session
+        await self._register_tools(name, session)
+        logger.info("MCP HTTP server '%s' connected at %s", name, url)
+
+    async def _register_tools(self, name: str, session: ClientSession) -> None:
+        """Discover tools from a connected session and register them."""
         result = await session.list_tools()
         for tool in result.tools:
             prefixed_name = f"mcp_{name}_{tool.name}"
