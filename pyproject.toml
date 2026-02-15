@@ -27,6 +27,7 @@ dev = [
     "pytest-cov>=6.0",
     "types-requests>=2.31.0",
     "pre-commit>=4.0",
+    "pip-audit>=2.7.0",
 ]
 
 [build-system]

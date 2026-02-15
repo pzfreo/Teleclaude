@@ -12,30 +12,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -e ".[dev]"
+        run: uv sync --frozen
 
       - name: Check formatting (Black)
-        run: black --check .
+        run: uv run black --check .
 
       - name: Lint (Ruff)
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: Type check (mypy)
         run: |
-          mypy bot.py bot_agent.py persistence.py shared.py github_tools.py web_tools.py \
+          uv run mypy bot.py bot_agent.py persistence.py shared.py github_tools.py web_tools.py \
                claude_code.py calendar_tools.py tasks_tools.py email_tools.py webhooks.py \
                streaming.py mcp_tools.py
 
       - name: Security audit (pip-audit)
-        run: |
-          pip install pip-audit
-          pip-audit
+        run: uv run pip-audit
 
       - name: Test (pytest)
-        run: pytest --cov --cov-report=term-missing
+        run: uv run pytest --cov --cov-report=term-missing

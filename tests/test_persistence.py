@@ -237,7 +237,7 @@ class TestSerialize:
             from persistence import load_conversation, save_conversation
 
             class FakeBlock:
-                def model_dump(self):
+                def model_dump(self, **kwargs):
                     return {"type": "text", "text": "hello"}
 
             msgs = [{"role": "assistant", "content": [FakeBlock()]}]

@@ -51,7 +51,8 @@ jobs:
             --include='*.py' \
             --include='Dockerfile' \
             --include='docker-compose.yml' \
-            --include='requirements.txt' \
+            --include='pyproject.toml' \
+            --include='uv.lock' \
             --include='VERSION' \
             --exclude='*' \
             ./ root@${{ secrets.DROPLET_IP }}:/opt/teleclaude/

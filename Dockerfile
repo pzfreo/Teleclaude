@@ -21,6 +21,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
 # Create non-root user (claude CLI refuses --dangerously-skip-permissions as root)
 # Give them a proper home for pip/npm caches and local installs
 RUN useradd -m -s /bin/bash teleclaude \
@@ -30,9 +33,9 @@ RUN useradd -m -s /bin/bash teleclaude \
 # App directory
 WORKDIR /app
 
-# Install Python deps first (layer caching)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python deps first (layer caching via lock file)
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-editable
 
 # Copy application code
 COPY *.py VERSION ./
@@ -41,6 +44,6 @@ COPY *.py VERSION ./
 RUN mkdir -p /app/data /app/workspaces && chown -R teleclaude:teleclaude /app
 
 USER teleclaude
-ENV PATH="/home/teleclaude/.local/bin:${PATH}"
+ENV PATH="/app/.venv/bin:/home/teleclaude/.local/bin:${PATH}"
 
 CMD ["python", "bot.py"]

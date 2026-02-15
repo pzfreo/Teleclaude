@@ -61,7 +61,7 @@ wait_for_ssh() {
 copy_files() {
     local host="$1"
     scp -o StrictHostKeyChecking=accept-new \
-        Dockerfile docker-compose.yml requirements.txt VERSION *.py \
+        Dockerfile docker-compose.yml pyproject.toml uv.lock VERSION *.py \
         "${SSH_USER}@${host}:${REMOTE_DIR}/"
 }
 
