@@ -621,6 +621,10 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
         ],
     )
 
+    # Don't send redundant message if aborted — /stop or /new already replied
+    if result in ("(stopped)", "(aborted)"):
+        return
+
     await send_long_message(chat_id, result, bot)
 
 

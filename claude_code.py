@@ -270,8 +270,12 @@ class ClaudeCodeManager:
         await proc.wait()
 
         if proc.returncode != 0 and not result_text:
-            stderr = await proc.stderr.read()
-            err_msg = stderr.decode("utf-8", errors="replace").strip()
-            result_text = f"(Claude Code exited with code {proc.returncode}: {err_msg})"
+            if proc.returncode == -9:
+                # Killed by abort() — don't show an error
+                result_text = "(stopped)"
+            else:
+                stderr = await proc.stderr.read()
+                err_msg = stderr.decode("utf-8", errors="replace").strip()
+                result_text = f"(Claude Code exited with code {proc.returncode}: {err_msg})"
 
         return result_text, session_id
