@@ -180,6 +180,8 @@ class TestRunCli:
             patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
             patch("bot_agent.save_conversation"),
             patch("bot_agent.load_conversation", return_value=[]),
+            patch("bot_agent.save_session_id"),
+            patch("bot_agent.load_session_id", return_value=None),
         ):
             mock_mgr.run = AsyncMock(return_value="CLI output here")
             await _run_cli(3332, "do something", update, ctx)
@@ -199,6 +201,8 @@ class TestRunCli:
             patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
             patch("bot_agent.save_conversation"),
             patch("bot_agent.load_conversation", return_value=[]),
+            patch("bot_agent.save_session_id"),
+            patch("bot_agent.load_session_id", return_value=None),
         ):
             mock_mgr.run = AsyncMock(return_value="")
             await _run_cli(3331, "do something", update, ctx)
@@ -218,6 +222,8 @@ class TestRunCli:
             patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
             patch("bot_agent.save_conversation"),
             patch("bot_agent.load_conversation", return_value=[]),
+            patch("bot_agent.save_session_id"),
+            patch("bot_agent.load_session_id", return_value=None),
         ):
             mock_mgr.run = AsyncMock(side_effect=RuntimeError("CLI crashed"))
             await _run_cli(3330, "do something", update, ctx)
@@ -237,6 +243,8 @@ class TestRunCli:
             patch("bot_agent.send_long_message", new_callable=AsyncMock),
             patch("bot_agent.save_conversation") as mock_save,
             patch("bot_agent.load_conversation", return_value=[]),
+            patch("bot_agent.save_session_id"),
+            patch("bot_agent.load_session_id", return_value=None),
         ):
             mock_mgr.run = AsyncMock(return_value="result")
             await _run_cli(3329, "prompt", update, ctx)
@@ -244,6 +252,30 @@ class TestRunCli:
         saved_msgs = mock_save.call_args[0][1]
         assert saved_msgs[-2]["role"] == "user"
         assert saved_msgs[-1]["role"] == "assistant"
+
+    async def test_restores_session_from_db(self):
+        """Session ID should be restored from DB when not in memory."""
+        from bot_agent import _run_cli
+
+        update = _make_update(chat_id=3328)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.get_active_repo", return_value="owner/repo"),
+            patch("bot_agent.get_model", return_value="claude-test"),
+            patch("bot_agent.get_active_branch", return_value=None),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+            patch("bot_agent.send_long_message", new_callable=AsyncMock),
+            patch("bot_agent.save_conversation"),
+            patch("bot_agent.load_conversation", return_value=[]),
+            patch("bot_agent.save_session_id"),
+            patch("bot_agent.load_session_id", return_value="saved-session-xyz"),
+        ):
+            mock_mgr.get_session_id.return_value = None
+            mock_mgr._sessions = {}
+            mock_mgr.run = AsyncMock(return_value="result")
+            await _run_cli(3328, "prompt", update, ctx)
+        # Session should have been restored into _sessions
+        assert mock_mgr._sessions.get(3328) == "saved-session-xyz"
 
 
 # ── handle_message tests ──────────────────────────────────────────────
@@ -346,12 +378,14 @@ class TestAgentCommands:
             patch("bot_agent.get_active_repo", return_value=None),
             patch("bot_agent.get_active_branch", return_value=None),
             patch("bot_agent.claude_code_mgr") as mock_mgr,
+            patch("bot_agent.save_session_id") as mock_save_session,
         ):
             mock_mgr.new_session = MagicMock()
             mock_mgr.abort = AsyncMock(return_value=False)
             await new_conversation(update, ctx)
         mock_mgr.new_session.assert_called_once_with(3320)
         mock_mgr.abort.assert_called_once_with(3320)
+        mock_save_session.assert_called_once_with(3320, None)
         text = update.message.reply_text.call_args[0][0]
         assert "cleared" in text.lower()
 

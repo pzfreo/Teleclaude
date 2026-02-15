@@ -92,6 +92,40 @@ class TestActiveBranch:
             assert load_active_branch(1001) is None
 
 
+class TestSessionId:
+    def test_save_and_load(self, tmp_db):
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import load_session_id, save_active_repo, save_session_id
+
+            save_active_repo(1001, "owner/repo")  # session_id requires repo row
+            save_session_id(1001, "session-abc-123")
+            assert load_session_id(1001) == "session-abc-123"
+
+    def test_load_none_when_no_repo(self, tmp_db):
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import load_session_id
+
+            assert load_session_id(9999) is None
+
+    def test_clear_session(self, tmp_db):
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import load_session_id, save_active_repo, save_session_id
+
+            save_active_repo(1001, "owner/repo")
+            save_session_id(1001, "session-abc-123")
+            save_session_id(1001, None)
+            assert load_session_id(1001) is None
+
+    def test_overwrite(self, tmp_db):
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import load_session_id, save_active_repo, save_session_id
+
+            save_active_repo(1001, "owner/repo")
+            save_session_id(1001, "old-session")
+            save_session_id(1001, "new-session")
+            assert load_session_id(1001) == "new-session"
+
+
 class TestTodos:
     def test_save_and_load(self, tmp_db):
         with patch("persistence.DB_PATH", tmp_db):

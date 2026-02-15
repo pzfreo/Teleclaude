@@ -34,10 +34,12 @@ from persistence import (
     load_active_repo,
     load_conversation,
     load_model,
+    load_session_id,
     save_active_branch,
     save_active_repo,
     save_conversation,
     save_model,
+    save_session_id,
 )
 from shared import (
     RingBufferHandler,
@@ -406,6 +408,7 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     clear_conversation(chat_id)
     set_active_branch(chat_id, None)
     claude_code_mgr.new_session(chat_id)
+    save_session_id(chat_id, None)
 
     parts = ["Session cleared."]
     if was_running:
@@ -567,6 +570,13 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
     model = get_model(chat_id)
     branch = get_active_branch(chat_id)
 
+    # Restore session ID from DB if not already in memory
+    if claude_code_mgr.get_session_id(chat_id) is None:
+        saved_session = load_session_id(chat_id)
+        if saved_session:
+            claude_code_mgr._sessions[chat_id] = saved_session
+            logger.info("Restored session %s for chat %d", saved_session, chat_id)
+
     # Progress: send a Telegram message for each tool invocation
     tool_count = 0
     last_progress_time = 0.0
@@ -607,6 +617,10 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
     finally:
         stop_typing.set()
         await typing_task
+        # Persist session ID immediately so it survives restarts/crashes
+        current_session = claude_code_mgr.get_session_id(chat_id)
+        if current_session:
+            save_session_id(chat_id, current_session)
 
     if not result:
         result = "(no output)"

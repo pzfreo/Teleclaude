@@ -86,6 +86,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE active_repos ADD COLUMN branch TEXT")
         conn.commit()
         logger.info("Migrated active_repos: added branch column")
+    if "session_id" not in repo_columns:
+        conn.execute("ALTER TABLE active_repos ADD COLUMN session_id TEXT")
+        conn.commit()
+        logger.info("Migrated active_repos: added session_id column")
 
 
 def load_conversation(chat_id: int) -> list[dict]:
@@ -151,6 +155,22 @@ def save_active_branch(chat_id: int, branch: str | None) -> None:
         """UPDATE active_repos SET branch = ? WHERE chat_id = ?""",
         (branch, chat_id),
     )
+    conn.commit()
+    conn.close()
+
+
+def load_session_id(chat_id: int) -> str | None:
+    """Load persisted CLI session ID for a chat."""
+    conn = _connect()
+    row = conn.execute("SELECT session_id FROM active_repos WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
+def save_session_id(chat_id: int, session_id: str | None) -> None:
+    """Persist CLI session ID for a chat (requires active_repos row to exist)."""
+    conn = _connect()
+    conn.execute("UPDATE active_repos SET session_id = ? WHERE chat_id = ?", (session_id, chat_id))
     conn.commit()
     conn.close()
 
