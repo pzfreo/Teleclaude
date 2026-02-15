@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-time setup to authorize Google APIs (Tasks, Calendar, Gmail send).
+"""One-time setup to authorize Google APIs (Tasks, Calendar, Gmail send, Contacts).
 
 Run this locally to get a refresh token, then add it to Railway.
 
@@ -9,14 +9,14 @@ Usage:
 Prerequisites:
     1. Go to https://console.cloud.google.com/
     2. Create a project (or use an existing one)
-    3. Enable these APIs: Google Tasks, Google Calendar, Gmail
+    3. Enable these APIs: Google Tasks, Google Calendar, Gmail, People API
     4. Go to Credentials -> Create Credentials -> OAuth 2.0 Client ID
     5. Choose "Desktop app" as the application type
     6. Download the JSON and save it as 'credentials.json' in this directory
        OR set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in your .env
 
-Note: If you previously ran this script for Tasks only, re-run it to
-      add Calendar and Gmail scopes. The new token replaces the old one.
+Note: If you previously ran this script, re-run it to add any new scopes.
+      The new token replaces the old one.
 """
 
 import os
@@ -30,6 +30,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/tasks",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/gmail.send",  # send only — no read access
+    "https://www.googleapis.com/auth/contacts",  # read + write contacts
 ]
 
 
@@ -69,6 +70,7 @@ def main():
     print("  - Google Tasks")
     print("  - Google Calendar")
     print("  - Gmail (send only)")
+    print("  - Google Contacts (read + write)")
     print("\n--- Done! ---")
 
 

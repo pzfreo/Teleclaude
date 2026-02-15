@@ -204,6 +204,28 @@ except Exception as e:
     logger.warning("Gmail: failed to load (%s)", e)
     EMAIL_TOOLS = []
 
+# Google Contacts
+contacts_client = None
+CONTACTS_TOOLS: list[dict[str, Any]] = []
+execute_contacts_tool = None
+try:
+    from contacts_tools import CONTACTS_TOOLS, GoogleContactsClient
+    from contacts_tools import execute_tool as _execute_contacts
+
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+    client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    refresh_token = os.getenv("GOOGLE_REFRESH_TOKEN", "")
+    if client_id and client_secret and refresh_token:
+        contacts_client = GoogleContactsClient(client_id, client_secret, refresh_token)
+        execute_contacts_tool = _execute_contacts
+        logger.info("Google Contacts: enabled")
+    else:
+        CONTACTS_TOOLS = []
+        logger.info("Google Contacts: disabled (missing Google credentials)")
+except Exception as e:
+    logger.warning("Google Contacts: failed to load (%s)", e)
+    CONTACTS_TOOLS = []
+
 # Voice transcription (OpenAI Whisper)
 openai_client = None
 try:
@@ -356,6 +378,7 @@ _github_tool_names = {t["name"] for t in GITHUB_TOOLS}
 _tasks_tool_names = {t["name"] for t in TASKS_TOOLS}
 _calendar_tool_names = {t["name"] for t in CALENDAR_TOOLS}
 _email_tool_names = {t["name"] for t in EMAIL_TOOLS}
+_contacts_tool_names = {t["name"] for t in CONTACTS_TOOLS}
 
 # In-memory cache (backed by SQLite)
 conversations: dict[int, list] = {}
@@ -996,6 +1019,9 @@ def _execute_tool_call(block, repo, chat_id) -> str:
         elif block.name in _email_tool_names and execute_email_tool:
             audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: to={block.input.get('to', '')}")
             return execute_email_tool(email_client, block.name, block.input)
+        elif block.name in _contacts_tool_names and execute_contacts_tool:
+            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
+            return execute_contacts_tool(contacts_client, block.name, block.input)
         elif block.name in _github_tool_names and execute_github_tool:
             if not repo:
                 return "No active repo. Ask the user to set one with /repo owner/name first."
@@ -1358,6 +1384,8 @@ async def _process_message(
         tools.extend(CALENDAR_TOOLS)
     if email_client:
         tools.extend(EMAIL_TOOLS)
+    if contacts_client:
+        tools.extend(CONTACTS_TOOLS)
     if MCP_TOOLS:
         tools.extend(MCP_TOOLS)
 
@@ -1523,6 +1551,8 @@ async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
         tools.extend(CALENDAR_TOOLS)
     if email_client:
         tools.extend(EMAIL_TOOLS)
+    if contacts_client:
+        tools.extend(CONTACTS_TOOLS)
 
     try:
         import zoneinfo

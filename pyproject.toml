@@ -38,7 +38,7 @@ build-backend = "setuptools.build_meta"
 py-modules = [
     "bot", "bot_agent", "persistence", "shared", "github_tools", "web_tools",
     "calendar_tools", "tasks_tools", "email_tools", "claude_code",
-    "setup_google", "webhooks", "streaming", "mcp_tools",
+    "contacts_tools", "setup_google", "webhooks", "streaming", "mcp_tools",
 ]
 
 [tool.setuptools.dynamic]
@@ -89,6 +89,7 @@ known-first-party = [
     "tasks_tools",
     "email_tools",
     "claude_code",
+    "contacts_tools",
     "streaming",
     "mcp_tools",
 ]
