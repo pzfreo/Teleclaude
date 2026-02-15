@@ -30,7 +30,7 @@ jobs:
         run: |
           uv run mypy bot.py bot_agent.py persistence.py shared.py github_tools.py web_tools.py \
                claude_code.py calendar_tools.py tasks_tools.py email_tools.py webhooks.py \
-               contacts_tools.py streaming.py mcp_tools.py
+               contacts_tools.py train_tools.py streaming.py mcp_tools.py
 
       - name: Security audit (pip-audit)
         run: uv run pip-audit

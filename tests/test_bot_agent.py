@@ -343,6 +343,8 @@ class TestAgentCommands:
             patch("bot_agent.is_authorized", return_value=True),
             patch("bot_agent.clear_conversation"),
             patch("bot_agent.save_active_branch"),
+            patch("bot_agent.get_active_repo", return_value=None),
+            patch("bot_agent.get_active_branch", return_value=None),
             patch("bot_agent.claude_code_mgr") as mock_mgr,
         ):
             mock_mgr.new_session = MagicMock()

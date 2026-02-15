@@ -226,6 +226,21 @@ except Exception as e:
     logger.warning("Google Contacts: failed to load (%s)", e)
     CONTACTS_TOOLS = []
 
+# UK Train Times (Huxley2 — no API key needed)
+train_client = None
+TRAIN_TOOLS: list[dict[str, Any]] = []
+execute_train_tool = None
+try:
+    from train_tools import TRAIN_TOOLS, TrainClient
+    from train_tools import execute_tool as _execute_train
+
+    train_client = TrainClient()
+    execute_train_tool = _execute_train
+    logger.info("UK Train Times: enabled")
+except Exception as e:
+    logger.warning("UK Train Times: failed to load (%s)", e)
+    TRAIN_TOOLS = []
+
 # Voice transcription (OpenAI Whisper)
 openai_client = None
 try:
@@ -379,6 +394,7 @@ _tasks_tool_names = {t["name"] for t in TASKS_TOOLS}
 _calendar_tool_names = {t["name"] for t in CALENDAR_TOOLS}
 _email_tool_names = {t["name"] for t in EMAIL_TOOLS}
 _contacts_tool_names = {t["name"] for t in CONTACTS_TOOLS}
+_train_tool_names = {t["name"] for t in TRAIN_TOOLS}
 
 # In-memory cache (backed by SQLite)
 conversations: dict[int, list] = {}
@@ -1022,6 +1038,9 @@ def _execute_tool_call(block, repo, chat_id) -> str:
         elif block.name in _contacts_tool_names and execute_contacts_tool:
             audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
             return execute_contacts_tool(contacts_client, block.name, block.input)
+        elif block.name in _train_tool_names and execute_train_tool:
+            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: {block.input.get('station', '')}")
+            return execute_train_tool(train_client, block.name, block.input)
         elif block.name in _github_tool_names and execute_github_tool:
             if not repo:
                 return "No active repo. Ask the user to set one with /repo owner/name first."
@@ -1386,6 +1405,8 @@ async def _process_message(
         tools.extend(EMAIL_TOOLS)
     if contacts_client:
         tools.extend(CONTACTS_TOOLS)
+    if train_client:
+        tools.extend(TRAIN_TOOLS)
     if MCP_TOOLS:
         tools.extend(MCP_TOOLS)
 
@@ -1553,6 +1574,8 @@ async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
         tools.extend(EMAIL_TOOLS)
     if contacts_client:
         tools.extend(CONTACTS_TOOLS)
+    if train_client:
+        tools.extend(TRAIN_TOOLS)
 
     try:
         import zoneinfo

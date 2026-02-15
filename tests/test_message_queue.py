@@ -70,7 +70,7 @@ class TestCancelEvents:
         update.message.reply_text.assert_called_once_with("Nothing to cancel.")
 
     @pytest.mark.asyncio
-    async def test_cancel_rolls_back_history(self):
+    async def test_cancel_rolls_back_history(self, tmp_db):
         """When cancel is set, _process_message should roll back history."""
         from bot import _process_message, conversations
 
