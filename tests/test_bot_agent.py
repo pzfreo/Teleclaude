@@ -346,8 +346,10 @@ class TestAgentCommands:
             patch("bot_agent.claude_code_mgr") as mock_mgr,
         ):
             mock_mgr.new_session = MagicMock()
+            mock_mgr.abort = AsyncMock(return_value=False)
             await new_conversation(update, ctx)
         mock_mgr.new_session.assert_called_once_with(3320)
+        mock_mgr.abort.assert_called_once_with(3320)
         text = update.message.reply_text.call_args[0][0]
         assert "cleared" in text.lower()
 

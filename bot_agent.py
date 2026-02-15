@@ -262,6 +262,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/repo owner/name - Set the active GitHub repo\n"
         "/repo - Show current repo\n"
         "/branch name - Set active branch\n"
+        "/stop - Stop current work (keeps session)\n"
         "/new - Start a fresh CLI session\n"
         "/model - Show or switch model (opus/sonnet/haiku)\n"
         "/logs [min] - Download recent logs\n"
@@ -379,14 +380,44 @@ async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(msg)
 
 
+async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    was_running = await claude_code_mgr.abort(chat_id)
+    if was_running:
+        await update.message.reply_text("Stopped.")
+    else:
+        await update.message.reply_text("Nothing running.")
+
+
 async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
+
+    # Capture repo/branch before clearing
+    repo = get_active_repo(chat_id)
+    branch = get_active_branch(chat_id)
+
+    # Kill any running CLI process immediately
+    was_running = await claude_code_mgr.abort(chat_id)
+
     clear_conversation(chat_id)
     set_active_branch(chat_id, None)
     claude_code_mgr.new_session(chat_id)
-    await update.message.reply_text("Session cleared. Starting fresh.")
+
+    parts = ["Session cleared."]
+    if was_running:
+        parts.append("Stopped running task.")
+    if repo:
+        label = f"`{repo}`"
+        if branch:
+            label += f" on `{branch}`"
+        parts.append(f"Repo: {label}")
+    else:
+        parts.append("No repo set.")
+    await update.message.reply_text(" ".join(parts), parse_mode="Markdown")
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -638,6 +669,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("repo", set_repo))
     app.add_handler(CommandHandler("branch", set_branch))
+    app.add_handler(CommandHandler("stop", stop_work))
     app.add_handler(CommandHandler("new", new_conversation))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("logs", send_logs))

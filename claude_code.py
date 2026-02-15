@@ -19,6 +19,7 @@ class ClaudeCodeManager:
         self.workspace_root = Path(workspace_root or os.getenv("CLAUDE_CODE_WORKSPACE") or "workspaces")
         self.cli_path = cli_path or os.getenv("CLAUDE_CLI_PATH") or shutil.which("claude")
         self._sessions: dict[int, str] = {}  # chat_id → session_id
+        self._running_procs: dict[int, asyncio.subprocess.Process] = {}  # chat_id → active proc
 
     @property
     def available(self) -> bool:
@@ -118,6 +119,15 @@ class ClaudeCodeManager:
         """Clear the session so the next message starts fresh."""
         self._sessions.pop(chat_id, None)
 
+    async def abort(self, chat_id: int) -> bool:
+        """Kill the running CLI subprocess for a chat. Returns True if a process was killed."""
+        proc = self._running_procs.pop(chat_id, None)
+        if proc and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+            return True
+        return False
+
     # ── CLI invocation ───────────────────────────────────────────────
 
     async def run(
@@ -191,16 +201,23 @@ class ClaudeCodeManager:
             limit=10 * 1024 * 1024,  # 10 MB line buffer
         )
 
+        self._running_procs[chat_id] = proc
         result_text = ""
         returned_session_id = None
 
         try:
             result_text, returned_session_id = await self._read_stream(proc, on_progress)
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            return "(aborted)"
         except Exception as e:
             logger.error("Claude Code stream error: %s", e, exc_info=True)
             proc.kill()
             await proc.wait()
             result_text = f"(Claude Code error: {e})"
+        finally:
+            self._running_procs.pop(chat_id, None)
 
         # Store session ID for continuity
         if returned_session_id:
