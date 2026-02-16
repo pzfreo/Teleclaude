@@ -176,11 +176,10 @@ class TestSanitizeHistory:
             },
         ]
         result = _sanitize_history(history)
-        # The orphaned tool_use (assistant) is dropped; both user messages remain
-        assert len(result) == 2
+        # The orphaned tool_use (assistant) is dropped; the user message with only
+        # orphaned tool_results is also dropped (it would cause an API error)
+        assert len(result) == 1
         assert result[0]["content"] == "search"
-        # The tool_result user message is kept (it's still a valid user message)
-        assert result[1]["role"] == "user"
 
 
 class TestFormatTodoList:

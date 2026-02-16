@@ -278,7 +278,7 @@ DAILY_BRIEFING_TIME = os.getenv("DAILY_BRIEFING_TIME", "")  # e.g. "08:00"
 
 SYSTEM_PROMPT = """You are Teleclaude, a personal AI assistant on Telegram. You help with coding, productivity, and daily tasks.
 
-You have access to: GitHub (code, issues, PRs, CI), web search, Google Tasks, Google Calendar, and Gmail (send only).
+You have access to: GitHub (code, issues, PRs, CI), web search, Google Tasks, Google Calendar, Gmail (send only), Google Contacts, and UK train times.
 
 Coding guidelines:
 - Always read existing files before modifying them.
@@ -299,6 +299,8 @@ Tool usage:
 - Use Google Calendar to check schedule, create events, or manage the user's calendar.
 - For time-specific events, use the user's timezone unless they specify otherwise.
 - You can send emails via Gmail but NEVER send an email without explicitly confirming the recipient, subject, and body with the user first.
+- Use Google Contacts to search, view, or manage the user's contacts.
+- Use UK train times to check departures, arrivals, search stations, or get service details for National Rail.
 - When you need the user to choose between options, use the ask_user tool to present inline buttons.
 - When plan mode is on, always outline your plan first and wait for user approval before executing.
 - You can upload binary files (images, etc.) to GitHub repos using the upload_binary_file tool.
@@ -616,7 +618,7 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
                     cleaned.append(b)
             msg["content"] = cleaned
 
-    # Walk backwards and remove orphaned tool_use/tool_result pairs
+    # Walk forward and remove orphaned tool_use/tool_result pairs
     sanitized = []
     i = 0
     while i < len(history):
@@ -638,16 +640,62 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
                             for b in next_msg["content"]
                             if isinstance(b, dict) and b.get("type") == "tool_result"
                         }
-                        if tool_use_ids <= result_ids:
+                        if tool_use_ids == result_ids:
                             # Pair is complete, keep both
                             sanitized.append(msg)
                             sanitized.append(next_msg)
                             i += 2
                             continue
-                # Pair is broken — skip the assistant message (and orphaned results if any)
+                # Pair is broken — skip the assistant message
                 logger.warning("Dropping orphaned tool_use message at index %d", i)
+                # Also skip the next message if it contains orphaned tool_results
+                if i + 1 < len(history):
+                    next_msg = history[i + 1]
+                    if next_msg.get("role") == "user" and isinstance(next_msg.get("content"), list):
+                        has_tool_results = any(
+                            isinstance(b, dict) and b.get("type") == "tool_result" for b in next_msg["content"]
+                        )
+                        if has_tool_results:
+                            # Strip tool_result blocks, keep any other content (e.g. text)
+                            kept = [
+                                b
+                                for b in next_msg["content"]
+                                if not (isinstance(b, dict) and b.get("type") == "tool_result")
+                            ]
+                            if kept:
+                                sanitized.append({"role": "user", "content": kept})
+                            logger.warning("Stripped orphaned tool_result blocks from message at index %d", i + 1)
+                            i += 2
+                            continue
                 i += 1
                 continue
+
+        # Check if a user message has tool_result blocks without a preceding tool_use
+        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            has_tool_results = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in msg["content"])
+            if has_tool_results:
+                # Check if previous sanitized message is an assistant with matching tool_use
+                prev = sanitized[-1] if sanitized else None
+                prev_tool_ids: set[str] = set()
+                if prev and prev.get("role") == "assistant" and isinstance(prev.get("content"), list):
+                    prev_tool_ids = {
+                        b["id"]
+                        for b in prev["content"]
+                        if isinstance(b, dict) and b.get("type") == "tool_use" and "id" in b
+                    }
+                result_ids = {
+                    b.get("tool_use_id")
+                    for b in msg["content"]
+                    if isinstance(b, dict) and b.get("type") == "tool_result"
+                }
+                if not prev_tool_ids or not (result_ids <= prev_tool_ids):
+                    # Orphaned tool_results — strip them, keep other content
+                    kept = [b for b in msg["content"] if not (isinstance(b, dict) and b.get("type") == "tool_result")]
+                    if kept:
+                        sanitized.append({"role": "user", "content": kept})
+                    logger.warning("Stripped orphaned tool_result blocks from user message at index %d", i)
+                    i += 1
+                    continue
 
         sanitized.append(msg)
         i += 1
