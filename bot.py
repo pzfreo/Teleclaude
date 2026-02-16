@@ -597,6 +597,7 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
         return history
 
     # Clean assistant content blocks:
+    # - Convert SDK objects to plain dicts (SDK objects bypass isinstance(b, dict) checks below)
     # - Strip thinking blocks (they can't be replayed)
     # - Remove SDK-internal fields like parsed_output that the API rejects
     _KNOWN_TEXT_KEYS = {"type", "text"}
@@ -605,9 +606,13 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
         if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
             cleaned = []
             for b in msg["content"]:
+                # Convert SDK objects (e.g. ToolUseBlock, TextBlock) to plain dicts
+                if not isinstance(b, dict) and hasattr(b, "model_dump"):
+                    b = b.model_dump(exclude_none=True)
+                elif not isinstance(b, dict) and hasattr(b, "__dict__"):
+                    b = dict(b.__dict__)
                 if not isinstance(b, dict):
-                    cleaned.append(b)
-                    continue
+                    continue  # Skip non-dict, non-SDK items we can't process
                 if b.get("type") == "thinking":
                     continue
                 if b.get("type") == "text":
@@ -617,6 +622,18 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
                 else:
                     cleaned.append(b)
             msg["content"] = cleaned
+        # Also convert SDK objects in user messages (tool_result blocks)
+        elif msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            cleaned = []
+            for b in msg["content"]:
+                if not isinstance(b, dict) and hasattr(b, "model_dump"):
+                    b = b.model_dump(exclude_none=True)
+                elif not isinstance(b, dict) and hasattr(b, "__dict__"):
+                    b = dict(b.__dict__)
+                if isinstance(b, dict):
+                    cleaned.append(b)
+            if cleaned:
+                msg["content"] = cleaned
 
     # Walk forward and remove orphaned tool_use/tool_result pairs
     sanitized = []
@@ -1520,6 +1537,18 @@ async def _process_message(
                 return
 
             progress["round"] = round_num + 1
+
+            # Sanitize before each API call to catch any mid-session corruption
+            # (e.g. orphaned tool_use/tool_result from errors in previous rounds)
+            sanitized_messages = _sanitize_history(history)
+            if len(sanitized_messages) != len(history):
+                logger.warning(
+                    "Pre-call sanitization fixed history: %d -> %d messages",
+                    len(history),
+                    len(sanitized_messages),
+                )
+                history.clear()
+                history.extend(sanitized_messages)
 
             kwargs: dict[str, Any] = {
                 "model": get_model(chat_id),

@@ -181,6 +181,83 @@ class TestSanitizeHistory:
         assert len(result) == 1
         assert result[0]["content"] == "search"
 
+    def test_sdk_objects_converted_to_dicts(self):
+        """SDK objects (e.g. ToolUseBlock) must be converted to dicts so tool_use
+        validation doesn't skip them."""
+        from bot import _sanitize_history
+
+        class FakeToolUseBlock:
+            """Mimics anthropic.types.ToolUseBlock with model_dump()."""
+
+            def __init__(self, id, name, input):
+                self.type = "tool_use"
+                self.id = id
+                self.name = name
+                self.input = input
+
+            def model_dump(self, exclude_none=False):
+                return {"type": self.type, "id": self.id, "name": self.name, "input": self.input}
+
+        class FakeTextBlock:
+            def __init__(self, text):
+                self.type = "text"
+                self.text = text
+
+            def model_dump(self, exclude_none=False):
+                return {"type": self.type, "text": self.text}
+
+        # Assistant message with SDK objects (not dicts) and no matching tool_result
+        history = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": [
+                    FakeTextBlock("Let me search"),
+                    FakeToolUseBlock("tool_1", "web_search", {"q": "test"}),
+                ],
+            },
+            {"role": "user", "content": "thanks"},
+        ]
+        result = _sanitize_history(history)
+        # The tool_use has no matching tool_result, so the assistant message should be dropped
+        assert len(result) == 2
+        assert result[0]["content"] == "hello"
+        assert result[1]["content"] == "thanks"
+
+    def test_sdk_objects_with_matching_results_kept(self):
+        """SDK objects that have matching tool_results should be kept."""
+        from bot import _sanitize_history
+
+        class FakeToolUseBlock:
+            def __init__(self, id, name, input):
+                self.type = "tool_use"
+                self.id = id
+                self.name = name
+                self.input = input
+
+            def model_dump(self, exclude_none=False):
+                return {"type": self.type, "id": self.id, "name": self.name, "input": self.input}
+
+        history = [
+            {"role": "user", "content": "search"},
+            {
+                "role": "assistant",
+                "content": [FakeToolUseBlock("tool_1", "web_search", {"q": "test"})],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tool_1", "content": "result"}],
+            },
+        ]
+        result = _sanitize_history(history)
+        # Complete pair — all three messages kept
+        assert len(result) == 3
+        # SDK objects should have been converted to dicts
+        assistant_content = result[1]["content"]
+        assert isinstance(assistant_content[0], dict)
+        assert assistant_content[0]["type"] == "tool_use"
+        assert assistant_content[0]["id"] == "tool_1"
+
 
 class TestFormatTodoList:
     def test_empty(self):
