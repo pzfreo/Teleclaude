@@ -59,6 +59,19 @@ def init_db() -> None:
             created_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_schedules_chat_id ON schedules(chat_id);
+        CREATE TABLE IF NOT EXISTS monitors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            check_prompt TEXT NOT NULL,
+            notify_condition TEXT NOT NULL,
+            interval_minutes INTEGER NOT NULL,
+            expires_at REAL NOT NULL,
+            summary TEXT NOT NULL,
+            last_result TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_monitors_chat_id ON monitors(chat_id);
         """)
     # Migrations for existing databases
     _migrate(conn)
@@ -321,6 +334,104 @@ def delete_schedule(schedule_id: int, chat_id: int) -> bool:
     conn.commit()
     conn.close()
     return deleted
+
+
+# ── Monitors ────────────────────────────────────────────────────────
+
+
+def save_monitor(
+    chat_id: int,
+    check_prompt: str,
+    notify_condition: str,
+    interval_minutes: int,
+    expires_at: float,
+    summary: str,
+) -> int:
+    """Create a new monitor. Returns the new monitor ID."""
+    conn = _connect()
+    cursor = conn.execute(
+        "INSERT INTO monitors (chat_id, check_prompt, notify_condition, interval_minutes, "
+        "expires_at, summary, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+        (chat_id, check_prompt, notify_condition, interval_minutes, expires_at, summary, time.time()),
+    )
+    monitor_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return monitor_id  # type: ignore[return-value]
+
+
+def load_monitors(chat_id: int) -> list[dict]:
+    """Load all enabled monitors for a chat."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, chat_id, check_prompt, notify_condition, interval_minutes, "
+        "expires_at, summary, last_result, enabled, created_at "
+        "FROM monitors WHERE chat_id = ? AND enabled = 1 ORDER BY id",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+    return [_monitor_row_to_dict(r) for r in rows]
+
+
+def load_all_monitors() -> list[dict]:
+    """Load all enabled monitors across all chats."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, chat_id, check_prompt, notify_condition, interval_minutes, "
+        "expires_at, summary, last_result, enabled, created_at "
+        "FROM monitors WHERE enabled = 1 ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [_monitor_row_to_dict(r) for r in rows]
+
+
+def count_monitors(chat_id: int) -> int:
+    """Count active monitors for a chat."""
+    conn = _connect()
+    row = conn.execute("SELECT COUNT(*) FROM monitors WHERE chat_id = ? AND enabled = 1", (chat_id,)).fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def update_monitor_result(monitor_id: int, result: str) -> None:
+    """Update the last_result for a monitor."""
+    conn = _connect()
+    conn.execute("UPDATE monitors SET last_result = ? WHERE id = ?", (result, monitor_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_monitor(monitor_id: int, chat_id: int) -> bool:
+    """Delete a monitor by ID, scoped to a chat. Returns True if a row was deleted."""
+    conn = _connect()
+    cursor = conn.execute("DELETE FROM monitors WHERE id = ? AND chat_id = ?", (monitor_id, chat_id))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def disable_monitor(monitor_id: int) -> None:
+    """Disable a monitor (soft delete for expiry)."""
+    conn = _connect()
+    conn.execute("UPDATE monitors SET enabled = 0 WHERE id = ?", (monitor_id,))
+    conn.commit()
+    conn.close()
+
+
+def _monitor_row_to_dict(r) -> dict:
+    return {
+        "id": r[0],
+        "chat_id": r[1],
+        "check_prompt": r[2],
+        "notify_condition": r[3],
+        "interval_minutes": r[4],
+        "expires_at": r[5],
+        "summary": r[6],
+        "last_result": r[7],
+        "enabled": r[8],
+        "created_at": r[9],
+    }
 
 
 def _serialize(obj):

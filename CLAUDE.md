@@ -69,6 +69,16 @@ def execute_tool(client: SomeClient, tool_name: str, tool_input: dict) -> str:
 | `tasks_tools.py` | Google Tasks API | 5 (list, create, complete, update, delete) | OAuth2 |
 | `calendar_tools.py` | Google Calendar API | 5 (list, create, update, delete events) | OAuth2 |
 | `email_tools.py` | Gmail API (send only) | 1 (send_email) | OAuth2 |
+| `contacts_tools.py` | Google People API | search, get, create, update contacts | OAuth2 |
+| `train_tools.py` | Huxley2 (National Rail) | departures, arrivals, station search, service details | None |
+
+**Internal tools** (always available, defined in `bot.py`):
+
+| Tool | Purpose |
+|------|---------|
+| `update_todo_list` | Track tasks/todos per chat |
+| `ask_user` | Present inline keyboard buttons for user choices |
+| `schedule_check` | Schedule recurring background monitors with change detection (max 24h, max 5 per chat) |
 
 Tool loading is **graceful** — each module is wrapped in try/except at import time (`bot.py:96-197`). Missing credentials or import failures disable the integration without crashing.
 

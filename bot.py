@@ -33,13 +33,18 @@ from telegram.ext import (
 from persistence import (
     audit_log,
     clear_conversation,
+    count_monitors,
+    delete_monitor,
     delete_schedule,
+    disable_monitor,
     init_db,
     load_active_branch,
     load_active_repo,
+    load_all_monitors,
     load_all_schedules,
     load_conversation,
     load_model,
+    load_monitors,
     load_plan_mode,
     load_schedules,
     load_todos,
@@ -47,9 +52,11 @@ from persistence import (
     save_active_repo,
     save_conversation,
     save_model,
+    save_monitor,
     save_plan_mode,
     save_schedule,
     save_todos,
+    update_monitor_result,
 )
 from shared import (
     RingBufferHandler,
@@ -301,6 +308,10 @@ Tool usage:
 - You can send emails via Gmail but NEVER send an email without explicitly confirming the recipient, subject, and body with the user first.
 - Use Google Contacts to search, view, or manage the user's contacts.
 - Use UK train times to check departures, arrivals, search stations, or get service details for National Rail.
+- You can set up background monitors using schedule_check to watch for changes and alert the user.
+  Use this when they want to be notified about future events (train delays, new issues, PR merges, etc.).
+  Choose sensible intervals (trains: 5-10m, GitHub: 15-30m) and expiry times (until journey, end of day).
+  The user can view active monitors with /monitors and remove them with /monitors remove <id>.
 - When you need the user to choose between options, use the ask_user tool to present inline buttons.
 - When plan mode is on, always outline your plan first and wait for user approval before executing.
 - You can upload binary files (images, etc.) to GitHub repos using the upload_binary_file tool.
@@ -371,6 +382,61 @@ ASK_USER_TOOL = {
         "required": ["question", "options"],
     },
 }
+
+SCHEDULE_CHECK_TOOL = {
+    "name": "schedule_check",
+    "description": (
+        "Schedule a recurring background check that monitors something and notifies the user "
+        "when conditions change. Use this when the user wants to be alerted about future changes "
+        "(e.g. train delays, new GitHub issues, PR merges). The check runs every interval_minutes "
+        "until expires_at, using all available tools to gather current state. It compares each "
+        "result with the previous one and only notifies the user if the notify_condition is met. "
+        "First run captures a baseline silently. Auto-expires — max 24 hours. Max 5 active monitors."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "check_prompt": {
+                "type": "string",
+                "description": (
+                    "The prompt to run each check cycle. Should instruct use of specific tools "
+                    "(e.g. get_train_departures, list_issues). Be specific about what data to gather."
+                ),
+            },
+            "notify_condition": {
+                "type": "string",
+                "description": (
+                    "When to notify the user. Describe the change that matters. "
+                    "E.g. 'Any train is delayed by more than 5 minutes or cancelled', "
+                    "'A new issue was opened', 'The CI check failed'"
+                ),
+            },
+            "interval_minutes": {
+                "type": "integer",
+                "description": "How often to check, in minutes. Min 5, max 60. Use 5-10 for trains, 15-30 for GitHub.",
+                "minimum": 5,
+                "maximum": 60,
+            },
+            "expires_at": {
+                "type": "string",
+                "description": (
+                    "ISO 8601 datetime when monitoring should stop. Max 24h from now. "
+                    "Choose sensibly: train monitoring until journey time, GitHub until end of day."
+                ),
+            },
+            "summary": {
+                "type": "string",
+                "description": "Brief human-readable label, e.g. 'CHI→VIC train delays', 'New issues on Teleclaude'",
+            },
+        },
+        "required": ["check_prompt", "notify_condition", "interval_minutes", "expires_at", "summary"],
+    },
+}
+
+MAX_MONITORS_PER_CHAT = 5
+MAX_MONITOR_DURATION_HOURS = 24
+# Registered monitor jobs: monitor_id -> Job
+_monitor_jobs: dict[int, Any] = {}
 
 ASK_USER_TIMEOUT = 300  # seconds to wait for user response
 _ask_user_futures: dict[int, asyncio.Future] = {}
@@ -1088,6 +1154,8 @@ def _execute_tool_call(block, repo, chat_id) -> str:
             save_todos(chat_id, todos)
             audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
             return format_todo_list(todos)
+        if block.name == "schedule_check":
+            return _handle_schedule_check(block.input, chat_id)
         if block.name == "web_search" and execute_web_tool:
             audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: {block.input.get('query', '')[:100]}")
             return execute_web_tool(web_client, block.name, block.input)
@@ -1124,6 +1192,89 @@ def _execute_tool_call(block, repo, chat_id) -> str:
         logger.error("Tool '%s' crashed: %s", block.name, e, exc_info=True)
         audit_log("tool_error", chat_id=chat_id, detail=f"{block.name}: {e}")
         return f"Tool error: {e}"
+
+
+def _handle_schedule_check(tool_input: dict, chat_id: int) -> str:
+    """Handle the schedule_check tool call — validate and persist a new monitor."""
+    # Validate limits
+    active_count = count_monitors(chat_id)
+    if active_count >= MAX_MONITORS_PER_CHAT:
+        return f"Monitor limit reached ({MAX_MONITORS_PER_CHAT} active). Remove one with /monitors remove <id> first."
+
+    check_prompt = tool_input.get("check_prompt", "")
+    notify_condition = tool_input.get("notify_condition", "")
+    interval_minutes = tool_input.get("interval_minutes", 10)
+    expires_at_str = tool_input.get("expires_at", "")
+    summary = tool_input.get("summary", "Monitor")
+
+    if not check_prompt or not notify_condition:
+        return "Error: check_prompt and notify_condition are required."
+
+    interval_minutes = max(5, min(60, int(interval_minutes)))
+
+    # Parse expiry
+    try:
+        import zoneinfo
+
+        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
+    except Exception:
+        tz = datetime.UTC
+
+    now = datetime.datetime.now(tz)
+    try:
+        expires_dt = datetime.datetime.fromisoformat(expires_at_str)
+        if expires_dt.tzinfo is None:
+            expires_dt = expires_dt.replace(tzinfo=tz)
+    except (ValueError, TypeError):
+        # Default: 2 hours from now
+        expires_dt = now + datetime.timedelta(hours=2)
+
+    # Cap at 24 hours
+    max_expiry = now + datetime.timedelta(hours=MAX_MONITOR_DURATION_HOURS)
+    if expires_dt > max_expiry:
+        expires_dt = max_expiry
+    if expires_dt <= now:
+        return "Error: expires_at must be in the future."
+
+    expires_at_ts = expires_dt.timestamp()
+
+    monitor_id = save_monitor(
+        chat_id=chat_id,
+        check_prompt=check_prompt,
+        notify_condition=notify_condition,
+        interval_minutes=interval_minutes,
+        expires_at=expires_at_ts,
+        summary=summary,
+    )
+
+    # Register with job queue (needs to happen on the event loop)
+    # Store pending registration — picked up by the async tool loop in _process_message
+    _pending_monitor_registrations.append(
+        {
+            "id": monitor_id,
+            "chat_id": chat_id,
+            "check_prompt": check_prompt,
+            "notify_condition": notify_condition,
+            "interval_minutes": interval_minutes,
+            "expires_at": expires_at_ts,
+            "summary": summary,
+            "last_result": None,
+        }
+    )
+
+    expires_str = (
+        expires_dt.strftime("%H:%M %Z") if expires_dt.date() == now.date() else expires_dt.strftime("%b %d %H:%M")
+    )
+    audit_log("monitor_created", chat_id=chat_id, detail=f"#{monitor_id}: {summary}")
+    return (
+        f"Monitor #{monitor_id} created: {summary}\n"
+        f"Checking every {interval_minutes}m until {expires_str}.\n"
+        f"First check will run shortly to capture a baseline."
+    )
+
+
+# Pending registrations from sync _execute_tool_call → picked up by async _process_message
+_pending_monitor_registrations: list[dict] = []
 
 
 async def _handle_ask_user(block, chat_id: int, bot) -> str:
@@ -1457,7 +1608,7 @@ async def _process_message(
     trim_history(chat_id)
 
     repo = get_active_repo(chat_id)
-    tools = [TODO_TOOL, ASK_USER_TOOL]
+    tools = [TODO_TOOL, ASK_USER_TOOL, SCHEDULE_CHECK_TOOL]
     if gh_client:
         tools.extend(GITHUB_TOOLS)
     if web_client:
@@ -1613,6 +1764,14 @@ async def _process_message(
             # Save after each tool round in case of crash
             save_state(chat_id)
 
+            # Register any monitors created during this tool round
+            if _pending_monitor_registrations:
+                job_queue = bot.application.job_queue if hasattr(bot, "application") else None
+                while _pending_monitor_registrations:
+                    monitor = _pending_monitor_registrations.pop(0)
+                    if job_queue:
+                        _register_monitor(job_queue, monitor, bot)
+
         stop_typing.set()
         await typing_task
         await send_long_message(chat_id, "(Reached tool call limit. Send another message to continue.)", bot)
@@ -1634,6 +1793,185 @@ async def _process_message(
         stop_typing.set()
         await typing_task
         await send_long_message(chat_id, "Something went wrong. Please try again.", bot)
+
+
+# ── Monitor execution ─────────────────────────────────────────────────
+
+
+def _register_monitor(job_queue, monitor: dict, bot=None) -> None:
+    """Register a monitor dict as a repeating JobQueue job."""
+    monitor_id = monitor["id"]
+    job_data = {**monitor, "bot": bot}
+    job_name = f"monitor_{monitor_id}"
+    interval = monitor["interval_minutes"] * 60
+
+    job = job_queue.run_repeating(
+        _run_monitor_job,
+        interval=interval,
+        first=10,  # first check 10s after creation
+        data=job_data,
+        name=job_name,
+    )
+    _monitor_jobs[monitor_id] = job
+    logger.info("Registered monitor #%d: every %dm — %s", monitor_id, monitor["interval_minutes"], monitor["summary"])
+
+
+def _unregister_monitor(monitor_id: int) -> None:
+    """Remove a monitor job from the job queue."""
+    job = _monitor_jobs.pop(monitor_id, None)
+    if job:
+        job.schedule_removal()
+
+
+async def _run_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Job callback for monitor checks."""
+    job_data: dict = context.job.data  # type: ignore[assignment]
+    monitor_id = job_data["id"]
+    chat_id = job_data["chat_id"]
+    check_prompt = job_data["check_prompt"]
+    notify_condition = job_data["notify_condition"]
+    summary = job_data["summary"]
+    expires_at = job_data["expires_at"]
+    last_result = job_data.get("last_result")
+
+    # Check expiry
+    if time.time() > expires_at:
+        _unregister_monitor(monitor_id)
+        disable_monitor(monitor_id)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"Monitor expired: {summary}")
+        except Exception:
+            pass
+        logger.info("Monitor #%d expired: %s", monitor_id, summary)
+        return
+
+    try:
+        # Run the check prompt through the tool loop to get current state
+        current_result = await _run_monitor_prompt(context.bot, chat_id, check_prompt)
+
+        if last_result is None:
+            # First run — capture baseline silently
+            job_data["last_result"] = current_result
+            update_monitor_result(monitor_id, current_result)
+            logger.info("Monitor #%d baseline captured", monitor_id)
+            return
+
+        # Compare old vs new
+        should_notify, alert_msg = await _compare_monitor_results(
+            last_result, current_result, notify_condition, summary
+        )
+
+        # Update stored result
+        job_data["last_result"] = current_result
+        update_monitor_result(monitor_id, current_result)
+
+        if should_notify and alert_msg:
+            await send_long_message(chat_id, f"🔔 {summary}\n\n{alert_msg}", context.bot)
+            audit_log("monitor_alert", chat_id=chat_id, detail=f"#{monitor_id}: {summary}")
+
+    except Exception as e:
+        logger.warning("Monitor #%d check failed: %s", monitor_id, e)
+
+
+async def _run_monitor_prompt(bot, chat_id: int, prompt: str) -> str:
+    """Run a monitor check prompt through the tool loop, returning the text result.
+
+    Similar to run_scheduled_prompt but returns text instead of sending it.
+    """
+    tools: list[dict[str, Any]] = []
+    if gh_client:
+        tools.extend(GITHUB_TOOLS)
+    if web_client:
+        tools.extend(WEB_TOOLS)
+    if tasks_client:
+        tools.extend(TASKS_TOOLS)
+    if calendar_client:
+        tools.extend(CALENDAR_TOOLS)
+    if contacts_client:
+        tools.extend(CONTACTS_TOOLS)
+    if train_client:
+        tools.extend(TRAIN_TOOLS)
+
+    try:
+        import zoneinfo
+
+        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
+    except Exception:
+        tz = datetime.UTC
+    now = datetime.datetime.now(tz)
+
+    system = (
+        f"Today is {now.strftime('%A, %B %d, %Y at %I:%M %p')} ({USER_TIMEZONE}).\n\n"
+        "You are running a background monitoring check. Gather the requested data using the "
+        "available tools and return a concise factual summary of the current state. "
+        "Do NOT address the user — just report the data."
+    )
+
+    repo = get_active_repo(chat_id)
+    if repo:
+        system += f"\n\nActive repository: {repo}"
+
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    loop = asyncio.get_running_loop()
+
+    for _ in range(5):  # fewer rounds than interactive — monitors should be quick
+        response = await _call_anthropic(
+            model="claude-haiku-4-5-20251001",  # use Haiku for cost efficiency
+            max_tokens=1024,
+            system=system,
+            messages=messages,
+            **({"tools": tools} if tools else {}),
+        )
+
+        if response.stop_reason != "tool_use":
+            text_parts = [b.text for b in response.content if b.type == "text"]
+            return "\n".join(text_parts) if text_parts else "(no data)"
+
+        messages.append({"role": "assistant", "content": response.content})
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                try:
+                    result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
+                except Exception as e:
+                    result = f"Tool error: {e}"
+                if len(result) > 10000:
+                    result = result[:10000] + "\n... (truncated)"
+                tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
+        messages.append({"role": "user", "content": tool_results})
+
+    return "(monitor check hit tool limit)"
+
+
+async def _compare_monitor_results(
+    previous: str, current: str, notify_condition: str, summary: str
+) -> tuple[bool, str | None]:
+    """Use Claude to compare two monitor snapshots and decide whether to notify.
+
+    Returns (should_notify, alert_message_or_none).
+    """
+    prompt = (
+        f"You are comparing two snapshots from a background monitor: '{summary}'.\n\n"
+        f"PREVIOUS STATE:\n{previous[:3000]}\n\n"
+        f"CURRENT STATE:\n{current[:3000]}\n\n"
+        f"NOTIFY CONDITION: {notify_condition}\n\n"
+        "Does the current state meet the notify condition (compared to the previous state)?\n"
+        "If YES: write a concise alert message for a phone notification (2-3 lines max).\n"
+        "If NO: respond with exactly the word NO_CHANGE and nothing else."
+    )
+
+    response = await _call_anthropic(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=256,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    text_parts = [b.text for b in response.content if b.type == "text"]
+    reply = "\n".join(text_parts).strip()
+
+    if reply == "NO_CHANGE" or reply.startswith("NO_CHANGE"):
+        return False, None
+    return True, reply
 
 
 async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
@@ -1897,6 +2235,56 @@ async def schedule_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(f"Unknown subcommand: {subcommand}\nUse: daily, every, list, remove")
 
 
+async def monitors_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/monitors command handler — list and manage active monitors."""
+    if not is_authorized(update.effective_user.id):
+        return
+
+    chat_id = update.effective_chat.id
+    args = context.args or []
+
+    if not args or args[0].lower() == "list":
+        monitors = load_monitors(chat_id)
+        if not monitors:
+            await update.message.reply_text("No active monitors. Ask me to watch something and I'll set one up.")
+            return
+        try:
+            import zoneinfo
+
+            tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
+        except Exception:
+            tz = datetime.UTC
+        lines = []
+        for m in monitors:
+            expires_dt = datetime.datetime.fromtimestamp(m["expires_at"], tz=tz)
+            expires_str = (
+                expires_dt.strftime("%H:%M")
+                if expires_dt.date() == datetime.datetime.now(tz).date()
+                else expires_dt.strftime("%b %d %H:%M")
+            )
+            lines.append(f"#{m['id']} — {m['summary']}\n  Every {m['interval_minutes']}m, expires {expires_str}")
+        await update.message.reply_text("\n\n".join(lines))
+        return
+
+    if args[0].lower() == "remove":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /monitors remove <id>")
+            return
+        try:
+            monitor_id = int(args[1].lstrip("#"))
+        except ValueError:
+            await update.message.reply_text("Invalid monitor ID.")
+            return
+        if delete_monitor(monitor_id, chat_id):
+            _unregister_monitor(monitor_id)
+            await update.message.reply_text(f"Monitor #{monitor_id} removed.")
+        else:
+            await update.message.reply_text(f"Monitor #{monitor_id} not found.")
+        return
+
+    await update.message.reply_text("Usage: /monitors [list] or /monitors remove <id>")
+
+
 async def _load_schedules_on_startup(app: Application) -> None:
     """Load all saved schedules from DB and register with job_queue."""
     if not app.job_queue:
@@ -1928,6 +2316,23 @@ async def _load_schedules_on_startup(app: Application) -> None:
 
     if schedules:
         logger.info("Loaded %d schedule(s) from database", len(schedules))
+
+    # Load active monitors
+    monitors = load_all_monitors()
+    now = time.time()
+    for m in monitors:
+        if m["expires_at"] <= now:
+            # Already expired — clean up
+            disable_monitor(m["id"])
+            continue
+        try:
+            _register_monitor(app.job_queue, m)
+        except Exception as e:
+            logger.warning("Failed to register monitor %d: %s", m["id"], e)
+
+    active_monitors = [m for m in monitors if m["expires_at"] > now]
+    if active_monitors:
+        logger.info("Loaded %d active monitor(s) from database", len(active_monitors))
 
 
 async def _init_mcp() -> None:
@@ -2005,6 +2410,7 @@ def main() -> None:
     app.add_handler(CommandHandler("todos", show_todos))
     app.add_handler(CommandHandler("briefing", trigger_briefing))
     app.add_handler(CommandHandler("schedule", schedule_command))
+    app.add_handler(CommandHandler("monitors", monitors_command))
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CallbackQueryHandler(_ask_user_callback, pattern=r"^ask_user:"))
