@@ -184,7 +184,12 @@ class ClaudeCodeManager:
         cmd.extend(
             [
                 "--append-system-prompt",
-                "Responding via Telegram. Keep responses concise for mobile reading.",
+                "You are responding to a user via Telegram chat, NOT a terminal. Important constraints:\n"
+                "- The user can only see your final text responses — not tool calls, file diffs, or intermediate output.\n"
+                "- Do NOT ask the user to run CLI commands or use terminal features.\n"
+                "- When presenting plans, include the full plan text in your response so the user can read it.\n"
+                "- Keep responses concise for mobile reading.\n"
+                "- If you need user input, ask a clear question in your response text.",
             ]
         )
 

@@ -473,6 +473,32 @@ async def show_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"Teleclaude Agent v{VERSION}\nModel: {get_model(update.effective_chat.id)}")
 
 
+async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /plan — enter plan mode for a task."""
+    if not update.message or not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    text = update.message.text or ""
+    # Strip "/plan" prefix
+    task = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+    if not task:
+        await update.message.reply_text("Usage: /plan <task description>")
+        return
+    prompt = (
+        "Think carefully and create a plan for this task. Present the full plan in your response so I can review it. "
+        "Do NOT start implementing until I approve.\n\n"
+        f"Task: {task}"
+    )
+    lock = _chat_locks[chat_id]
+    if lock.locked():
+        try:
+            await update.message.reply_text("Queued — finishing current request first.")
+        except TelegramError:
+            pass
+    async with lock:
+        await _run_cli(chat_id, prompt, update, context)
+
+
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not is_authorized(update.effective_user.id):
         return
@@ -692,6 +718,7 @@ def main() -> None:
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("version", show_version))
+    app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(
         MessageHandler(
