@@ -787,6 +787,11 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
     while sanitized and sanitized[0].get("role") != "user":
         sanitized.pop(0)
 
+    # Removing orphans can create new orphans (e.g. a tool_result whose tool_use
+    # was inside a dropped pair). Re-run until stable.
+    if len(sanitized) < len(history):
+        return _sanitize_history(sanitized)
+
     return sanitized
 
 
@@ -2050,9 +2055,11 @@ async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
 async def generate_briefing(bot, chat_id: int) -> None:
     """Generate and send a daily briefing using Claude with available tools."""
     briefing_prompt = (
-        "Give me a concise morning briefing. Check my calendar for today's events "
-        "and my task list for pending items. Format it as:\n"
-        "- A quick summary line (e.g. '3 events, 5 tasks')\n"
+        "Give me a concise morning briefing. Check my calendar for today's events, "
+        "my task list for pending items, and search the web for today's weather in Chichester, UK. "
+        "Format it as:\n"
+        "- A quick summary line (e.g. '3 events, 5 tasks, 12°C partly cloudy')\n"
+        "- Today's weather (temperature, conditions, rain chance)\n"
         "- Today's schedule in chronological order\n"
         "- Top pending tasks\n"
         "Keep it short and scannable for a phone screen."
@@ -2296,9 +2303,11 @@ async def _load_schedules_on_startup(app: Application) -> None:
         all_schedules = load_all_schedules()
         if not all_schedules:
             briefing_prompt = (
-                "Give me a concise morning briefing. Check my calendar for today's events "
-                "and my task list for pending items. Format it as:\n"
-                "- A quick summary line (e.g. '3 events, 5 tasks')\n"
+                "Give me a concise morning briefing. Check my calendar for today's events, "
+                "my task list for pending items, and search the web for today's weather in Chichester, UK. "
+                "Format it as:\n"
+                "- A quick summary line (e.g. '3 events, 5 tasks, 12°C partly cloudy')\n"
+                "- Today's weather (temperature, conditions, rain chance)\n"
                 "- Today's schedule in chronological order\n"
                 "- Top pending tasks\n"
                 "Keep it short and scannable for a phone screen."
