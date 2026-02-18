@@ -1646,9 +1646,10 @@ async def _process_message(
         upcoming.append(d.strftime("%A %b %d"))
     upcoming_str = ", ".join(upcoming)
     system = (
-        f"Today is {date_str} ({USER_TIMEZONE}). "
+        f"TODAY IS {date_str} ({USER_TIMEZONE}). "
         f"Coming days: {upcoming_str}. "
-        "These dates are authoritative — use them for all scheduling references.\n\n"
+        "These dates are AUTHORITATIVE — use them for ALL date references. "
+        "Ignore any conflicting dates from earlier messages in the conversation history.\n\n"
         + SYSTEM_PROMPT
         + f"\n\nModel: {get_model(chat_id)}"
     )
