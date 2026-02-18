@@ -22,7 +22,7 @@ class TestGoogleCalendarClient:
             client = GoogleCalendarClient("cid", "csec", "rtok")
             return client, mock_service
 
-    def test_list_events(self):
+    def test_list_events_single_calendar(self):
         client, svc = self._make_client()
         svc.events().list().execute.return_value = {
             "items": [
@@ -36,15 +36,38 @@ class TestGoogleCalendarClient:
                 }
             ]
         }
-        events = client.list_events(days_ahead=7)
+        events = client.list_events(days_ahead=7, calendar_id="primary")
         assert len(events) == 1
         assert events[0]["summary"] == "Meeting"
         assert events[0]["location"] == "Office"
 
+    def test_list_events_all_calendars(self):
+        client, svc = self._make_client()
+        svc.calendarList().list().execute.return_value = {
+            "items": [
+                {"id": "primary", "summary": "My Calendar", "primary": True},
+                {"id": "work@group.calendar.google.com", "summary": "Work", "primary": False},
+            ]
+        }
+        svc.events().list().execute.return_value = {
+            "summary": "Work",
+            "items": [
+                {
+                    "id": "e1",
+                    "summary": "Meeting",
+                    "start": {"dateTime": "2026-02-14T10:00:00Z"},
+                    "end": {"dateTime": "2026-02-14T11:00:00Z"},
+                }
+            ],
+        }
+        events = client.list_events(days_ahead=7)
+        # Should have events from both calendars (mocked to return same data)
+        assert len(events) == 2
+
     def test_list_events_empty(self):
         client, svc = self._make_client()
         svc.events().list().execute.return_value = {"items": []}
-        events = client.list_events()
+        events = client.list_events(days_ahead=7, calendar_id="primary")
         assert events == []
 
     def test_create_event(self):
@@ -96,7 +119,7 @@ class TestExecuteTool:
         result = execute_tool(client, "list_calendar_events", {"days_ahead": 3})
         parsed = json.loads(result)
         assert len(parsed) == 1
-        client.list_events.assert_called_once_with(3, 250, "primary")
+        client.list_events.assert_called_once_with(3, 250, "all")
 
     def test_create_calendar_event(self):
         from calendar_tools import execute_tool

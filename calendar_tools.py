@@ -26,12 +26,8 @@ class GoogleCalendarClient:
         creds.refresh(Request())
         self.service = build("calendar", "v3", credentials=creds)
 
-    def list_events(self, days_ahead: int = 7, max_results: int = 250, calendar_id: str = "primary") -> list[dict]:
-        """List upcoming events."""
-        now = datetime.now(tz=UTC)
-        time_min = now.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-        time_max = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-
+    def _query_events(self, calendar_id: str, time_min: str, time_max: str, max_results: int) -> list[dict]:
+        """Query events from a single calendar."""
         results = (
             self.service.events()
             .list(
@@ -44,21 +40,44 @@ class GoogleCalendarClient:
             )
             .execute()
         )
+        cal_name = results.get("summary", calendar_id)
         events = []
         for e in results.get("items", []):
             start = e["start"].get("dateTime", e["start"].get("date", ""))
             end = e["end"].get("dateTime", e["end"].get("date", ""))
-            events.append(
-                {
-                    "id": e["id"],
-                    "summary": e.get("summary", "(no title)"),
-                    "start": start,
-                    "end": end,
-                    "location": e.get("location", ""),
-                    "description": e.get("description", ""),
-                }
-            )
+            event: dict[str, Any] = {
+                "id": e["id"],
+                "summary": e.get("summary", "(no title)"),
+                "start": start,
+                "end": end,
+                "location": e.get("location", ""),
+                "description": e.get("description", ""),
+            }
+            if calendar_id != "primary":
+                event["calendar"] = cal_name
+            events.append(event)
         return events
+
+    def list_events(self, days_ahead: int = 7, max_results: int = 250, calendar_id: str = "all") -> list[dict]:
+        """List upcoming events. Use calendar_id='all' to query all visible calendars."""
+        now = datetime.now(tz=UTC)
+        time_min = now.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+        time_max = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+
+        if calendar_id != "all":
+            return self._query_events(calendar_id, time_min, time_max, max_results)
+
+        # Query all visible calendars and merge
+        calendars = self.list_calendars()
+        all_events: list[dict] = []
+        for cal in calendars:
+            try:
+                all_events.extend(self._query_events(cal["id"], time_min, time_max, max_results))
+            except Exception as e:
+                logger.warning("Failed to query calendar %s: %s", cal.get("summary", cal["id"]), e)
+        # Sort by start time
+        all_events.sort(key=lambda ev: ev.get("start", ""))
+        return all_events
 
     def create_event(
         self,
@@ -129,7 +148,7 @@ class GoogleCalendarClient:
 CALENDAR_TOOLS = [
     {
         "name": "list_calendar_events",
-        "description": "List upcoming events from Google Calendar.",
+        "description": "List upcoming events from Google Calendar. By default queries all visible calendars.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -139,7 +158,11 @@ CALENDAR_TOOLS = [
                     "default": 7,
                 },
                 "max_results": {"type": "integer", "description": "Max events to return (default 250)", "default": 250},
-                "calendar_id": {"type": "string", "default": "primary"},
+                "calendar_id": {
+                    "type": "string",
+                    "description": "Calendar ID, or 'all' to query all visible calendars (default)",
+                    "default": "all",
+                },
             },
             "required": [],
         },
@@ -206,7 +229,7 @@ def execute_tool(client: GoogleCalendarClient, tool_name: str, tool_input: dict)
             result = client.list_events(
                 tool_input.get("days_ahead", 7),
                 tool_input.get("max_results", 250),
-                tool_input.get("calendar_id", "primary"),
+                tool_input.get("calendar_id", "all"),
             )
         elif tool_name == "create_calendar_event":
             result = client.create_event(
