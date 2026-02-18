@@ -207,7 +207,7 @@ tests/              # pytest test suite
 - `ANTHROPIC_API_KEY` (required)
 - `GITHUB_TOKEN` (optional — enables GitHub tools)
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (optional — enables Tasks/Calendar/Gmail/Contacts)
-- `CLAUDE_MODEL` (default: claude-sonnet-4-5-20250929)
+- `CLAUDE_MODEL` (default: claude-sonnet-4-6)
 - `ALLOWED_USER_IDS` (comma-separated Telegram user IDs; empty = allow all)
 - `TIMEZONE` (default: UTC)
 - `DAILY_BRIEFING_TIME` (e.g., "08:00")
