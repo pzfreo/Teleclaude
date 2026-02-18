@@ -26,7 +26,7 @@ class GoogleCalendarClient:
         creds.refresh(Request())
         self.service = build("calendar", "v3", credentials=creds)
 
-    def list_events(self, days_ahead: int = 7, max_results: int = 20, calendar_id: str = "primary") -> list[dict]:
+    def list_events(self, days_ahead: int = 7, max_results: int = 250, calendar_id: str = "primary") -> list[dict]:
         """List upcoming events."""
         now = datetime.now(tz=UTC)
         time_min = now.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
@@ -138,7 +138,7 @@ CALENDAR_TOOLS = [
                     "description": "How many days ahead to look (default 7)",
                     "default": 7,
                 },
-                "max_results": {"type": "integer", "default": 20},
+                "max_results": {"type": "integer", "description": "Max events to return (default 250)", "default": 250},
                 "calendar_id": {"type": "string", "default": "primary"},
             },
             "required": [],
@@ -205,7 +205,7 @@ def execute_tool(client: GoogleCalendarClient, tool_name: str, tool_input: dict)
         if tool_name == "list_calendar_events":
             result = client.list_events(
                 tool_input.get("days_ahead", 7),
-                tool_input.get("max_results", 20),
+                tool_input.get("max_results", 250),
                 tool_input.get("calendar_id", "primary"),
             )
         elif tool_name == "create_calendar_event":

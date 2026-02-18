@@ -96,7 +96,7 @@ class TestExecuteTool:
         result = execute_tool(client, "list_calendar_events", {"days_ahead": 3})
         parsed = json.loads(result)
         assert len(parsed) == 1
-        client.list_events.assert_called_once_with(3, 20, "primary")
+        client.list_events.assert_called_once_with(3, 250, "primary")
 
     def test_create_calendar_event(self):
         from calendar_tools import execute_tool
