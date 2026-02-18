@@ -12,11 +12,15 @@ from googleapiclient.discovery import build
 
 logger = logging.getLogger(__name__)
 
-_URL_RE = re.compile(r"https?://\S+")
+_URL_RE = re.compile(
+    r"https?://\S+"  # full URLs
+    r"|(?:[\w-]+\.)+(?:ly|co|gl|us|com|io|me|link)/\S*",  # bare domain links (bit.ly/x, zoom.us/x, etc.)
+    re.IGNORECASE,
+)
 
 
 def _strip_urls(text: str) -> str:
-    """Remove URLs from text to avoid Telegram link previews."""
+    """Remove URLs and common bare short-links to avoid Telegram link previews."""
     return _URL_RE.sub("", text).strip()
 
 
@@ -53,16 +57,13 @@ class GoogleCalendarClient:
         for e in results.get("items", []):
             start = e["start"].get("dateTime", e["start"].get("date", ""))
             end = e["end"].get("dateTime", e["end"].get("date", ""))
-            # Strip URLs from location/description to avoid Telegram link previews
-            location = e.get("location", "")
-            description = e.get("description", "")
-            if location:
-                location = _strip_urls(location)
-            if description:
-                description = _strip_urls(description)
+            # Strip URLs from all text fields to avoid Telegram link previews
+            summary = _strip_urls(e.get("summary", "(no title)")) or "(no title)"
+            location = _strip_urls(e.get("location", ""))
+            description = _strip_urls(e.get("description", ""))
             event: dict[str, Any] = {
                 "id": e["id"],
-                "summary": e.get("summary", "(no title)"),
+                "summary": summary,
                 "start": start,
                 "end": end,
                 "location": location,
