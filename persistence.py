@@ -72,6 +72,25 @@ def init_db() -> None:
             created_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_monitors_chat_id ON monitors(chat_id);
+        CREATE TABLE IF NOT EXISTS pulse_config (
+            chat_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            interval_minutes INTEGER NOT NULL DEFAULT 60,
+            quiet_start TEXT,
+            quiet_end TEXT,
+            last_pulse_at REAL,
+            last_pulse_summary TEXT,
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS pulse_goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            goal TEXT NOT NULL,
+            priority TEXT NOT NULL DEFAULT 'normal',
+            created_at REAL NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_pulse_goals_chat_id ON pulse_goals(chat_id);
         """)
     # Migrations for existing databases
     _migrate(conn)
@@ -432,6 +451,120 @@ def _monitor_row_to_dict(r) -> dict:
         "enabled": r[8],
         "created_at": r[9],
     }
+
+
+# ── Pulse ─────────────────────────────────────────────────────────────
+
+
+def load_pulse_config(chat_id: int) -> dict | None:
+    """Load pulse config for a chat. Returns None if not configured."""
+    conn = _connect()
+    row = conn.execute(
+        "SELECT chat_id, enabled, interval_minutes, quiet_start, quiet_end, "
+        "last_pulse_at, last_pulse_summary, created_at FROM pulse_config WHERE chat_id = ?",
+        (chat_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "chat_id": row[0],
+        "enabled": bool(row[1]),
+        "interval_minutes": row[2],
+        "quiet_start": row[3],
+        "quiet_end": row[4],
+        "last_pulse_at": row[5],
+        "last_pulse_summary": row[6],
+        "created_at": row[7],
+    }
+
+
+def save_pulse_config(
+    chat_id: int, enabled: bool, interval_minutes: int, quiet_start: str | None, quiet_end: str | None
+) -> None:
+    """Create or update pulse config for a chat."""
+    conn = _connect()
+    conn.execute(
+        "INSERT INTO pulse_config (chat_id, enabled, interval_minutes, quiet_start, quiet_end, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET enabled=excluded.enabled, interval_minutes=excluded.interval_minutes, "
+        "quiet_start=excluded.quiet_start, quiet_end=excluded.quiet_end",
+        (chat_id, int(enabled), interval_minutes, quiet_start, quiet_end, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_pulse_last_run(chat_id: int, summary: str) -> None:
+    """Update last pulse run time and summary."""
+    conn = _connect()
+    conn.execute(
+        "UPDATE pulse_config SET last_pulse_at = ?, last_pulse_summary = ? WHERE chat_id = ?",
+        (time.time(), summary, chat_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_pulse_goals(chat_id: int) -> list[dict]:
+    """Load all enabled pulse goals for a chat."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, chat_id, goal, priority, created_at, enabled "
+        "FROM pulse_goals WHERE chat_id = ? AND enabled = 1 ORDER BY id",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "chat_id": r[1], "goal": r[2], "priority": r[3], "created_at": r[4], "enabled": bool(r[5])}
+        for r in rows
+    ]
+
+
+def save_pulse_goal(chat_id: int, goal: str, priority: str = "normal") -> int:
+    """Create a new pulse goal. Returns the goal ID."""
+    conn = _connect()
+    cursor = conn.execute(
+        "INSERT INTO pulse_goals (chat_id, goal, priority, created_at) VALUES (?, ?, ?, ?)",
+        (chat_id, goal, priority, time.time()),
+    )
+    goal_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return goal_id  # type: ignore[return-value]
+
+
+def delete_pulse_goal(goal_id: int, chat_id: int) -> bool:
+    """Delete a pulse goal by ID, scoped to a chat. Returns True if deleted."""
+    conn = _connect()
+    cursor = conn.execute("DELETE FROM pulse_goals WHERE id = ? AND chat_id = ?", (goal_id, chat_id))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def load_all_pulse_configs() -> list[dict]:
+    """Load all enabled pulse configs across all chats."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT chat_id, enabled, interval_minutes, quiet_start, quiet_end, "
+        "last_pulse_at, last_pulse_summary, created_at FROM pulse_config WHERE enabled = 1"
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "chat_id": r[0],
+            "enabled": bool(r[1]),
+            "interval_minutes": r[2],
+            "quiet_start": r[3],
+            "quiet_end": r[4],
+            "last_pulse_at": r[5],
+            "last_pulse_summary": r[6],
+            "created_at": r[7],
+        }
+        for r in rows
+    ]
 
 
 def _serialize(obj):

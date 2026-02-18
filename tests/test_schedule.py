@@ -429,6 +429,7 @@ class TestLoadSchedulesOnStartup:
             patch("bot.load_all_schedules", return_value=mock_schedules),
             patch("bot._register_schedule") as mock_reg,
             patch("bot.load_all_monitors", return_value=[]),
+            patch("bot.load_all_pulse_configs", return_value=[]),
         ):
             await _load_schedules_on_startup(app)
 
@@ -462,6 +463,7 @@ class TestLoadSchedulesOnStartup:
             patch("bot.save_schedule", return_value=1) as mock_save,
             patch("bot._register_schedule"),
             patch("bot.load_all_monitors", return_value=[]),
+            patch("bot.load_all_pulse_configs", return_value=[]),
         ):
             await _load_schedules_on_startup(app)
 
@@ -502,6 +504,7 @@ class TestLoadSchedulesOnStartup:
             patch("bot.save_schedule") as mock_save,
             patch("bot._register_schedule"),
             patch("bot.load_all_monitors", return_value=[]),
+            patch("bot.load_all_pulse_configs", return_value=[]),
         ):
             await _load_schedules_on_startup(app)
 

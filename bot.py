@@ -35,17 +35,21 @@ from persistence import (
     clear_conversation,
     count_monitors,
     delete_monitor,
+    delete_pulse_goal,
     delete_schedule,
     disable_monitor,
     init_db,
     load_active_branch,
     load_active_repo,
     load_all_monitors,
+    load_all_pulse_configs,
     load_all_schedules,
     load_conversation,
     load_model,
     load_monitors,
     load_plan_mode,
+    load_pulse_config,
+    load_pulse_goals,
     load_schedules,
     load_todos,
     save_active_branch,
@@ -54,9 +58,12 @@ from persistence import (
     save_model,
     save_monitor,
     save_plan_mode,
+    save_pulse_config,
+    save_pulse_goal,
     save_schedule,
     save_todos,
     update_monitor_result,
+    update_pulse_last_run,
 )
 from shared import (
     RingBufferHandler,
@@ -309,6 +316,11 @@ Tool usage:
 - You can send emails via Gmail but NEVER send an email without explicitly confirming the recipient, subject, and body with the user first.
 - Use Google Contacts to search, view, or manage the user's contacts.
 - Use UK train times to check departures, arrivals, search stations, or get service details for National Rail.
+- You can configure the Pulse autonomous agent using manage_pulse. Pulse periodically reviews the user's context
+  (calendar, tasks, goals) and proactively sends updates when something needs attention. Most checks are silent.
+  When the user says things like "keep an eye on my PRs", "remind me about overdue tasks", or "watch for X",
+  use manage_pulse to add a goal. Use it to enable/disable Pulse, set intervals, and configure quiet hours.
+  The user can also use /pulse as a shortcut.
 - You can set up background monitors using schedule_check to watch for changes and alert the user.
   Use this when they want to be notified about future events (train delays, new issues, PR merges, etc.).
   Choose sensible intervals (trains: 5-10m, GitHub: 15-30m) and expiry times (until journey, end of day).
@@ -433,6 +445,69 @@ SCHEDULE_CHECK_TOOL = {
         "required": ["check_prompt", "notify_condition", "interval_minutes", "expires_at", "summary"],
     },
 }
+
+MANAGE_PULSE_TOOL = {
+    "name": "manage_pulse",
+    "description": (
+        "Configure the autonomous Pulse agent. Pulse periodically reviews your context (calendar, tasks, goals) "
+        "and proactively sends helpful updates when something needs attention. Most pulses are silent — "
+        "it only messages you when there's something worth knowing. "
+        "Use this when the user wants to: add/remove goals for Pulse to watch, enable/disable Pulse, "
+        "change check interval, set quiet hours, or check Pulse status."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "add_goal",
+                    "remove_goal",
+                    "list_goals",
+                    "enable",
+                    "disable",
+                    "set_interval",
+                    "set_quiet_hours",
+                    "status",
+                ],
+                "description": "The action to perform.",
+            },
+            "goal": {
+                "type": "string",
+                "description": "For add_goal: description of what Pulse should watch for.",
+            },
+            "priority": {
+                "type": "string",
+                "enum": ["high", "normal", "low"],
+                "description": "For add_goal: priority level. Default normal.",
+            },
+            "goal_id": {
+                "type": "integer",
+                "description": "For remove_goal: the goal ID to remove.",
+            },
+            "interval_minutes": {
+                "type": "integer",
+                "description": "For set_interval: how often to check, in minutes (15-240).",
+                "minimum": 15,
+                "maximum": 240,
+            },
+            "quiet_start": {
+                "type": "string",
+                "description": "For set_quiet_hours: start of quiet period, e.g. '22:00'.",
+            },
+            "quiet_end": {
+                "type": "string",
+                "description": "For set_quiet_hours: end of quiet period, e.g. '07:00'.",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+# Registered pulse jobs: chat_id -> Job
+_pulse_jobs: dict[int, Any] = {}
+# In-memory pulse config cache: chat_id -> dict
+_pulse_configs: dict[int, dict] = {}
 
 MAX_MONITORS_PER_CHAT = 5
 MAX_MONITOR_DURATION_HOURS = 24
@@ -897,6 +972,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model - Show or switch Claude model (opus/sonnet/haiku)\n"
         "/plan - Toggle plan mode (outline before executing)\n"
         "/todo - Show current task list (/todo clear to reset)\n"
+        "/pulse - Autonomous agent status and config\n"
         "/schedule - Manage recurring scheduled prompts\n"
         "/briefing - Get a daily summary of calendar + tasks\n"
         "/logs [min] - Download recent logs (default 5 min)\n"
@@ -1162,6 +1238,9 @@ def _execute_tool_call(block, repo, chat_id) -> str:
             return format_todo_list(todos)
         if block.name == "schedule_check":
             return _handle_schedule_check(block.input, chat_id)
+        if block.name == "manage_pulse":
+            audit_log("tool_call", chat_id=chat_id, detail=f"manage_pulse:{block.input.get('action', '')}")
+            return _handle_manage_pulse(block.input, chat_id)
         if block.name == "web_search" and execute_web_tool:
             audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: {block.input.get('query', '')[:100]}")
             return execute_web_tool(web_client, block.name, block.input)
@@ -1614,7 +1693,7 @@ async def _process_message(
     trim_history(chat_id)
 
     repo = get_active_repo(chat_id)
-    tools = [TODO_TOOL, ASK_USER_TOOL, SCHEDULE_CHECK_TOOL]
+    tools = [TODO_TOOL, ASK_USER_TOOL, SCHEDULE_CHECK_TOOL, MANAGE_PULSE_TOOL]
     if gh_client:
         tools.extend(GITHUB_TOOLS)
     if web_client:
@@ -1770,6 +1849,15 @@ async def _process_message(
             history.append({"role": "user", "content": tool_results})
             # Save after each tool round in case of crash
             save_state(chat_id)
+
+            # Register any pulse jobs requested during this tool round
+            if _pending_pulse_registrations or _pending_pulse_unregistrations:
+                job_queue = bot.application.job_queue if hasattr(bot, "application") else None
+                if job_queue:
+                    while _pending_pulse_unregistrations:
+                        _unregister_pulse(_pending_pulse_unregistrations.pop(0))
+                    while _pending_pulse_registrations:
+                        _register_pulse(job_queue, _pending_pulse_registrations.pop(0))
 
             # Register any monitors created during this tool round
             if _pending_monitor_registrations:
@@ -1979,6 +2067,616 @@ async def _compare_monitor_results(
     if reply == "NO_CHANGE" or reply.startswith("NO_CHANGE"):
         return False, None
     return True, reply
+
+
+# ── Pulse: autonomous agent ───────────────────────────────────────────
+
+
+def _handle_manage_pulse(tool_input: dict, chat_id: int) -> str:
+    """Handle the manage_pulse tool call."""
+    action = tool_input.get("action", "")
+
+    if action == "add_goal":
+        goal_text = tool_input.get("goal", "").strip()
+        if not goal_text:
+            return "Error: goal text is required."
+        priority = tool_input.get("priority", "normal")
+        # Ensure config exists
+        config = load_pulse_config(chat_id)
+        if not config:
+            save_pulse_config(chat_id, enabled=False, interval_minutes=60, quiet_start=None, quiet_end=None)
+        goal_id = save_pulse_goal(chat_id, goal_text, priority)
+        return f"Goal #{goal_id} added: {goal_text} (priority: {priority})"
+
+    if action == "remove_goal":
+        remove_id = tool_input.get("goal_id")
+        if remove_id is None:
+            return "Error: goal_id is required."
+        if delete_pulse_goal(int(remove_id), chat_id):
+            return f"Goal #{remove_id} removed."
+        return f"Goal #{remove_id} not found."
+
+    if action == "list_goals":
+        goals = load_pulse_goals(chat_id)
+        if not goals:
+            return "No pulse goals configured. Add some with add_goal."
+        lines = []
+        for g in goals:
+            lines.append(f"#{g['id']} [{g['priority']}] {g['goal']}")
+        return "\n".join(lines)
+
+    if action == "enable":
+        config = load_pulse_config(chat_id)
+        if not config:
+            save_pulse_config(chat_id, enabled=True, interval_minutes=60, quiet_start=None, quiet_end=None)
+        else:
+            save_pulse_config(
+                chat_id,
+                enabled=True,
+                interval_minutes=config["interval_minutes"],
+                quiet_start=config["quiet_start"],
+                quiet_end=config["quiet_end"],
+            )
+        _pulse_configs.pop(chat_id, None)  # invalidate cache
+        _pending_pulse_registrations.append(chat_id)
+        goals = load_pulse_goals(chat_id)
+        if not goals:
+            return "Pulse enabled, but no goals configured yet. Add goals so Pulse knows what to watch."
+        return "Pulse enabled. It will start checking on the next interval."
+
+    if action == "disable":
+        config = load_pulse_config(chat_id)
+        if config:
+            save_pulse_config(
+                chat_id,
+                enabled=False,
+                interval_minutes=config["interval_minutes"],
+                quiet_start=config["quiet_start"],
+                quiet_end=config["quiet_end"],
+            )
+        _pulse_configs.pop(chat_id, None)
+        _pending_pulse_unregistrations.append(chat_id)
+        return "Pulse disabled."
+
+    if action == "set_interval":
+        minutes = tool_input.get("interval_minutes", 60)
+        minutes = max(15, min(240, int(minutes)))
+        config = load_pulse_config(chat_id)
+        if not config:
+            save_pulse_config(chat_id, enabled=False, interval_minutes=minutes, quiet_start=None, quiet_end=None)
+        else:
+            save_pulse_config(
+                chat_id,
+                enabled=config["enabled"],
+                interval_minutes=minutes,
+                quiet_start=config["quiet_start"],
+                quiet_end=config["quiet_end"],
+            )
+        _pulse_configs.pop(chat_id, None)
+        if config and config["enabled"]:
+            _pending_pulse_registrations.append(chat_id)
+        return f"Pulse interval set to {minutes} minutes."
+
+    if action == "set_quiet_hours":
+        quiet_start = tool_input.get("quiet_start")
+        quiet_end = tool_input.get("quiet_end")
+        if not quiet_start or not quiet_end:
+            return "Error: both quiet_start and quiet_end are required (e.g. '22:00' and '07:00')."
+        config = load_pulse_config(chat_id)
+        if not config:
+            save_pulse_config(chat_id, enabled=False, interval_minutes=60, quiet_start=quiet_start, quiet_end=quiet_end)
+        else:
+            save_pulse_config(
+                chat_id,
+                enabled=config["enabled"],
+                interval_minutes=config["interval_minutes"],
+                quiet_start=quiet_start,
+                quiet_end=quiet_end,
+            )
+        _pulse_configs.pop(chat_id, None)
+        return f"Quiet hours set: {quiet_start} - {quiet_end}."
+
+    if action == "status":
+        config = load_pulse_config(chat_id)
+        if not config:
+            return "Pulse is not configured. Enable it and add goals to get started."
+        goals = load_pulse_goals(chat_id)
+        lines = [
+            f"Enabled: {'yes' if config['enabled'] else 'no'}",
+            f"Interval: every {config['interval_minutes']}m",
+        ]
+        if config["quiet_start"] and config["quiet_end"]:
+            lines.append(f"Quiet hours: {config['quiet_start']} - {config['quiet_end']}")
+        if config["last_pulse_at"]:
+            try:
+                import zoneinfo
+
+                tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
+            except Exception:
+                tz = datetime.UTC
+            last_dt = datetime.datetime.fromtimestamp(config["last_pulse_at"], tz=tz)
+            lines.append(f"Last pulse: {last_dt.strftime('%H:%M %b %d')}")
+        lines.append(f"Goals: {len(goals)}")
+        for g in goals:
+            lines.append(f"  #{g['id']} [{g['priority']}] {g['goal']}")
+        return "\n".join(lines)
+
+    return f"Unknown action: {action}"
+
+
+# Pending pulse registrations/unregistrations from sync tool call → picked up by async _process_message
+_pending_pulse_registrations: list[int] = []
+_pending_pulse_unregistrations: list[int] = []
+
+
+def _is_quiet_hours(quiet_start: str | None, quiet_end: str | None, tz: datetime.tzinfo) -> bool:
+    """Check if current time is within quiet hours."""
+    if not quiet_start or not quiet_end:
+        return False
+    now = datetime.datetime.now(tz)
+    try:
+        start_h, start_m = (int(x) for x in quiet_start.split(":"))
+        end_h, end_m = (int(x) for x in quiet_end.split(":"))
+    except (ValueError, AttributeError):
+        return False
+    current_minutes = now.hour * 60 + now.minute
+    start_minutes = start_h * 60 + start_m
+    end_minutes = end_h * 60 + end_m
+
+    if start_minutes <= end_minutes:
+        # Same day: e.g. 09:00 - 17:00
+        return start_minutes <= current_minutes < end_minutes
+    else:
+        # Overnight: e.g. 22:00 - 07:00
+        return current_minutes >= start_minutes or current_minutes < end_minutes
+
+
+async def _build_triage_context(chat_id: int) -> str:
+    """Build a compact context snapshot for pulse triage (~500 tokens)."""
+    parts = []
+    loop = asyncio.get_running_loop()
+
+    try:
+        import zoneinfo
+
+        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
+    except Exception:
+        tz = datetime.UTC
+    now = datetime.datetime.now(tz)
+    parts.append(f"Time: {now.strftime('%A %H:%M %Z')}")
+
+    # Goals
+    goals = load_pulse_goals(chat_id)
+    if goals:
+        goal_lines = [f"- [{g['priority']}] {g['goal']}" for g in goals]
+        parts.append("Goals:\n" + "\n".join(goal_lines))
+
+    # Calendar (next 4 hours)
+    if calendar_client and execute_calendar_tool:
+        try:
+            time_min = now.isoformat()
+            time_max = (now + datetime.timedelta(hours=4)).isoformat()
+            result = await loop.run_in_executor(
+                None,
+                execute_calendar_tool,
+                calendar_client,
+                "list_events",
+                {"time_min": time_min, "time_max": time_max, "max_results": 5},
+            )
+            parts.append(f"Calendar (next 4h): {result[:500]}")
+        except Exception as e:
+            logger.debug("Pulse triage calendar fetch failed: %s", e)
+
+    # Tasks
+    if tasks_client and execute_tasks_tool:
+        try:
+            result = await loop.run_in_executor(
+                None, execute_tasks_tool, tasks_client, "list_tasks", {"max_results": 10}
+            )
+            parts.append(f"Tasks: {result[:500]}")
+        except Exception as e:
+            logger.debug("Pulse triage tasks fetch failed: %s", e)
+
+    # Todos
+    todos = get_todos(chat_id)
+    if todos:
+        pending = [t for t in todos if t.get("status") != "completed"]
+        if pending:
+            parts.append(f"Todos: {format_todo_list(pending)}")
+
+    # Last pulse summary
+    config = load_pulse_config(chat_id)
+    if config and config.get("last_pulse_summary"):
+        parts.append(f"Last pulse said: {config['last_pulse_summary'][:300]}")
+
+    return "\n\n".join(parts)
+
+
+async def _run_pulse_triage(chat_id: int) -> dict:
+    """Run triage with Haiku. Returns {"act": bool, "reason": str}."""
+    context_text = await _build_triage_context(chat_id)
+
+    triage_prompt = (
+        "You are a triage agent for a personal assistant. Review this context snapshot and decide "
+        "if there's anything worth proactively telling the user about RIGHT NOW.\n\n"
+        "Consider:\n"
+        "- Upcoming events they should prepare for\n"
+        "- Overdue or urgent tasks\n"
+        "- Things matching their stated goals\n"
+        "- Time-sensitive information\n\n"
+        "Be conservative — silence is better than noise. Only recommend action if there's genuine value.\n"
+        "If the last pulse already covered this information, don't repeat it.\n\n"
+        f"CONTEXT:\n{context_text}\n\n"
+        'Respond with ONLY valid JSON: {"act": true/false, "reason": "brief reason or empty"}'
+    )
+
+    try:
+        response = await _call_anthropic(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            messages=[{"role": "user", "content": triage_prompt}],
+        )
+        text = "".join(b.text for b in response.content if b.type == "text").strip()
+        # Parse JSON from response (handle markdown code blocks)
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        result = json.loads(text)
+        return {"act": bool(result.get("act", False)), "reason": result.get("reason", "")}
+    except (json.JSONDecodeError, KeyError, TypeError) as e:
+        logger.warning("Pulse triage JSON parse failed: %s — raw: %s", e, text[:200] if "text" in dir() else "n/a")
+        return {"act": False, "reason": ""}
+    except Exception as e:
+        logger.warning("Pulse triage failed: %s", e)
+        return {"act": False, "reason": ""}
+
+
+async def _run_pulse_action(bot, chat_id: int, triage_result: dict) -> None:
+    """Run the action phase with Sonnet + full tools. Sends result to user."""
+    goals = load_pulse_goals(chat_id)
+    config = load_pulse_config(chat_id)
+    goal_text = "\n".join(f"- [{g['priority']}] {g['goal']}" for g in goals) if goals else "(no specific goals)"
+    last_summary = config.get("last_pulse_summary", "") if config else ""
+
+    try:
+        import zoneinfo
+
+        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
+    except Exception:
+        tz = datetime.UTC
+    now = datetime.datetime.now(tz)
+
+    action_prompt = (
+        f"You are Teleclaude's Pulse agent running a proactive check at {now.strftime('%H:%M %Z')}.\n\n"
+        f"TRIAGE REASON: {triage_result.get('reason', 'General check')}\n\n"
+        f"USER'S GOALS:\n{goal_text}\n\n"
+        + (f"LAST PULSE SAID: {last_summary[:500]}\n\n" if last_summary else "")
+        + "Use the available tools to gather current information relevant to the triage reason and goals. "
+        "Then compose a concise, helpful update for the user's phone screen.\n\n"
+        "Guidelines:\n"
+        "- Be brief — 2-5 lines max unless there's a lot to report.\n"
+        "- Don't repeat info from the last pulse unless it has changed.\n"
+        "- Actionable > informational.\n"
+        "- End with a one-line summary of what you checked (this will be stored as context for next pulse)."
+    )
+
+    # Build tools
+    tools: list[dict[str, Any]] = []
+    if gh_client:
+        tools.extend(GITHUB_TOOLS)
+    if web_client:
+        tools.extend(WEB_TOOLS)
+    if tasks_client:
+        tools.extend(TASKS_TOOLS)
+    if calendar_client:
+        tools.extend(CALENDAR_TOOLS)
+    if email_client:
+        tools.extend(EMAIL_TOOLS)
+    if contacts_client:
+        tools.extend(CONTACTS_TOOLS)
+    if train_client:
+        tools.extend(TRAIN_TOOLS)
+
+    system = (
+        f"Today is {now.strftime('%A, %B %d, %Y at %I:%M %p')} ({USER_TIMEZONE}).\n\n"
+        "You are running as Teleclaude's Pulse agent — a proactive background check. "
+        "Keep responses concise and useful for a phone screen."
+    )
+
+    repo = get_active_repo(chat_id)
+    if repo:
+        system += f"\n\nActive repository: {repo}"
+
+    messages: list[dict[str, Any]] = [{"role": "user", "content": action_prompt}]
+    loop = asyncio.get_running_loop()
+
+    for _ in range(8):
+        response = await _call_anthropic(
+            model=DEFAULT_MODEL,
+            max_tokens=2048,
+            system=system,
+            messages=messages,
+            **({"tools": tools} if tools else {}),
+        )
+
+        if response.stop_reason != "tool_use":
+            text_parts = [b.text for b in response.content if b.type == "text"]
+            reply = "\n".join(text_parts) if text_parts else "(Pulse check completed with no output.)"
+            await send_long_message(chat_id, f"Pulse\n\n{reply}", bot)
+            # Store summary (last line or truncated reply)
+            summary = reply.split("\n")[-1][:300] if reply else ""
+            update_pulse_last_run(chat_id, summary)
+            _pulse_configs.pop(chat_id, None)  # invalidate cache
+            audit_log("pulse_action", chat_id=chat_id, detail=summary[:100])
+            return
+
+        messages.append({"role": "assistant", "content": response.content})
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                try:
+                    result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
+                except Exception as e:
+                    result = f"Tool error: {e}"
+                if len(result) > 10000:
+                    result = result[:10000] + "\n... (truncated)"
+                tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
+        messages.append({"role": "user", "content": tool_results})
+
+    await send_long_message(chat_id, "Pulse check hit tool limit.", bot)
+
+
+async def _run_pulse(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback for pulse checks."""
+    job_data: dict = context.job.data  # type: ignore[assignment]
+    chat_id = job_data["chat_id"]
+
+    # Reload config in case it changed
+    config = load_pulse_config(chat_id)
+    if not config or not config["enabled"]:
+        return
+
+    try:
+        import zoneinfo
+
+        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
+    except Exception:
+        tz = datetime.UTC
+
+    # Check quiet hours
+    if _is_quiet_hours(config.get("quiet_start"), config.get("quiet_end"), tz):
+        logger.debug("Pulse for chat %d skipped — quiet hours", chat_id)
+        return
+
+    # Check goals exist
+    goals = load_pulse_goals(chat_id)
+    if not goals:
+        logger.debug("Pulse for chat %d skipped — no goals", chat_id)
+        return
+
+    logger.info("Pulse triage starting for chat %d", chat_id)
+
+    # Phase 1: Triage (cheap)
+    triage = await _run_pulse_triage(chat_id)
+    if not triage.get("act"):
+        logger.info("Pulse triage for chat %d: no action needed", chat_id)
+        return
+
+    # Phase 2: Action (full tools)
+    logger.info("Pulse action for chat %d: %s", chat_id, triage.get("reason", "")[:80])
+    try:
+        await _run_pulse_action(context.bot, chat_id, triage)
+    except Exception as e:
+        logger.warning("Pulse action failed for chat %d: %s", chat_id, e)
+
+
+def _register_pulse(job_queue, chat_id: int) -> None:
+    """Register a pulse job for a chat."""
+    # Unregister existing first
+    _unregister_pulse(chat_id)
+
+    config = load_pulse_config(chat_id)
+    if not config or not config["enabled"]:
+        return
+
+    interval = config["interval_minutes"] * 60
+    job_data = {"chat_id": chat_id}
+    job_name = f"pulse_{chat_id}"
+
+    job = job_queue.run_repeating(
+        _run_pulse,
+        interval=interval,
+        first=30,  # first check 30s after registration
+        data=job_data,
+        name=job_name,
+    )
+    _pulse_jobs[chat_id] = job
+    logger.info("Registered pulse for chat %d: every %dm", chat_id, config["interval_minutes"])
+
+
+def _unregister_pulse(chat_id: int) -> None:
+    """Remove a pulse job from the job queue."""
+    job = _pulse_jobs.pop(chat_id, None)
+    if job:
+        job.schedule_removal()
+
+
+async def pulse_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/pulse command handler."""
+    if not is_authorized(update.effective_user.id):
+        return
+
+    chat_id = update.effective_chat.id
+    args = context.args or []
+
+    if not args:
+        # Show status
+        config = load_pulse_config(chat_id)
+        goals = load_pulse_goals(chat_id)
+        if not config:
+            await update.message.reply_text(
+                "Pulse is not configured yet.\n\n"
+                "Pulse is an autonomous agent that periodically checks your context "
+                "(calendar, tasks, goals) and sends updates when something needs attention.\n\n"
+                "Get started:\n"
+                "/pulse on — enable Pulse\n"
+                "Then tell me what to watch for, e.g.:\n"
+                '"Keep an eye on my PRs"\n'
+                '"Remind me about overdue tasks"\n'
+                '"Watch for calendar conflicts"'
+            )
+            return
+
+        lines = [f"Pulse: {'ON' if config['enabled'] else 'OFF'}"]
+        lines.append(f"Interval: every {config['interval_minutes']}m")
+        if config["quiet_start"] and config["quiet_end"]:
+            lines.append(f"Quiet hours: {config['quiet_start']} - {config['quiet_end']}")
+        if config.get("last_pulse_at"):
+            try:
+                import zoneinfo
+
+                tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
+            except Exception:
+                tz = datetime.UTC
+            last_dt = datetime.datetime.fromtimestamp(config["last_pulse_at"], tz=tz)
+            lines.append(f"Last active pulse: {last_dt.strftime('%H:%M %b %d')}")
+
+        if goals:
+            lines.append(f"\nGoals ({len(goals)}):")
+            for g in goals:
+                lines.append(f"  #{g['id']} [{g['priority']}] {g['goal']}")
+        else:
+            lines.append("\nNo goals. Tell me what to watch for.")
+
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    subcmd = args[0].lower()
+
+    if subcmd in ("on", "enable"):
+        config = load_pulse_config(chat_id)
+        if not config:
+            save_pulse_config(chat_id, enabled=True, interval_minutes=60, quiet_start=None, quiet_end=None)
+        else:
+            save_pulse_config(
+                chat_id,
+                enabled=True,
+                interval_minutes=config["interval_minutes"],
+                quiet_start=config["quiet_start"],
+                quiet_end=config["quiet_end"],
+            )
+        _pulse_configs.pop(chat_id, None)
+        if context.application.job_queue:
+            _register_pulse(context.application.job_queue, chat_id)
+        goals = load_pulse_goals(chat_id)
+        if goals:
+            await update.message.reply_text("Pulse enabled.")
+        else:
+            await update.message.reply_text("Pulse enabled. Now tell me what to watch for.")
+        return
+
+    if subcmd in ("off", "disable"):
+        config = load_pulse_config(chat_id)
+        if config:
+            save_pulse_config(
+                chat_id,
+                enabled=False,
+                interval_minutes=config["interval_minutes"],
+                quiet_start=config["quiet_start"],
+                quiet_end=config["quiet_end"],
+            )
+        _pulse_configs.pop(chat_id, None)
+        _unregister_pulse(chat_id)
+        await update.message.reply_text("Pulse disabled.")
+        return
+
+    if subcmd == "every":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /pulse every 30m or /pulse every 2h")
+            return
+        interval_str = args[1].lower()
+        match = re.match(r"^(\d+)(m|h)$", interval_str)
+        if not match:
+            await update.message.reply_text("Invalid interval. Use e.g. 30m or 2h.")
+            return
+        value = int(match.group(1))
+        unit = match.group(2)
+        minutes = value if unit == "m" else value * 60
+        minutes = max(15, min(240, minutes))
+        config = load_pulse_config(chat_id)
+        if not config:
+            save_pulse_config(chat_id, enabled=False, interval_minutes=minutes, quiet_start=None, quiet_end=None)
+        else:
+            save_pulse_config(
+                chat_id,
+                enabled=config["enabled"],
+                interval_minutes=minutes,
+                quiet_start=config["quiet_start"],
+                quiet_end=config["quiet_end"],
+            )
+        _pulse_configs.pop(chat_id, None)
+        if config and config["enabled"] and context.application.job_queue:
+            _register_pulse(context.application.job_queue, chat_id)
+        await update.message.reply_text(f"Pulse interval set to {minutes} minutes.")
+        return
+
+    if subcmd == "quiet":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /pulse quiet 22:00-07:00")
+            return
+        time_range = args[1]
+        parts = time_range.split("-")
+        if len(parts) != 2:
+            await update.message.reply_text("Usage: /pulse quiet 22:00-07:00")
+            return
+        quiet_start, quiet_end = parts[0].strip(), parts[1].strip()
+        config = load_pulse_config(chat_id)
+        if not config:
+            save_pulse_config(chat_id, enabled=False, interval_minutes=60, quiet_start=quiet_start, quiet_end=quiet_end)
+        else:
+            save_pulse_config(
+                chat_id,
+                enabled=config["enabled"],
+                interval_minutes=config["interval_minutes"],
+                quiet_start=quiet_start,
+                quiet_end=quiet_end,
+            )
+        _pulse_configs.pop(chat_id, None)
+        await update.message.reply_text(f"Quiet hours set: {quiet_start} - {quiet_end}")
+        return
+
+    if subcmd == "goals":
+        goals = load_pulse_goals(chat_id)
+        if not goals:
+            await update.message.reply_text("No goals. Tell me what to watch for.")
+        else:
+            lines = [f"#{g['id']} [{g['priority']}] {g['goal']}" for g in goals]
+            await update.message.reply_text("\n".join(lines))
+        return
+
+    if subcmd == "remove":
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /pulse remove <goal_id>")
+            return
+        try:
+            goal_id = int(args[1].lstrip("#"))
+        except ValueError:
+            await update.message.reply_text("Invalid goal ID.")
+            return
+        if delete_pulse_goal(goal_id, chat_id):
+            await update.message.reply_text(f"Goal #{goal_id} removed.")
+        else:
+            await update.message.reply_text(f"Goal #{goal_id} not found.")
+        return
+
+    await update.message.reply_text(
+        "Usage:\n"
+        "/pulse — show status\n"
+        "/pulse on/off — enable/disable\n"
+        "/pulse every 30m — set interval\n"
+        "/pulse quiet 22:00-07:00 — set quiet hours\n"
+        "/pulse goals — list goals\n"
+        "/pulse remove <id> — remove a goal"
+    )
 
 
 async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
@@ -2345,6 +3043,16 @@ async def _load_schedules_on_startup(app: Application) -> None:
     if active_monitors:
         logger.info("Loaded %d active monitor(s) from database", len(active_monitors))
 
+    # Load active pulse configs
+    pulse_configs = load_all_pulse_configs()
+    for pc in pulse_configs:
+        try:
+            _register_pulse(app.job_queue, pc["chat_id"])
+        except Exception as e:
+            logger.warning("Failed to register pulse for chat %d: %s", pc["chat_id"], e)
+    if pulse_configs:
+        logger.info("Loaded %d pulse config(s) from database", len(pulse_configs))
+
 
 async def _init_mcp() -> None:
     """Initialize MCP server connections (requires running event loop)."""
@@ -2360,20 +3068,23 @@ async def _init_mcp() -> None:
 
 async def notify_startup(app: Application) -> None:
     """Send a startup message to all allowed users."""
-    await app.bot.set_my_commands([
-        ("new", "Start a new conversation"),
-        ("repo", "Set active GitHub repo"),
-        ("branch", "Set active branch"),
-        ("model", "Show or change AI model"),
-        ("plan", "Toggle plan mode"),
-        ("briefing", "Get daily briefing"),
-        ("todo", "Show current todo list"),
-        ("schedule", "Manage scheduled jobs"),
-        ("monitors", "View active monitors"),
-        ("logs", "View recent bot logs"),
-        ("version", "Show bot version"),
-        ("help", "Show help message"),
-    ])
+    await app.bot.set_my_commands(
+        [
+            ("new", "Start a new conversation"),
+            ("repo", "Set active GitHub repo"),
+            ("branch", "Set active branch"),
+            ("model", "Show or change AI model"),
+            ("plan", "Toggle plan mode"),
+            ("briefing", "Get daily briefing"),
+            ("todo", "Show current todo list"),
+            ("schedule", "Manage scheduled jobs"),
+            ("pulse", "Autonomous agent config"),
+            ("monitors", "View active monitors"),
+            ("logs", "View recent bot logs"),
+            ("version", "Show bot version"),
+            ("help", "Show help message"),
+        ]
+    )
     await _init_mcp()
     await _load_schedules_on_startup(app)
 
@@ -2436,6 +3147,7 @@ def main() -> None:
     app.add_handler(CommandHandler("briefing", trigger_briefing))
     app.add_handler(CommandHandler("schedule", schedule_command))
     app.add_handler(CommandHandler("monitors", monitors_command))
+    app.add_handler(CommandHandler("pulse", pulse_command))
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CallbackQueryHandler(_ask_user_callback, pattern=r"^ask_user:"))

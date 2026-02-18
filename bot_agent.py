@@ -675,17 +675,19 @@ WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "0"))  # 0 = disabled
 
 
 async def notify_startup(app: Application) -> None:
-    await app.bot.set_my_commands([
-        ("new", "Start a new conversation"),
-        ("repo", "Set active GitHub repo"),
-        ("branch", "Set active branch"),
-        ("model", "Show or change AI model"),
-        ("plan", "Plan before implementing"),
-        ("stop", "Stop current work"),
-        ("logs", "View recent bot logs"),
-        ("version", "Show bot version"),
-        ("help", "Show help message"),
-    ])
+    await app.bot.set_my_commands(
+        [
+            ("new", "Start a new conversation"),
+            ("repo", "Set active GitHub repo"),
+            ("branch", "Set active branch"),
+            ("model", "Show or change AI model"),
+            ("plan", "Plan before implementing"),
+            ("stop", "Stop current work"),
+            ("logs", "View recent bot logs"),
+            ("version", "Show bot version"),
+            ("help", "Show help message"),
+        ]
+    )
     if not ALLOWED_USER_IDS:
         return
     now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
