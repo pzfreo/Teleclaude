@@ -131,8 +131,12 @@ web_tools.py        # Web search tool
 calendar_tools.py   # Google Calendar tools
 tasks_tools.py      # Google Tasks tools
 email_tools.py      # Gmail send tool
+contacts_tools.py   # Google Contacts (People API) tools
+train_tools.py      # UK train times (National Rail)
 webhooks.py         # GitHub webhook receiver
-setup_google.py     # One-time OAuth2 setup script
+streaming.py        # Anthropic streaming response handler
+mcp_tools.py        # MCP (Model Context Protocol) tool integration
+setup_google.py     # One-time OAuth2 setup script (Tasks, Calendar, Gmail, Contacts)
 pyproject.toml      # All tooling config (black, ruff, mypy, pytest, coverage)
 VERSION             # Semver version string
 Dockerfile          # Python 3.12-slim + Node.js 22 + Claude Code CLI
@@ -150,7 +154,7 @@ tests/              # pytest test suite
 |------|---------|---------|
 | Black | `black --check .` | Formatting (line-length 120, py312) |
 | Ruff | `ruff check .` | Linting (E, W, F, I, UP, B, SIM, RUF, C4, PIE) |
-| mypy | `mypy bot.py bot_agent.py persistence.py shared.py github_tools.py web_tools.py claude_code.py calendar_tools.py tasks_tools.py email_tools.py webhooks.py` | Type checking |
+| mypy | `mypy bot.py bot_agent.py persistence.py shared.py github_tools.py web_tools.py claude_code.py calendar_tools.py tasks_tools.py email_tools.py webhooks.py contacts_tools.py train_tools.py streaming.py mcp_tools.py` | Type checking |
 | pytest | `pytest --cov --cov-report=term-missing` | Tests + coverage |
 | pip-audit | `pip-audit` | Dependency vulnerability scan |
 
@@ -202,7 +206,7 @@ tests/              # pytest test suite
 - `TELEGRAM_BOT_TOKEN` (required)
 - `ANTHROPIC_API_KEY` (required)
 - `GITHUB_TOKEN` (optional — enables GitHub tools)
-- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (optional — enables Tasks/Calendar/Gmail)
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (optional — enables Tasks/Calendar/Gmail/Contacts)
 - `CLAUDE_MODEL` (default: claude-sonnet-4-5-20250929)
 - `ALLOWED_USER_IDS` (comma-separated Telegram user IDs; empty = allow all)
 - `TIMEZONE` (default: UTC)
