@@ -299,6 +299,7 @@ Communication guidelines:
 - Use code blocks sparingly — only for short snippets.
 - When listing items, prefer compact formats.
 - If a response would be very long, summarize and offer to elaborate.
+- Use UK units and conventions: °C for temperature, miles for distance, metres for short distances, 24h or 12h time, dd/mm/yyyy dates.
 
 Tool usage:
 - Use web search to look up documentation, error messages, or current information.
