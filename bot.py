@@ -240,7 +240,7 @@ except Exception as e:
     logger.warning("Google Contacts: failed to load (%s)", e)
     CONTACTS_TOOLS = []
 
-# UK Train Times (Huxley2 — no API key needed)
+# UK Train Times (National Rail Darwin OpenLDBWS)
 train_client = None
 TRAIN_TOOLS: list[dict[str, Any]] = []
 execute_train_tool = None
@@ -248,9 +248,14 @@ try:
     from train_tools import TRAIN_TOOLS, TrainClient
     from train_tools import execute_tool as _execute_train
 
-    train_client = TrainClient()
-    execute_train_tool = _execute_train
-    logger.info("UK Train Times: enabled")
+    _darwin_token = os.getenv("DARWIN_API_TOKEN", "")
+    if _darwin_token:
+        train_client = TrainClient(_darwin_token)
+        execute_train_tool = _execute_train
+        logger.info("UK Train Times: enabled")
+    else:
+        TRAIN_TOOLS = []
+        logger.info("UK Train Times: disabled (missing DARWIN_API_TOKEN)")
 except Exception as e:
     logger.warning("UK Train Times: failed to load (%s)", e)
     TRAIN_TOOLS = []

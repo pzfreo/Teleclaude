@@ -1,115 +1,146 @@
-"""Tests for train_tools.py."""
+"""Tests for train_tools.py (Darwin OpenLDBWS via zeep)."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-MOCK_DEPARTURES_RESPONSE = {
-    "trainServices": [
-        {
-            "origin": [{"locationName": "London Victoria", "crs": "VIC"}],
-            "destination": [{"locationName": "Bognor Regis", "crs": "BOG"}],
-            "std": "16:11",
-            "etd": "On time",
-            "platform": "17",
-            "operator": "Southern",
-            "operatorCode": "SN",
-            "isCancelled": False,
-            "cancelReason": None,
-            "delayReason": None,
-            "serviceID": "abc123==",
-        },
-        {
-            "origin": [{"locationName": "London Victoria", "crs": "VIC"}],
-            "destination": [{"locationName": "Chichester", "crs": "CHI"}],
-            "std": "16:26",
-            "etd": "16:31",
-            "platform": "15",
-            "operator": "Southern",
-            "operatorCode": "SN",
-            "isCancelled": False,
-            "cancelReason": None,
-            "delayReason": "Late running of a previous service",
-            "serviceID": "def456==",
-        },
-    ],
-    "busServices": None,
-    "ferryServices": None,
-    "locationName": "Barnham",
-    "crs": "BAA",
-    "generatedAt": "2026-02-15T16:00:00.0000000+00:00",
-    "nrccMessages": None,
-    "platformAvailable": True,
-    "areServicesAvailable": True,
-}
 
-MOCK_ARRIVALS_RESPONSE = {
-    "trainServices": [
-        {
-            "origin": [{"locationName": "Bognor Regis", "crs": "BOG"}],
-            "destination": [{"locationName": "London Victoria", "crs": "VIC"}],
-            "sta": "16:20",
-            "eta": "On time",
-            "platform": "2",
-            "operator": "Southern",
-            "operatorCode": "SN",
-            "isCancelled": False,
-            "cancelReason": None,
-            "delayReason": None,
-            "serviceID": "ghi789==",
-        },
-    ],
-    "locationName": "Barnham",
-    "crs": "BAA",
-    "generatedAt": "2026-02-15T16:00:00.0000000+00:00",
-    "nrccMessages": [{"value": "Disruption between Horsham and Barnham."}],
-    "platformAvailable": True,
-    "areServicesAvailable": True,
-}
+def _loc(name, crs):
+    """Create a mock ServiceLocation object."""
+    return SimpleNamespace(locationName=name, crs=crs)
 
-MOCK_SERVICE_RESPONSE = {
-    "operator": "Southern",
-    "isCancelled": False,
-    "cancelReason": None,
-    "delayReason": None,
-    "platform": "17",
-    "std": "16:11",
-    "etd": "On time",
-    "sta": None,
-    "eta": None,
-    "previousCallingPoints": [
-        {
-            "callingPoint": [
-                {"locationName": "London Victoria", "crs": "VIC", "st": "16:11", "et": "On time"},
-                {"locationName": "Clapham Junction", "crs": "CLJ", "st": "16:19", "et": "On time"},
+
+def _svc(
+    std="",
+    etd="",
+    sta=None,
+    eta=None,
+    platform=None,
+    operator="",
+    service_id="",
+    is_cancelled=False,
+    cancel_reason=None,
+    delay_reason=None,
+    origins=None,
+    destinations=None,
+):
+    """Create a mock ServiceItem object."""
+    return SimpleNamespace(
+        std=std,
+        etd=etd,
+        sta=sta,
+        eta=eta,
+        platform=platform,
+        operator=operator,
+        serviceID=service_id,
+        isCancelled=is_cancelled,
+        cancelReason=cancel_reason,
+        delayReason=delay_reason,
+        origin=SimpleNamespace(location=origins or []),
+        destination=SimpleNamespace(location=destinations or []),
+    )
+
+
+def _board(location_name, crs, generated_at, services=None, nrcc=None):
+    """Create a mock StationBoard response."""
+    train_services = SimpleNamespace(service=services) if services else None
+    return SimpleNamespace(
+        locationName=location_name,
+        crs=crs,
+        generatedAt=generated_at,
+        trainServices=train_services,
+        nrccMessages=nrcc,
+    )
+
+
+MOCK_DEPARTURES_RESPONSE = _board(
+    "Barnham",
+    "BAA",
+    "2026-02-15T16:00:00",
+    services=[
+        _svc(
+            std="16:11",
+            etd="On time",
+            platform="17",
+            operator="Southern",
+            service_id="abc123==",
+            origins=[_loc("London Victoria", "VIC")],
+            destinations=[_loc("Bognor Regis", "BOG")],
+        ),
+        _svc(
+            std="16:26",
+            etd="16:31",
+            platform="15",
+            operator="Southern",
+            service_id="def456==",
+            delay_reason="Late running of a previous service",
+            origins=[_loc("London Victoria", "VIC")],
+            destinations=[_loc("Chichester", "CHI")],
+        ),
+    ],
+)
+
+MOCK_ARRIVALS_RESPONSE = _board(
+    "Barnham",
+    "BAA",
+    "2026-02-15T16:00:00",
+    services=[
+        _svc(
+            sta="16:20",
+            eta="On time",
+            platform="2",
+            operator="Southern",
+            service_id="ghi789==",
+            origins=[_loc("Bognor Regis", "BOG")],
+            destinations=[_loc("London Victoria", "VIC")],
+        ),
+    ],
+    nrcc=SimpleNamespace(message=[SimpleNamespace(_value_1="Disruption between Horsham and Barnham.")]),
+)
+
+
+def _cp(name, crs, st, et):
+    """Create a mock CallingPoint object."""
+    return SimpleNamespace(locationName=name, crs=crs, st=st, et=et)
+
+
+MOCK_SERVICE_RESPONSE = SimpleNamespace(
+    operator="Southern",
+    isCancelled=False,
+    cancelReason=None,
+    delayReason=None,
+    platform="17",
+    std="16:11",
+    etd="On time",
+    sta=None,
+    eta=None,
+    previousCallingPoints=[
+        SimpleNamespace(
+            callingPoint=[
+                _cp("London Victoria", "VIC", "16:11", "On time"),
+                _cp("Clapham Junction", "CLJ", "16:19", "On time"),
             ]
-        }
+        )
     ],
-    "subsequentCallingPoints": [
-        {
-            "callingPoint": [
-                {"locationName": "Barnham", "crs": "BAA", "st": "17:22", "et": "On time"},
-                {"locationName": "Bognor Regis", "crs": "BOG", "st": "17:30", "et": "On time"},
+    subsequentCallingPoints=[
+        SimpleNamespace(
+            callingPoint=[
+                _cp("Barnham", "BAA", "17:22", "On time"),
+                _cp("Bognor Regis", "BOG", "17:30", "On time"),
             ]
-        }
+        )
     ],
-}
-
-MOCK_STATION_SEARCH = [
-    {"stationName": "Barnham", "crsCode": "BAA"},
-]
+)
 
 
+@patch("train_tools.Client")
 class TestTrainClient:
-    def test_get_departures(self):
+    def test_get_departures(self, MockClient):
         from train_tools import TrainClient
 
-        with patch("train_tools.requests.get") as mock_get:
-            mock_get.return_value = MagicMock(status_code=200)
-            mock_get.return_value.json.return_value = MOCK_DEPARTURES_RESPONSE
-            mock_get.return_value.raise_for_status = MagicMock()
-
-            client = TrainClient()
-            result = client.get_departures("BAA", num_rows=5)
+        MockClient.return_value.service.GetDepartureBoard.return_value = MOCK_DEPARTURES_RESPONSE
+        client = TrainClient("test-token")
+        result = client.get_departures("BAA", num_rows=5)
 
         assert result["station"] == "Barnham"
         assert result["crs"] == "BAA"
@@ -119,48 +150,39 @@ class TestTrainClient:
         assert result["services"][0]["destination"] == "Bognor Regis"
         assert result["services"][0]["platform"] == "17"
         assert result["services"][1]["delay_reason"] == "Late running of a previous service"
-        mock_get.assert_called_once()
-        assert "/departures/BAA/5" in mock_get.call_args[0][0]
+        call_kwargs = MockClient.return_value.service.GetDepartureBoard.call_args[1]
+        assert call_kwargs["crs"] == "BAA"
+        assert call_kwargs["numRows"] == 5
 
-    def test_get_departures_with_filter(self):
+    def test_get_departures_with_filter(self, MockClient):
         from train_tools import TrainClient
 
-        with patch("train_tools.requests.get") as mock_get:
-            mock_get.return_value = MagicMock(status_code=200)
-            mock_get.return_value.json.return_value = MOCK_DEPARTURES_RESPONSE
-            mock_get.return_value.raise_for_status = MagicMock()
+        MockClient.return_value.service.GetDepartureBoard.return_value = MOCK_DEPARTURES_RESPONSE
+        client = TrainClient("test-token")
+        client.get_departures("VIC", filter_station="BAA", num_rows=10)
 
-            client = TrainClient()
-            client.get_departures("VIC", filter_station="BAA", num_rows=10)
+        call_kwargs = MockClient.return_value.service.GetDepartureBoard.call_args[1]
+        assert call_kwargs["crs"] == "VIC"
+        assert call_kwargs["filterCrs"] == "BAA"
+        assert call_kwargs["filterType"] == "to"
 
-        url = mock_get.call_args[0][0]
-        assert "/departures/VIC/to/BAA/10" in url
-
-    def test_get_departures_with_time_params(self):
+    def test_get_departures_with_time_params(self, MockClient):
         from train_tools import TrainClient
 
-        with patch("train_tools.requests.get") as mock_get:
-            mock_get.return_value = MagicMock(status_code=200)
-            mock_get.return_value.json.return_value = MOCK_DEPARTURES_RESPONSE
-            mock_get.return_value.raise_for_status = MagicMock()
+        MockClient.return_value.service.GetDepartureBoard.return_value = MOCK_DEPARTURES_RESPONSE
+        client = TrainClient("test-token")
+        client.get_departures("BAA", time_offset=30, time_window=60)
 
-            client = TrainClient()
-            client.get_departures("BAA", time_offset=30, time_window=60)
+        call_kwargs = MockClient.return_value.service.GetDepartureBoard.call_args[1]
+        assert call_kwargs["timeOffset"] == 30
+        assert call_kwargs["timeWindow"] == 60
 
-        url = mock_get.call_args[0][0]
-        assert "timeOffset=30" in url
-        assert "timeWindow=60" in url
-
-    def test_get_arrivals(self):
+    def test_get_arrivals(self, MockClient):
         from train_tools import TrainClient
 
-        with patch("train_tools.requests.get") as mock_get:
-            mock_get.return_value = MagicMock(status_code=200)
-            mock_get.return_value.json.return_value = MOCK_ARRIVALS_RESPONSE
-            mock_get.return_value.raise_for_status = MagicMock()
-
-            client = TrainClient()
-            result = client.get_arrivals("BAA")
+        MockClient.return_value.service.GetArrivalBoard.return_value = MOCK_ARRIVALS_RESPONSE
+        client = TrainClient("test-token")
+        result = client.get_arrivals("BAA")
 
         assert result["station"] == "Barnham"
         assert len(result["services"]) == 1
@@ -169,48 +191,34 @@ class TestTrainClient:
         assert result["services"][0]["origin"] == "Bognor Regis"
         assert "notices" in result
         assert "Disruption" in result["notices"][0]
-        mock_get.assert_called_once()
-        assert "/arrivals/BAA/10" in mock_get.call_args[0][0]
 
-    def test_get_arrivals_with_filter(self):
+    def test_get_arrivals_with_filter(self, MockClient):
         from train_tools import TrainClient
 
-        with patch("train_tools.requests.get") as mock_get:
-            mock_get.return_value = MagicMock(status_code=200)
-            mock_get.return_value.json.return_value = MOCK_ARRIVALS_RESPONSE
-            mock_get.return_value.raise_for_status = MagicMock()
+        MockClient.return_value.service.GetArrivalBoard.return_value = MOCK_ARRIVALS_RESPONSE
+        client = TrainClient("test-token")
+        client.get_arrivals("BAA", filter_station="VIC")
 
-            client = TrainClient()
-            client.get_arrivals("BAA", filter_station="VIC")
+        call_kwargs = MockClient.return_value.service.GetArrivalBoard.call_args[1]
+        assert call_kwargs["filterCrs"] == "VIC"
+        assert call_kwargs["filterType"] == "from"
 
-        url = mock_get.call_args[0][0]
-        assert "/arrivals/BAA/from/VIC/10" in url
-
-    def test_search_stations(self):
+    def test_search_stations(self, MockClient):
         from train_tools import TrainClient
 
-        with patch("train_tools.requests.get") as mock_get:
-            mock_get.return_value = MagicMock(status_code=200)
-            mock_get.return_value.json.return_value = MOCK_STATION_SEARCH
-            mock_get.return_value.raise_for_status = MagicMock()
-
-            client = TrainClient()
-            result = client.search_stations("barnham")
+        client = TrainClient("test-token")
+        result = client.search_stations("barnham")
 
         assert len(result) == 1
         assert result[0]["station_name"] == "Barnham"
         assert result[0]["crs_code"] == "BAA"
 
-    def test_get_service_details(self):
+    def test_get_service_details(self, MockClient):
         from train_tools import TrainClient
 
-        with patch("train_tools.requests.get") as mock_get:
-            mock_get.return_value = MagicMock(status_code=200)
-            mock_get.return_value.json.return_value = MOCK_SERVICE_RESPONSE
-            mock_get.return_value.raise_for_status = MagicMock()
-
-            client = TrainClient()
-            result = client.get_service_details("abc123==")
+        MockClient.return_value.service.GetServiceDetails.return_value = MOCK_SERVICE_RESPONSE
+        client = TrainClient("test-token")
+        result = client.get_service_details("abc123==")
 
         assert result["operator"] == "Southern"
         assert result["is_cancelled"] is False
@@ -219,61 +227,39 @@ class TestTrainClient:
         assert len(result["subsequent_calling_points"]) == 2
         assert result["subsequent_calling_points"][1]["station"] == "Bognor Regis"
 
-    def test_no_services(self):
+    def test_no_services(self, MockClient):
         from train_tools import TrainClient
 
-        empty_response = {
-            "trainServices": None,
-            "locationName": "Barnham",
-            "crs": "BAA",
-            "generatedAt": "2026-02-15T02:00:00.0000000+00:00",
-            "nrccMessages": None,
-            "platformAvailable": True,
-            "areServicesAvailable": True,
-        }
-        with patch("train_tools.requests.get") as mock_get:
-            mock_get.return_value = MagicMock(status_code=200)
-            mock_get.return_value.json.return_value = empty_response
-            mock_get.return_value.raise_for_status = MagicMock()
-
-            client = TrainClient()
-            result = client.get_departures("BAA")
+        empty_response = _board("Barnham", "BAA", "2026-02-15T02:00:00")
+        MockClient.return_value.service.GetDepartureBoard.return_value = empty_response
+        client = TrainClient("test-token")
+        result = client.get_departures("BAA")
 
         assert result["services"] == []
 
-    def test_cancelled_service(self):
+    def test_cancelled_service(self, MockClient):
         from train_tools import TrainClient
 
-        cancelled_response = {
-            "trainServices": [
-                {
-                    "origin": [{"locationName": "London Victoria", "crs": "VIC"}],
-                    "destination": [{"locationName": "Bognor Regis", "crs": "BOG"}],
-                    "std": "16:11",
-                    "etd": "Cancelled",
-                    "platform": None,
-                    "operator": "Southern",
-                    "operatorCode": "SN",
-                    "isCancelled": True,
-                    "cancelReason": "A fault with the signalling system",
-                    "delayReason": None,
-                    "serviceID": "xyz999==",
-                },
+        cancelled_response = _board(
+            "Barnham",
+            "BAA",
+            "2026-02-15T16:00:00",
+            services=[
+                _svc(
+                    std="16:11",
+                    etd="Cancelled",
+                    is_cancelled=True,
+                    cancel_reason="A fault with the signalling system",
+                    operator="Southern",
+                    service_id="xyz999==",
+                    origins=[_loc("London Victoria", "VIC")],
+                    destinations=[_loc("Bognor Regis", "BOG")],
+                ),
             ],
-            "locationName": "Barnham",
-            "crs": "BAA",
-            "generatedAt": "2026-02-15T16:00:00.0000000+00:00",
-            "nrccMessages": None,
-            "platformAvailable": True,
-            "areServicesAvailable": True,
-        }
-        with patch("train_tools.requests.get") as mock_get:
-            mock_get.return_value = MagicMock(status_code=200)
-            mock_get.return_value.json.return_value = cancelled_response
-            mock_get.return_value.raise_for_status = MagicMock()
-
-            client = TrainClient()
-            result = client.get_departures("BAA")
+        )
+        MockClient.return_value.service.GetDepartureBoard.return_value = cancelled_response
+        client = TrainClient("test-token")
+        result = client.get_departures("BAA")
 
         svc = result["services"][0]
         assert svc["is_cancelled"] is True

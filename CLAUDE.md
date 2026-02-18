@@ -70,7 +70,8 @@ def execute_tool(client: SomeClient, tool_name: str, tool_input: dict) -> str:
 | `calendar_tools.py` | Google Calendar API | 5 (list, create, update, delete events) | OAuth2 |
 | `email_tools.py` | Gmail API (send only) | 1 (send_email) | OAuth2 |
 | `contacts_tools.py` | Google People API | search, get, create, update contacts | OAuth2 |
-| `train_tools.py` | Huxley2 (National Rail) | departures, arrivals, station search, service details | None |
+| `train_tools.py` | National Rail Darwin OpenLDBWS (SOAP) | departures, arrivals, station search, service details | Token (`DARWIN_API_TOKEN`) |
+| `station_codes.py` | Local data | CRS code lookup (~2600 UK stations) | None |
 
 **Internal tools** (always available, defined in `bot.py`):
 
@@ -132,7 +133,8 @@ calendar_tools.py   # Google Calendar tools
 tasks_tools.py      # Google Tasks tools
 email_tools.py      # Gmail send tool
 contacts_tools.py   # Google Contacts (People API) tools
-train_tools.py      # UK train times (National Rail)
+train_tools.py      # UK train times (Darwin OpenLDBWS SOAP API)
+station_codes.py    # CRS station code lookup (~2600 UK stations)
 webhooks.py         # GitHub webhook receiver
 streaming.py        # Anthropic streaming response handler
 mcp_tools.py        # MCP (Model Context Protocol) tool integration
@@ -154,7 +156,7 @@ tests/              # pytest test suite
 |------|---------|---------|
 | Black | `black --check .` | Formatting (line-length 120, py312) |
 | Ruff | `ruff check .` | Linting (E, W, F, I, UP, B, SIM, RUF, C4, PIE) |
-| mypy | `mypy bot.py bot_agent.py persistence.py shared.py github_tools.py web_tools.py claude_code.py calendar_tools.py tasks_tools.py email_tools.py webhooks.py contacts_tools.py train_tools.py streaming.py mcp_tools.py` | Type checking |
+| mypy | `mypy bot.py bot_agent.py persistence.py shared.py github_tools.py web_tools.py claude_code.py calendar_tools.py tasks_tools.py email_tools.py webhooks.py contacts_tools.py train_tools.py station_codes.py streaming.py mcp_tools.py` | Type checking |
 | pytest | `pytest --cov --cov-report=term-missing` | Tests + coverage |
 | pip-audit | `pip-audit` | Dependency vulnerability scan |
 
@@ -207,6 +209,7 @@ tests/              # pytest test suite
 - `ANTHROPIC_API_KEY` (required)
 - `GITHUB_TOKEN` (optional — enables GitHub tools)
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (optional — enables Tasks/Calendar/Gmail/Contacts)
+- `DARWIN_API_TOKEN` (optional — enables UK train times via National Rail Darwin API)
 - `CLAUDE_MODEL` (default: claude-sonnet-4-6)
 - `ALLOWED_USER_IDS` (comma-separated Telegram user IDs; empty = allow all)
 - `TIMEZONE` (default: UTC)

@@ -15,6 +15,7 @@ dependencies = [
     "aiohttp>=3.9.0",
     "openai>=1.0.0",
     "mcp>=1.0.0",
+    "zeep>=4.2.0",
 ]
 
 [project.optional-dependencies]
@@ -38,7 +39,7 @@ build-backend = "setuptools.build_meta"
 py-modules = [
     "bot", "bot_agent", "persistence", "shared", "github_tools", "web_tools",
     "calendar_tools", "tasks_tools", "email_tools", "claude_code",
-    "contacts_tools", "train_tools", "setup_google", "webhooks", "streaming", "mcp_tools",
+    "contacts_tools", "train_tools", "station_codes", "setup_google", "webhooks", "streaming", "mcp_tools",
 ]
 
 [tool.setuptools.dynamic]
@@ -91,6 +92,7 @@ known-first-party = [
     "claude_code",
     "contacts_tools",
     "train_tools",
+    "station_codes",
     "streaming",
     "mcp_tools",
 ]
@@ -119,6 +121,7 @@ module = [
     "aiohttp.*",
     "openai.*",
     "mcp.*",
+    "zeep.*",
 ]
 ignore_missing_imports = true
 
