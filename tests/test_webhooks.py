@@ -23,10 +23,10 @@ class TestVerifySignature:
 
         assert _verify_signature(b"payload", "md5=abc", "secret") is False
 
-    def test_empty_secret_skips_verification(self):
+    def test_empty_secret_rejects(self):
         from webhooks import _verify_signature
 
-        assert _verify_signature(b"payload", "", "") is True
+        assert _verify_signature(b"payload", "", "") is False
 
 
 class TestFormatPushEvent:

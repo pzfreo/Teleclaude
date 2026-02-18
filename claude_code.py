@@ -10,6 +10,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+GIT_TIMEOUT = 120  # 2 minutes for git operations
+CLI_TIMEOUT = 600  # 10 minutes for Claude Code CLI runs
+
 
 class ClaudeCodeManager:
     """Manages local clones and Claude Code CLI sessions."""
@@ -94,7 +97,7 @@ class ClaudeCodeManager:
             logger.warning("git pull --ff-only failed (expected if local changes): %s", e)
 
     async def _git(self, cwd: Path, *args: str) -> str:
-        """Run a git command as an async subprocess."""
+        """Run a git command as an async subprocess with timeout."""
         proc = await asyncio.create_subprocess_exec(
             "git",
             *args,
@@ -103,7 +106,12 @@ class ClaudeCodeManager:
             stderr=asyncio.subprocess.PIPE,
             env=self._git_env(),
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=GIT_TIMEOUT)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise RuntimeError(f"git {' '.join(args)} timed out after {GIT_TIMEOUT}s") from None
         if proc.returncode != 0:
             msg = stderr.decode().strip() or stdout.decode().strip()
             raise RuntimeError(f"git {' '.join(args)} failed: {msg}")
@@ -211,7 +219,14 @@ class ClaudeCodeManager:
         returned_session_id = None
 
         try:
-            result_text, returned_session_id = await self._read_stream(proc, on_progress)
+            result_text, returned_session_id = await asyncio.wait_for(
+                self._read_stream(proc, on_progress), timeout=CLI_TIMEOUT
+            )
+        except TimeoutError:
+            logger.warning("Claude Code CLI timed out after %ds for chat %d", CLI_TIMEOUT, chat_id)
+            proc.kill()
+            await proc.wait()
+            result_text = f"(Claude Code timed out after {CLI_TIMEOUT // 60} minutes)"
         except asyncio.CancelledError:
             proc.kill()
             await proc.wait()

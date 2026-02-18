@@ -126,6 +126,7 @@ class TestAskUserCallback:
         _ask_user_futures[chat_id] = future
 
         update = MagicMock()
+        update.effective_user.id = 12345
         query = AsyncMock()
         query.data = f"ask_user:{chat_id}:1"
         query.answer = AsyncMock()
@@ -142,7 +143,8 @@ class TestAskUserCallback:
         update.callback_query = query
 
         context = MagicMock()
-        await _ask_user_callback(update, context)
+        with patch("bot.ALLOWED_USER_IDS", set()):
+            await _ask_user_callback(update, context)
 
         assert future.done()
         assert future.result() == "Option B"
@@ -156,10 +158,12 @@ class TestAskUserCallback:
         from bot import _ask_user_callback
 
         update = MagicMock()
+        update.effective_user.id = 12345
         query = AsyncMock()
         query.data = "not_ask_user:123:0"
         update.callback_query = query
 
         context = MagicMock()
         # Should not raise
-        await _ask_user_callback(update, context)
+        with patch("bot.ALLOWED_USER_IDS", set()):
+            await _ask_user_callback(update, context)

@@ -531,6 +531,7 @@ for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
 MAX_HISTORY = 50
 MAX_TELEGRAM_LENGTH = 4096
 MAX_TOOL_ROUNDS = 15
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — reject Telegram file downloads above this
 TYPING_INTERVAL = 4  # seconds between typing indicator refreshes
 PROGRESS_INTERVAL = 15  # seconds before sending a progress message
 
@@ -556,6 +557,13 @@ chat_plan_mode: dict[int, bool] = {}
 _chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 # Per-chat cancel events for ! interrupt
 _cancel_events: dict[int, asyncio.Event] = {}
+# Per-chat rate limiting: chat_id -> list of message timestamps
+RATE_LIMIT_MESSAGES = 10  # max messages per window
+RATE_LIMIT_WINDOW = 60  # window in seconds
+_message_timestamps: dict[int, list[float]] = {}
+# Cache eviction: track last activity per chat and evict idle entries
+CACHE_IDLE_TIMEOUT = 86400  # 24 hours
+_chat_last_active: dict[int, float] = {}  # chat_id -> monotonic timestamp
 # Registered schedule jobs: schedule_id -> Job
 _scheduled_jobs: dict[int, Any] = {}
 
@@ -697,6 +705,25 @@ def set_active_branch(chat_id: int, branch: str | None) -> None:
     elif chat_id in active_branches:
         del active_branches[chat_id]
     save_active_branch(chat_id, branch)
+
+
+def _evict_idle_caches() -> None:
+    """Remove in-memory cache entries for chats idle longer than CACHE_IDLE_TIMEOUT."""
+    now = time.monotonic()
+    stale = [cid for cid, ts in _chat_last_active.items() if now - ts > CACHE_IDLE_TIMEOUT]
+    for cid in stale:
+        conversations.pop(cid, None)
+        active_repos.pop(cid, None)
+        active_branches.pop(cid, None)
+        chat_models.pop(cid, None)
+        chat_todos.pop(cid, None)
+        chat_plan_mode.pop(cid, None)
+        _cancel_events.pop(cid, None)
+        _message_timestamps.pop(cid, None)
+        _chat_last_active.pop(cid, None)
+        # Don't evict _chat_locks — defaultdict, harmless
+    if stale:
+        logger.info("Evicted in-memory caches for %d idle chat(s)", len(stale))
 
 
 MAX_CONTENT_SIZE = 20000  # max chars per content string in history
@@ -1405,6 +1432,12 @@ async def _ask_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     if not query or not query.data:
         return
+    if not update.effective_user or not is_authorized(update.effective_user.id):
+        try:
+            await query.answer("Not authorized", show_alert=True)
+        except TelegramError:
+            pass
+        return
 
     parts = query.data.split(":")
     if len(parts) != 3 or parts[0] != "ask_user":
@@ -1442,8 +1475,14 @@ _IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 _SUPPORTED_DOC_MIMES = _IMAGE_MIME_TYPES | {"application/pdf"}
 
 
-async def _download_telegram_file(file_obj, bot) -> bytes:
-    """Download a Telegram file and return its bytes."""
+async def _download_telegram_file(file_obj, bot, max_size: int = MAX_FILE_SIZE) -> bytes:
+    """Download a Telegram file and return its bytes.
+
+    Raises ValueError if the file exceeds max_size.
+    """
+    file_size = getattr(file_obj, "file_size", None)
+    if file_size and file_size > max_size:
+        raise ValueError(f"File too large ({file_size / 1024 / 1024:.1f} MB, limit {max_size / 1024 / 1024:.0f} MB)")
     return await download_telegram_file(file_obj, bot)
 
 
@@ -1633,6 +1672,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     raw_text = (update.message.text or "").strip()
+
+    # Rate limiting (skip for "!" cancel command)
+    if raw_text != "!":
+        now = time.monotonic()
+        timestamps = _message_timestamps.setdefault(chat_id, [])
+        # Prune timestamps outside the window
+        cutoff = now - RATE_LIMIT_WINDOW
+        timestamps[:] = [t for t in timestamps if t > cutoff]
+        if len(timestamps) >= RATE_LIMIT_MESSAGES:
+            try:
+                await update.message.reply_text("Too many messages — please wait a moment before sending more.")
+            except TelegramError:
+                pass
+            return
+        timestamps.append(now)
+
+    _chat_last_active[chat_id] = time.monotonic()
 
     # Handle "!" as cancel/interrupt
     if raw_text == "!":
@@ -3177,6 +3233,12 @@ def main() -> None:
     )
 
     app.post_init = notify_startup
+
+    # Periodic cache eviction for idle chats (every hour)
+    async def _evict_caches_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        _evict_idle_caches()
+
+    app.job_queue.run_repeating(_evict_caches_job, interval=3600, first=3600, name="cache_eviction")
 
     logger.info(
         "Teleclaude started — model: %s | github: %s | search: %s | tasks: %s | calendar: %s | email: %s",
