@@ -2360,6 +2360,20 @@ async def _init_mcp() -> None:
 
 async def notify_startup(app: Application) -> None:
     """Send a startup message to all allowed users."""
+    await app.bot.set_my_commands([
+        ("new", "Start a new conversation"),
+        ("repo", "Set active GitHub repo"),
+        ("branch", "Set active branch"),
+        ("model", "Show or change AI model"),
+        ("plan", "Toggle plan mode"),
+        ("briefing", "Get daily briefing"),
+        ("todo", "Show current todo list"),
+        ("schedule", "Manage scheduled jobs"),
+        ("monitors", "View active monitors"),
+        ("logs", "View recent bot logs"),
+        ("version", "Show bot version"),
+        ("help", "Show help message"),
+    ])
     await _init_mcp()
     await _load_schedules_on_startup(app)
 
