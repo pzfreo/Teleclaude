@@ -5,13 +5,22 @@ import json
 import logging
 import os
 import shutil
+import time
 import uuid
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 GIT_TIMEOUT = 120  # 2 minutes for git operations
-CLI_TIMEOUT = 600  # 10 minutes for Claude Code CLI runs
+
+
+def _get_cli_timeout() -> int:
+    """Get CLI timeout in seconds from CLAUDE_CLI_TIMEOUT env var (default 600, min 60)."""
+    raw = os.getenv("CLAUDE_CLI_TIMEOUT", "600")
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        return 600
 
 
 class ClaudeCodeManager:
@@ -146,6 +155,8 @@ class ClaudeCodeManager:
         branch: str | None = None,
         model: str | None = None,
         on_progress=None,
+        on_timeout=None,
+        permission_mode: str | None = None,
     ) -> str:
         """Run a prompt through Claude Code CLI and return the result.
 
@@ -155,7 +166,9 @@ class ClaudeCodeManager:
             prompt: The user's message
             branch: Optional branch to work on
             model: Claude model ID
-            on_progress: async callback(tool_name: str) for progress updates
+            on_progress: async callback(block: dict) for progress updates
+            on_timeout: async callback(elapsed_seconds: int) -> bool; return True to continue
+            permission_mode: CLI permission mode override (e.g. "plan")
 
         Returns:
             The final text result from Claude Code
@@ -180,6 +193,9 @@ class ClaudeCodeManager:
 
         if model:
             cmd.extend(["--model", model])
+
+        if permission_mode:
+            cmd.extend(["--permission-mode", permission_mode])
 
         # Session handling: resume existing or start new
         session_id = self._sessions.get(chat_id)
@@ -217,16 +233,45 @@ class ClaudeCodeManager:
         self._running_procs[chat_id] = proc
         result_text = ""
         returned_session_id = None
+        cli_timeout = _get_cli_timeout()
 
         try:
-            result_text, returned_session_id = await asyncio.wait_for(
-                self._read_stream(proc, on_progress), timeout=CLI_TIMEOUT
-            )
-        except TimeoutError:
-            logger.warning("Claude Code CLI timed out after %ds for chat %d", CLI_TIMEOUT, chat_id)
-            proc.kill()
-            await proc.wait()
-            result_text = f"(Claude Code timed out after {CLI_TIMEOUT // 60} minutes)"
+            start_time = time.monotonic()
+            stream_task = asyncio.create_task(self._read_stream(proc, on_progress))
+
+            while True:
+                try:
+                    result_text, returned_session_id = await asyncio.wait_for(
+                        asyncio.shield(stream_task), timeout=cli_timeout
+                    )
+                    break  # completed normally
+                except TimeoutError:
+                    # Check if stream actually finished (race condition)
+                    if stream_task.done():
+                        result_text, returned_session_id = stream_task.result()
+                        break
+
+                    elapsed = int(time.monotonic() - start_time)
+
+                    # Ask the on_timeout callback whether to continue
+                    should_continue = False
+                    if on_timeout:
+                        try:
+                            should_continue = await on_timeout(elapsed)
+                        except Exception as exc:
+                            logger.warning("Timeout callback failed: %s", exc)
+
+                    if should_continue:
+                        logger.info("CLI timeout extended for chat %d (elapsed %ds)", chat_id, elapsed)
+                        continue
+
+                    # No callback or callback said stop
+                    logger.warning("Claude Code CLI timed out after %ds for chat %d", elapsed, chat_id)
+                    proc.kill()
+                    await proc.wait()
+                    result_text = f"(Claude Code timed out after {elapsed // 60} minutes)"
+                    break
+
         except asyncio.CancelledError:
             proc.kill()
             await proc.wait()
@@ -270,12 +315,12 @@ class ClaudeCodeManager:
             event_type = event.get("type")
 
             if event_type == "assistant":
-                # Report tool_use blocks with context for progress display
+                # Report tool_use and text blocks for progress display
                 message = event.get("message", {})
                 content = message.get("content", [])
                 if isinstance(content, list):
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                        if isinstance(block, dict) and block.get("type") in ("tool_use", "text"):
                             if on_progress:
                                 try:
                                     await on_progress(block)

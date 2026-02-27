@@ -124,6 +124,7 @@ if cli_path:
 active_repos: dict[int, str] = {}
 active_branches: dict[int, str] = {}
 chat_models: dict[int, str] = {}
+_plan_mode: set[int] = set()  # chat IDs with plan mode enabled
 _chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 
 _MIME_TO_EXT = {
@@ -174,8 +175,23 @@ def set_active_branch(chat_id: int, branch: str | None) -> None:
 # ── Helpers ───────────────────────────────────────────────────────────
 
 
-def _format_tool_progress(block: dict) -> str | None:
-    """Format a tool_use block into a short, readable progress line."""
+MAX_REASONING_LEN = 250
+
+
+def _format_progress(block: dict) -> str | None:
+    """Format a content block (text or tool_use) into a short, readable progress line."""
+    block_type = block.get("type")
+
+    # Reasoning text blocks
+    if block_type == "text":
+        text = block.get("text", "").strip()
+        if not text:
+            return None
+        if len(text) > MAX_REASONING_LEN:
+            text = text[:MAX_REASONING_LEN] + "..."
+        return text
+
+    # Tool use blocks
     name = block.get("name", "")
     inp = block.get("input", {})
 
@@ -264,6 +280,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/repo owner/name - Set the active GitHub repo\n"
         "/repo - Show current repo\n"
         "/branch name - Set active branch\n"
+        "/plan - Toggle plan mode (read-only)\n"
+        "/plan <task> - Plan a specific task\n"
+        "/work - Exit plan mode\n"
         "/stop - Stop current work (keeps session)\n"
         "/new - Start a fresh CLI session\n"
         "/model - Show or switch model (opus/sonnet/haiku)\n"
@@ -474,16 +493,21 @@ async def show_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /plan — enter plan mode for a task."""
+    """Handle /plan — toggle plan mode or plan a specific task."""
     if not update.message or not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
     text = update.message.text or ""
     # Strip "/plan" prefix
     task = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+
     if not task:
-        await update.message.reply_text("Usage: /plan <task description>")
+        # Toggle plan mode on
+        _plan_mode.add(chat_id)
+        await update.message.reply_text("Plan mode ON. Claude will plan but not implement.\nSend /work to switch back.")
         return
+
+    # One-shot: plan a specific task
     prompt = (
         "Think carefully and create a plan for this task. Present the full plan in your response so I can review it. "
         "Do NOT start implementing until I approve.\n\n"
@@ -497,6 +521,19 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             pass
     async with lock:
         await _run_cli(chat_id, prompt, update, context)
+
+
+async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /work — exit plan mode."""
+    if not update.message or not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    was_planning = chat_id in _plan_mode
+    _plan_mode.discard(chat_id)
+    if was_planning:
+        await update.message.reply_text("Plan mode OFF. Claude will now implement directly.")
+    else:
+        await update.message.reply_text("Already in work mode.")
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -610,19 +647,35 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
 
     async def on_progress(block: dict):
         nonlocal tool_count, last_progress_time
-        tool_count += 1
         now = time.time()
         # Throttle: skip if too soon after last message
         if now - last_progress_time < MIN_PROGRESS_GAP:
             return
-        line = _format_tool_progress(block)
+        line = _format_progress(block)
         if not line:
             return
         last_progress_time = now
+        # Number tool actions but not reasoning text
+        if block.get("type") == "tool_use":
+            tool_count += 1
+            line = f"[{tool_count}] {line}"
         try:
-            await bot.send_message(chat_id=chat_id, text=f"[{tool_count}] {line}")
+            await bot.send_message(chat_id=chat_id, text=line)
         except TelegramError:
             pass
+
+    async def on_timeout(elapsed_seconds: int) -> bool:
+        """Called when CLI timeout fires. Notifies user and continues."""
+        from claude_code import _get_cli_timeout
+
+        minutes = elapsed_seconds // 60
+        next_minutes = _get_cli_timeout() // 60
+        msg = f"Still running after {minutes} min. Continuing for another {next_minutes} min — send /stop to abort."
+        try:
+            await bot.send_message(chat_id=chat_id, text=msg)
+        except TelegramError:
+            pass
+        return True  # always continue; user can /stop
 
     # Typing indicator
     stop_typing = asyncio.Event()
@@ -636,6 +689,8 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
             branch=branch,
             model=model,
             on_progress=on_progress,
+            on_timeout=on_timeout,
+            permission_mode="plan" if chat_id in _plan_mode else None,
         )
     except Exception as e:
         logger.error("Claude Code run failed: %s", e, exc_info=True)
@@ -681,7 +736,8 @@ async def notify_startup(app: Application) -> None:
             ("repo", "Set active GitHub repo"),
             ("branch", "Set active branch"),
             ("model", "Show or change AI model"),
-            ("plan", "Plan before implementing"),
+            ("plan", "Toggle plan mode / plan a task"),
+            ("work", "Exit plan mode"),
             ("stop", "Stop current work"),
             ("logs", "View recent bot logs"),
             ("version", "Show bot version"),
@@ -732,6 +788,7 @@ def main() -> None:
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CommandHandler("plan", plan_command))
+    app.add_handler(CommandHandler("work", work_command))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(
         MessageHandler(

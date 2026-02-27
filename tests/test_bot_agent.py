@@ -3,76 +3,112 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
-class TestFormatToolProgress:
-    """Test _format_tool_progress() formatting."""
+class TestFormatProgress:
+    """Test _format_progress() formatting for both text and tool_use blocks."""
 
     def test_read_tool(self):
-        from bot_agent import _format_tool_progress
+        from bot_agent import _format_progress
 
-        result = _format_tool_progress({"name": "Read", "input": {"file_path": "/app/src/main.py"}})
+        result = _format_progress({"type": "tool_use", "name": "Read", "input": {"file_path": "/app/src/main.py"}})
         assert result == "Reading app/src/main.py"
 
     def test_write_tool(self):
-        from bot_agent import _format_tool_progress
+        from bot_agent import _format_progress
 
-        result = _format_tool_progress({"name": "Write", "input": {"file_path": "/app/src/main.py"}})
+        result = _format_progress({"type": "tool_use", "name": "Write", "input": {"file_path": "/app/src/main.py"}})
         assert result == "Writing app/src/main.py"
 
     def test_edit_tool(self):
-        from bot_agent import _format_tool_progress
+        from bot_agent import _format_progress
 
-        result = _format_tool_progress({"name": "Edit", "input": {"file_path": "/a/b/c.py"}})
+        result = _format_progress({"type": "tool_use", "name": "Edit", "input": {"file_path": "/a/b/c.py"}})
         assert result == "Editing a/b/c.py"
 
     def test_bash_tool(self):
-        from bot_agent import _format_tool_progress
+        from bot_agent import _format_progress
 
-        result = _format_tool_progress({"name": "Bash", "input": {"command": "npm test"}})
+        result = _format_progress({"type": "tool_use", "name": "Bash", "input": {"command": "npm test"}})
         assert result == "$ npm test"
 
     def test_bash_multiline_truncated(self):
-        from bot_agent import _format_tool_progress
+        from bot_agent import _format_progress
 
         long_cmd = "a" * 100 + "\nsecond line"
-        result = _format_tool_progress({"name": "Bash", "input": {"command": long_cmd}})
+        result = _format_progress({"type": "tool_use", "name": "Bash", "input": {"command": long_cmd}})
         assert result.startswith("$ ")
         assert len(result) <= 82  # "$ " + 80 chars
 
     def test_glob_tool(self):
-        from bot_agent import _format_tool_progress
+        from bot_agent import _format_progress
 
-        result = _format_tool_progress({"name": "Glob", "input": {"pattern": "**/*.py"}})
+        result = _format_progress({"type": "tool_use", "name": "Glob", "input": {"pattern": "**/*.py"}})
         assert result == "Finding **/*.py"
 
     def test_grep_tool(self):
-        from bot_agent import _format_tool_progress
+        from bot_agent import _format_progress
 
-        result = _format_tool_progress({"name": "Grep", "input": {"pattern": "TODO"}})
+        result = _format_progress({"type": "tool_use", "name": "Grep", "input": {"pattern": "TODO"}})
         assert result == "Searching: TODO"
 
     def test_task_tool(self):
-        from bot_agent import _format_tool_progress
+        from bot_agent import _format_progress
 
-        result = _format_tool_progress({"name": "Task", "input": {"description": "explore code"}})
+        result = _format_progress({"type": "tool_use", "name": "Task", "input": {"description": "explore code"}})
         assert result == "Subagent: explore code"
 
     def test_unknown_tool_fallback(self):
-        from bot_agent import _format_tool_progress
+        from bot_agent import _format_progress
 
-        result = _format_tool_progress({"name": "web_fetch", "input": {}})
+        result = _format_progress({"type": "tool_use", "name": "web_fetch", "input": {}})
         assert result == "Web Fetch"
 
     def test_empty_name(self):
-        from bot_agent import _format_tool_progress
+        from bot_agent import _format_progress
 
-        result = _format_tool_progress({"name": "", "input": {}})
+        result = _format_progress({"type": "tool_use", "name": "", "input": {}})
         assert result is None
 
     def test_empty_input(self):
-        from bot_agent import _format_tool_progress
+        from bot_agent import _format_progress
 
-        result = _format_tool_progress({"name": "Read", "input": {}})
+        result = _format_progress({"type": "tool_use", "name": "Read", "input": {}})
         assert result is None
+
+    # ── Text block (reasoning) tests ──
+
+    def test_text_block_short(self):
+        from bot_agent import _format_progress
+
+        result = _format_progress({"type": "text", "text": "Looking at the auth module"})
+        assert result == "Looking at the auth module"
+
+    def test_text_block_empty(self):
+        from bot_agent import _format_progress
+
+        result = _format_progress({"type": "text", "text": ""})
+        assert result is None
+
+    def test_text_block_whitespace_only(self):
+        from bot_agent import _format_progress
+
+        result = _format_progress({"type": "text", "text": "   \n  "})
+        assert result is None
+
+    def test_text_block_truncated(self):
+        from bot_agent import MAX_REASONING_LEN, _format_progress
+
+        long_text = "x" * 400
+        result = _format_progress({"type": "text", "text": long_text})
+        assert len(result) == MAX_REASONING_LEN + 3  # +3 for "..."
+        assert result.endswith("...")
+
+    def test_text_block_exactly_at_limit(self):
+        from bot_agent import MAX_REASONING_LEN, _format_progress
+
+        text = "x" * MAX_REASONING_LEN
+        result = _format_progress({"type": "text", "text": text})
+        assert result == text  # no truncation needed
+        assert not result.endswith("...")
 
 
 class TestShortPath:
@@ -414,6 +450,66 @@ class TestAgentCommands:
             await show_version(update, ctx)
         text = update.message.reply_text.call_args[0][0]
         assert "Agent" in text
+
+
+# ── Plan / Work mode tests ────────────────────────────────────────────
+
+
+class TestPlanWorkMode:
+    async def test_plan_no_args_enables_plan_mode(self):
+        import bot_agent
+        from bot_agent import plan_command
+
+        update = _make_update(chat_id=5001)
+        update.message.text = "/plan"
+        ctx = _make_context()
+        with patch("bot_agent.is_authorized", return_value=True):
+            await plan_command(update, ctx)
+        assert 5001 in bot_agent._plan_mode
+        text = update.message.reply_text.call_args[0][0]
+        assert "plan mode on" in text.lower()
+        # Clean up
+        bot_agent._plan_mode.discard(5001)
+
+    async def test_plan_with_task_runs_cli(self):
+        from bot_agent import plan_command
+
+        update = _make_update(chat_id=5002)
+        update.message.text = "/plan implement auth"
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent._run_cli", new_callable=AsyncMock) as mock_run,
+        ):
+            await plan_command(update, ctx)
+        mock_run.assert_called_once()
+        prompt = mock_run.call_args[0][1]
+        assert "implement auth" in prompt
+
+    async def test_work_disables_plan_mode(self):
+        import bot_agent
+        from bot_agent import work_command
+
+        bot_agent._plan_mode.add(5003)
+        update = _make_update(chat_id=5003)
+        ctx = _make_context()
+        with patch("bot_agent.is_authorized", return_value=True):
+            await work_command(update, ctx)
+        assert 5003 not in bot_agent._plan_mode
+        text = update.message.reply_text.call_args[0][0]
+        assert "plan mode off" in text.lower()
+
+    async def test_work_when_not_in_plan_mode(self):
+        import bot_agent
+        from bot_agent import work_command
+
+        bot_agent._plan_mode.discard(5004)
+        update = _make_update(chat_id=5004)
+        ctx = _make_context()
+        with patch("bot_agent.is_authorized", return_value=True):
+            await work_command(update, ctx)
+        text = update.message.reply_text.call_args[0][0]
+        assert "already" in text.lower()
 
 
 # ── keep_typing tests ─────────────────────────────────────────────────
