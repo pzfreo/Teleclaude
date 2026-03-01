@@ -32,8 +32,9 @@ Full-power filesystem access via Claude Code CLI subprocess.
 - **Entry point:** `main()` → same Application pattern as API bot
 - **AI call:** `ClaudeCodeManager.run()` launches `claude` CLI with `--output-format stream-json`
 - **Streaming:** Reads JSON events from CLI stdout line-by-line. Calls `on_progress` callback for tool_use events. Accumulates result text.
-- **Sessions:** Maintains CLI session IDs per chat for conversation continuity. `/new` clears the session.
+- **Sessions:** Maintains CLI session IDs per chat for conversation continuity. `/new` clears the session and checks for CLI updates.
 - **Workspace:** Each repo gets a local clone under `workspaces/{owner}/{repo}/`
+- **Auto-updates:** `/new` and `/update` commands automatically check for and install Claude CLI updates via `npm update -g @anthropic-ai/claude-code`, enabling new model support (e.g., Sonnet 4.6) without container rebuilds.
 
 ### Shared modules
 
@@ -41,7 +42,7 @@ Full-power filesystem access via Claude Code CLI subprocess.
 |--------|---------|-------------------|
 | `persistence.py` | SQLite CRUD for conversations, repos, todos, audit log | `init_db()`, `save_conversation()`, `audit_log()` |
 | `shared.py` | Telegram helpers, auth, logging | `send_long_message()`, `is_authorized()`, `RingBufferHandler` |
-| `claude_code.py` | CLI wrapper, workspace/session management | `ClaudeCodeManager` |
+| `claude_code.py` | CLI wrapper, workspace/session management, auto-updates | `ClaudeCodeManager`, `update_claude_cli()`, `get_claude_cli_version()` |
 | `webhooks.py` | GitHub webhook receiver (aiohttp) | `create_webhook_app()`, `start_webhook_server()` |
 
 ### Tool modules

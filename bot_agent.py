@@ -25,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-from claude_code import ClaudeCodeManager
+from claude_code import ClaudeCodeManager, get_claude_cli_version, update_claude_cli
 from persistence import (
     audit_log,
     clear_conversation,
@@ -70,7 +70,7 @@ DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
 
 AVAILABLE_MODELS = {
     "opus": "claude-opus-4-6",
-    "sonnet": "claude-sonnet-4-5-20250929",
+    "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
 
@@ -284,7 +284,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/plan <task> - Plan a specific task\n"
         "/work - Exit plan mode\n"
         "/stop - Stop current work (keeps session)\n"
-        "/new - Start a fresh CLI session\n"
+        "/new - Start a fresh CLI session (auto-updates Claude CLI)\n"
+        "/update - Update Claude CLI to latest version\n"
         "/model - Show or switch model (opus/sonnet/haiku)\n"
         "/logs [min] - Download recent logs\n"
         "/version - Show bot version\n"
@@ -412,6 +413,23 @@ async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Nothing running.")
 
 
+async def update_cli(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Update Claude CLI to latest version."""
+    if not is_authorized(update.effective_user.id):
+        return
+
+    await update.message.reply_text("Checking for Claude CLI updates...")
+
+    success, msg = await update_claude_cli()
+    if success:
+        await update.message.reply_text(f"✅ Claude CLI {msg}")
+    else:
+        # Show current version even if update failed
+        version = await get_claude_cli_version()
+        status = f"Current version: {version}\n" if version else ""
+        await update.message.reply_text(f"{status}ℹ️ {msg}")
+
+
 async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
@@ -439,7 +457,22 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         parts.append(f"Repo: {label}")
     else:
         parts.append("No repo set.")
-    await update.message.reply_text(" ".join(parts), parse_mode="Markdown")
+
+    # Check for Claude CLI updates
+    await update.message.reply_text(" ".join(parts) + "\n\nChecking for Claude CLI updates...", parse_mode="Markdown")
+
+    success, msg = await update_claude_cli()
+    if success:
+        await update.message.reply_text(f"✅ Claude CLI {msg}")
+    else:
+        # Don't show error if it's just permissions (likely already latest)
+        if "permission" not in msg.lower():
+            await update.message.reply_text(f"ℹ️ {msg}")
+        else:
+            # Just show current version
+            version = await get_claude_cli_version()
+            if version:
+                await update.message.reply_text(f"Claude CLI version: {version}")
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -784,6 +817,7 @@ def main() -> None:
     app.add_handler(CommandHandler("branch", set_branch))
     app.add_handler(CommandHandler("stop", stop_work))
     app.add_handler(CommandHandler("new", new_conversation))
+    app.add_handler(CommandHandler("update", update_cli))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("version", show_version))

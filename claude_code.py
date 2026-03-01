@@ -12,6 +12,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 GIT_TIMEOUT = 120  # 2 minutes for git operations
+NPM_UPDATE_TIMEOUT = 180  # 3 minutes for npm update
 
 
 def _get_cli_timeout() -> int:
@@ -21,6 +22,93 @@ def _get_cli_timeout() -> int:
         return max(60, int(raw))
     except ValueError:
         return 600
+
+
+async def update_claude_cli() -> tuple[bool, str]:
+    """Update Claude CLI to latest version via npm.
+
+    Returns:
+        (success: bool, message: str) - success flag and status message
+    """
+    npm_path = shutil.which("npm")
+    if not npm_path:
+        return False, "npm not found"
+
+    logger.info("Checking for Claude CLI updates...")
+
+    try:
+        # Run npm update -g @anthropic-ai/claude-code
+        proc = await asyncio.create_subprocess_exec(
+            npm_path,
+            "update",
+            "-g",
+            "@anthropic-ai/claude-code",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=NPM_UPDATE_TIMEOUT)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False, "npm update timed out"
+
+        if proc.returncode != 0:
+            err_msg = stderr.decode().strip() or stdout.decode().strip()
+            # EACCES means permission denied — might be already latest or need sudo
+            if "EACCES" in err_msg or "permission denied" in err_msg.lower():
+                logger.warning("npm update failed (permissions): %s", err_msg)
+                return False, "Permission denied (may already be latest)"
+            logger.warning("npm update failed: %s", err_msg)
+            return False, f"Update failed: {err_msg[:100]}"
+
+        # Get current version
+        version = await get_claude_cli_version()
+        logger.info("Claude CLI updated successfully to %s", version or "unknown")
+        return True, f"Updated to {version}" if version else "Updated successfully"
+
+    except Exception as e:
+        logger.error("Failed to update Claude CLI: %s", e)
+        return False, str(e)
+
+
+async def get_claude_cli_version() -> str | None:
+    """Get the installed Claude CLI version.
+
+    Returns:
+        Version string (e.g., "0.5.2") or None if unavailable
+    """
+    cli_path = shutil.which("claude")
+    if not cli_path:
+        return None
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            cli_path,
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return None
+
+        if proc.returncode == 0:
+            version = stdout.decode().strip()
+            # Output is typically "@anthropic-ai/claude-code/0.5.2" or just "0.5.2"
+            if "/" in version:
+                version = version.split("/")[-1]
+            return version
+
+    except Exception as e:
+        logger.warning("Failed to get Claude CLI version: %s", e)
+
+    return None
 
 
 class ClaudeCodeManager:
