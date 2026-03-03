@@ -415,6 +415,7 @@ class TestAgentCommands:
             patch("bot_agent.get_active_branch", return_value=None),
             patch("bot_agent.claude_code_mgr") as mock_mgr,
             patch("bot_agent.save_session_id") as mock_save_session,
+            patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
         ):
             mock_mgr.new_session = MagicMock()
             mock_mgr.abort = AsyncMock(return_value=False)
@@ -422,8 +423,8 @@ class TestAgentCommands:
         mock_mgr.new_session.assert_called_once_with(3320)
         mock_mgr.abort.assert_called_once_with(3320)
         mock_save_session.assert_called_once_with(3320, None)
-        text = update.message.reply_text.call_args[0][0]
-        assert "cleared" in text.lower()
+        first_reply = update.message.reply_text.call_args_list[0][0][0]
+        assert "cleared" in first_reply.lower()
 
     async def test_show_model_no_args(self):
         from bot_agent import show_model
