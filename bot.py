@@ -1453,8 +1453,9 @@ async def _ask_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Get the selected text from the button
     selected_text = query.data  # fallback
-    if query.message and query.message.reply_markup:
-        rows = query.message.reply_markup.inline_keyboard
+    msg = query.message
+    if msg and hasattr(msg, "reply_markup") and msg.reply_markup:
+        rows = msg.reply_markup.inline_keyboard
         if 0 <= option_index < len(rows) and rows[option_index]:
             selected_text = rows[option_index][0].text
 
