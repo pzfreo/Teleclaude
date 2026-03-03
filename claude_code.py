@@ -92,7 +92,7 @@ async def get_claude_cli_version() -> str | None:
         )
 
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
         except TimeoutError:
             proc.kill()
             await proc.wait()

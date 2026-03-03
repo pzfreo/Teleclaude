@@ -427,7 +427,7 @@ async def update_cli(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         # Show current version even if update failed
         version = await get_claude_cli_version()
         status = f"Current version: {version}\n" if version else ""
-        await update.message.reply_text(f"{status}ℹ️ {msg}")
+        await update.message.reply_text(f"{status}Info: {msg}")
 
 
 async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -467,7 +467,7 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         # Don't show error if it's just permissions (likely already latest)
         if "permission" not in msg.lower():
-            await update.message.reply_text(f"ℹ️ {msg}")
+            await update.message.reply_text(f"Info: {msg}")
         else:
             # Just show current version
             version = await get_claude_cli_version()
