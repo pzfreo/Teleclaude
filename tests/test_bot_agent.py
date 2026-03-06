@@ -4,109 +4,108 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 
 class TestFormatProgress:
-    """Test _format_progress() formatting for both text and tool_use blocks."""
+    """Test _format_tool_progress() formatting for both text and tool_use blocks."""
 
     def test_read_tool(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "tool_use", "name": "Read", "input": {"file_path": "/app/src/main.py"}})
+        result = _format_tool_progress({"type": "tool_use", "name": "Read", "input": {"file_path": "/app/src/main.py"}})
         assert result == "Reading app/src/main.py"
 
     def test_write_tool(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "tool_use", "name": "Write", "input": {"file_path": "/app/src/main.py"}})
+        result = _format_tool_progress({"type": "tool_use", "name": "Write", "input": {"file_path": "/app/src/main.py"}})
         assert result == "Writing app/src/main.py"
 
     def test_edit_tool(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "tool_use", "name": "Edit", "input": {"file_path": "/a/b/c.py"}})
+        result = _format_tool_progress({"type": "tool_use", "name": "Edit", "input": {"file_path": "/a/b/c.py"}})
         assert result == "Editing a/b/c.py"
 
     def test_bash_tool(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "tool_use", "name": "Bash", "input": {"command": "npm test"}})
+        result = _format_tool_progress({"type": "tool_use", "name": "Bash", "input": {"command": "npm test"}})
         assert result == "$ npm test"
 
     def test_bash_multiline_truncated(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
         long_cmd = "a" * 100 + "\nsecond line"
-        result = _format_progress({"type": "tool_use", "name": "Bash", "input": {"command": long_cmd}})
-        assert result.startswith("$ ")
-        assert len(result) <= 82  # "$ " + 80 chars
+        result = _format_tool_progress({"type": "tool_use", "name": "Bash", "input": {"command": long_cmd}})
+        assert result == f"$ {long_cmd}"
 
     def test_glob_tool(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "tool_use", "name": "Glob", "input": {"pattern": "**/*.py"}})
+        result = _format_tool_progress({"type": "tool_use", "name": "Glob", "input": {"pattern": "**/*.py"}})
         assert result == "Finding **/*.py"
 
     def test_grep_tool(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "tool_use", "name": "Grep", "input": {"pattern": "TODO"}})
+        result = _format_tool_progress({"type": "tool_use", "name": "Grep", "input": {"pattern": "TODO"}})
         assert result == "Searching: TODO"
 
     def test_task_tool(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "tool_use", "name": "Task", "input": {"description": "explore code"}})
+        result = _format_tool_progress({"type": "tool_use", "name": "Task", "input": {"description": "explore code"}})
         assert result == "Subagent: explore code"
 
     def test_unknown_tool_fallback(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "tool_use", "name": "web_fetch", "input": {}})
+        result = _format_tool_progress({"type": "tool_use", "name": "web_fetch", "input": {}})
         assert result == "Web Fetch"
 
     def test_empty_name(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "tool_use", "name": "", "input": {}})
+        result = _format_tool_progress({"type": "tool_use", "name": "", "input": {}})
         assert result is None
 
     def test_empty_input(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "tool_use", "name": "Read", "input": {}})
+        result = _format_tool_progress({"type": "tool_use", "name": "Read", "input": {}})
         assert result is None
 
     # ── Text block (reasoning) tests ──
 
     def test_text_block_short(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "text", "text": "Looking at the auth module"})
+        result = _format_tool_progress({"type": "text", "text": "Looking at the auth module"})
         assert result == "Looking at the auth module"
 
     def test_text_block_empty(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "text", "text": ""})
+        result = _format_tool_progress({"type": "text", "text": ""})
         assert result is None
 
     def test_text_block_whitespace_only(self):
-        from bot_agent import _format_progress
+        from bot_agent import _format_tool_progress
 
-        result = _format_progress({"type": "text", "text": "   \n  "})
+        result = _format_tool_progress({"type": "text", "text": "   \n  "})
         assert result is None
 
     def test_text_block_truncated(self):
-        from bot_agent import MAX_REASONING_LEN, _format_progress
+        from bot_agent import MAX_REASONING_LEN, _format_tool_progress
 
         long_text = "x" * 400
-        result = _format_progress({"type": "text", "text": long_text})
+        result = _format_tool_progress({"type": "text", "text": long_text})
         assert len(result) == MAX_REASONING_LEN + 3  # +3 for "..."
         assert result.endswith("...")
 
     def test_text_block_exactly_at_limit(self):
-        from bot_agent import MAX_REASONING_LEN, _format_progress
+        from bot_agent import MAX_REASONING_LEN, _format_tool_progress
 
         text = "x" * MAX_REASONING_LEN
-        result = _format_progress({"type": "text", "text": text})
+        result = _format_tool_progress({"type": "text", "text": text})
         assert result == text  # no truncation needed
         assert not result.endswith("...")
 
