@@ -195,10 +195,14 @@ def _format_tool_progress(block: dict) -> str | None:
         if turns is not None:
             parts.append(f"{turns} turns")
         usage = block.get("usage") or {}
-        input_tok = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
-        if input_tok:
-            pct = input_tok / 200_000 * 100
-            parts.append(f"ctx {pct:.0f}% ({input_tok:,} tok)")
+        total_tok = (
+            usage.get("input_tokens", 0)
+            + usage.get("output_tokens", 0)
+            + usage.get("cache_read_input_tokens", 0)
+            + usage.get("cache_creation_input_tokens", 0)
+        )
+        if total_tok:
+            parts.append(f"{total_tok:,} tok")
         return " · ".join(parts) if parts else None
 
     if synthetic == "system_event":
