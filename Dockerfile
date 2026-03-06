@@ -21,13 +21,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Claude Code CLI globally
 RUN npm install -g @anthropic-ai/claude-code
 
+# Install agent-browser (Vercel) + its MCP wrapper and Playwright/Chromium.
+# Browsers are installed to /opt/playwright-browsers so the non-root user can read them.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+RUN npm install -g agent-browser agent-browser-mcp \
+    && npx --yes playwright install --with-deps chromium \
+    && chmod -R a+rx /opt/playwright-browsers
+
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # Create non-root user (claude CLI refuses --dangerously-skip-permissions as root)
-# Give them a proper home for pip/npm caches and local installs
+# Give them a proper home for pip/npm caches and local installs.
+# ~/.claude/ is volume-mounted; we symlink ~/.claude.json into that directory so
+# the Claude Code MCP configuration also survives container rebuilds.
 RUN useradd -m -s /bin/bash teleclaude \
-    && mkdir -p /home/teleclaude/.local/bin \
+    && mkdir -p /home/teleclaude/.local/bin /home/teleclaude/.claude \
+    && ln -s /home/teleclaude/.claude/claude.json /home/teleclaude/.claude.json \
     && chown -R teleclaude:teleclaude /home/teleclaude
 
 # App directory

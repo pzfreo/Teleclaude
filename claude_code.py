@@ -389,6 +389,9 @@ class ClaudeCodeManager:
         """
         result_text = ""
         session_id = None
+        last_assistant_text = ""  # full text from the last assistant message
+        pending_system_events: list[dict] = []  # compaction/system events to emit after loop
+        result_stats: dict = {}  # cost/turns/usage from result event
 
         async for raw_line in proc.stdout:
             line = raw_line.decode("utf-8", errors="replace").strip()
@@ -403,21 +406,35 @@ class ClaudeCodeManager:
             event_type = event.get("type")
 
             if event_type == "assistant":
-                # Report tool_use and text blocks for progress display
                 message = event.get("message", {})
                 content = message.get("content", [])
                 if isinstance(content, list):
+                    texts = []
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") in ("tool_use", "text"):
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "text":
+                            texts.append(block.get("text", ""))
+                        elif block.get("type") == "tool_use":
                             if on_progress:
                                 try:
                                     await on_progress(block)
                                 except Exception:
                                     pass
+                    if texts:
+                        last_assistant_text = "\n".join(t for t in texts if t)
 
             elif event_type == "result":
                 result_text = event.get("result", "")
                 session_id = event.get("session_id")
+                for key in ("cost_usd", "num_turns", "usage"):
+                    if key in event:
+                        result_stats[key] = event[key]
+
+            elif event_type == "system":
+                subtype = event.get("subtype", "")
+                if subtype:
+                    pending_system_events.append({"_type": "system_event", "subtype": subtype})
 
         # Wait for process to finish
         await proc.wait()
@@ -430,5 +447,23 @@ class ClaudeCodeManager:
                 stderr = await proc.stderr.read()
                 err_msg = stderr.decode("utf-8", errors="replace").strip()
                 result_text = f"(Claude Code exited with code {proc.returncode}: {err_msg})"
+
+        # The result event's text can be truncated by the CLI. If we captured
+        # longer text directly from the assistant message stream, prefer that.
+        if last_assistant_text and len(last_assistant_text) > len(result_text):
+            result_text = last_assistant_text
+
+        # Emit deferred system events and stats after the main stream
+        if on_progress:
+            for sys_event in pending_system_events:
+                try:
+                    await on_progress(sys_event)
+                except Exception:
+                    pass
+            if result_stats:
+                try:
+                    await on_progress({"_type": "stats", **result_stats})
+                except Exception:
+                    pass
 
         return result_text, session_id

@@ -126,6 +126,7 @@ active_branches: dict[int, str] = {}
 chat_models: dict[int, str] = {}
 _plan_mode: set[int] = set()  # chat IDs with plan mode enabled
 _chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
+_chat_generation: dict[int, int] = collections.defaultdict(int)
 
 _MIME_TO_EXT = {
     "image/jpeg": ".jpg",
@@ -178,11 +179,35 @@ def set_active_branch(chat_id: int, branch: str | None) -> None:
 MAX_REASONING_LEN = 250
 
 
-def _format_progress(block: dict) -> str | None:
-    """Format a content block (text or tool_use) into a short, readable progress line."""
-    block_type = block.get("type")
+def _format_tool_progress(block: dict) -> str | None:
+    """Format a progress block into a readable line.
 
-    # Reasoning text blocks
+    Handles tool_use blocks, text (reasoning) blocks, and synthetic _type events (stats, system_event).
+    """
+    synthetic = block.get("_type")
+
+    if synthetic == "stats":
+        parts = []
+        cost = block.get("cost_usd")
+        if cost is not None:
+            parts.append(f"${cost:.4f}")
+        turns = block.get("num_turns")
+        if turns is not None:
+            parts.append(f"{turns} turns")
+        usage = block.get("usage") or {}
+        input_tok = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+        if input_tok:
+            pct = input_tok / 200_000 * 100
+            parts.append(f"ctx {pct:.0f}% ({input_tok:,} tok)")
+        return " · ".join(parts) if parts else None
+
+    if synthetic == "system_event":
+        subtype = block.get("subtype", "").lower()
+        if "compact" in subtype:
+            return "Context compacted"
+        return None
+
+    block_type = block.get("type")
     if block_type == "text":
         text = block.get("text", "").strip()
         if not text:
@@ -192,6 +217,7 @@ def _format_progress(block: dict) -> str | None:
         return text
 
     # Tool use blocks
+
     name = block.get("name", "")
     inp = block.get("input", {})
 
@@ -206,15 +232,13 @@ def _format_progress(block: dict) -> str | None:
         return f"Editing {_short_path(path)}" if path else None
     if name == "Bash":
         cmd = inp.get("command", "")
-        # Show first 80 chars of command
-        short = cmd.split("\n")[0][:80]
-        return f"$ {short}" if short else None
+        return f"$ {cmd}" if cmd else None
     if name == "Glob":
         pattern = inp.get("pattern", "")
         return f"Finding {pattern}" if pattern else None
     if name == "Grep":
         pattern = inp.get("pattern", "")
-        return f"Searching: {pattern[:60]}" if pattern else None
+        return f"Searching: {pattern}" if pattern else None
     if name == "Task":
         desc = inp.get("description", "")
         return f"Subagent: {desc}" if desc else None
@@ -406,6 +430,7 @@ async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
+    _chat_generation[chat_id] += 1  # invalidate all queued coroutines
     was_running = await claude_code_mgr.abort(chat_id)
     if was_running:
         await update.message.reply_text("Stopped.")
@@ -547,12 +572,15 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Task: {task}"
     )
     lock = _chat_locks[chat_id]
+    gen = _chat_generation[chat_id]
     if lock.locked():
         try:
             await update.message.reply_text("Queued — finishing current request first.")
         except TelegramError:
             pass
     async with lock:
+        if _chat_generation[chat_id] != gen:
+            return  # /stop was called while we were queued
         await _run_cli(chat_id, prompt, update, context)
 
 
@@ -645,12 +673,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     audit_log("agent_message", chat_id=chat_id, user_id=user_id, detail=text_preview)
 
     lock = _chat_locks[chat_id]
+    gen = _chat_generation[chat_id]
     if lock.locked():
         try:
             await update.message.reply_text("Queued — finishing current request first.")
         except TelegramError:
             pass
     async with lock:
+        if _chat_generation[chat_id] != gen:
+            return  # /stop was called while we were queued
         await _run_cli(chat_id, prompt, update, context)
 
 
@@ -680,22 +711,22 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
 
     async def on_progress(block: dict):
         nonlocal tool_count, last_progress_time
+        # Stats and system events bypass the counter and throttle
+        if block.get("_type"):
+            line = _format_tool_progress(block)
+            if line:
+                await send_long_message(chat_id, line, bot)
+            return
+        tool_count += 1
         now = time.time()
         # Throttle: skip if too soon after last message
         if now - last_progress_time < MIN_PROGRESS_GAP:
             return
-        line = _format_progress(block)
+        line = _format_tool_progress(block)
         if not line:
             return
         last_progress_time = now
-        # Number tool actions but not reasoning text
-        if block.get("type") == "tool_use":
-            tool_count += 1
-            line = f"[{tool_count}] {line}"
-        try:
-            await bot.send_message(chat_id=chat_id, text=line)
-        except TelegramError:
-            pass
+        await send_long_message(chat_id, f"[{tool_count}] {line}", bot)
 
     async def on_timeout(elapsed_seconds: int) -> bool:
         """Called when CLI timeout fires. Notifies user and continues."""

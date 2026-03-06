@@ -70,12 +70,29 @@ MAX_TELEGRAM_LENGTH = 4096
 
 
 async def send_long_message(chat_id: int, text: str, bot) -> None:
-    """Send a message, splitting if it exceeds Telegram's limit."""
+    """Send a message, splitting at line boundaries to respect Telegram's 4096-char limit."""
     if not text:
         return
-    for i in range(0, len(text), MAX_TELEGRAM_LENGTH):
+    chunks: list[str] = []
+    current_parts: list[str] = []
+    current_len = 0
+    for line in text.splitlines(keepends=True):
+        if current_len + len(line) > MAX_TELEGRAM_LENGTH:
+            if current_parts:
+                chunks.append("".join(current_parts))
+                current_parts = []
+                current_len = 0
+            # Single line longer than the limit — hard split it
+            while len(line) > MAX_TELEGRAM_LENGTH:
+                chunks.append(line[:MAX_TELEGRAM_LENGTH])
+                line = line[MAX_TELEGRAM_LENGTH:]
+        current_parts.append(line)
+        current_len += len(line)
+    if current_parts:
+        chunks.append("".join(current_parts))
+    for chunk in chunks:
         try:
-            await bot.send_message(chat_id=chat_id, text=text[i : i + MAX_TELEGRAM_LENGTH])
+            await bot.send_message(chat_id=chat_id, text=chunk)
         except TelegramError as e:
             logger.warning("Failed to send message chunk to %d: %s", chat_id, e)
 
