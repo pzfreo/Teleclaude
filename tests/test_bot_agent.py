@@ -15,7 +15,9 @@ class TestFormatProgress:
     def test_write_tool(self):
         from bot_agent import _format_tool_progress
 
-        result = _format_tool_progress({"type": "tool_use", "name": "Write", "input": {"file_path": "/app/src/main.py"}})
+        result = _format_tool_progress(
+            {"type": "tool_use", "name": "Write", "input": {"file_path": "/app/src/main.py"}}
+        )
         assert result == "Writing app/src/main.py"
 
     def test_edit_tool(self):
