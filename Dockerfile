@@ -18,7 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code CLI globally
+# Install Claude Code CLI into user-writable npm prefix so the non-root
+# teleclaude user can self-update at runtime via /new and /update.
+ENV NPM_CONFIG_PREFIX=/home/teleclaude/.npm-global
 RUN npm install -g @anthropic-ai/claude-code
 
 # Install agent-browser (Vercel) + its MCP wrapper and Playwright/Chromium.
@@ -38,7 +40,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN useradd -m -s /bin/bash teleclaude \
     && mkdir -p /home/teleclaude/.local/bin /home/teleclaude/.claude \
     && ln -s /home/teleclaude/.claude/claude.json /home/teleclaude/.claude.json \
-    && chown -R teleclaude:teleclaude /home/teleclaude
+    && chown -R teleclaude:teleclaude /home/teleclaude /home/teleclaude/.npm-global
 
 # App directory
 WORKDIR /app
@@ -54,6 +56,6 @@ COPY *.py VERSION ./
 RUN mkdir -p /app/data /app/workspaces && chown -R teleclaude:teleclaude /app
 
 USER teleclaude
-ENV PATH="/app/.venv/bin:/home/teleclaude/.local/bin:${PATH}"
+ENV PATH="/app/.venv/bin:/home/teleclaude/.npm-global/bin:/home/teleclaude/.local/bin:${PATH}"
 
 CMD ["python", "bot.py"]
