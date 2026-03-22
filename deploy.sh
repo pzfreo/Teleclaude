@@ -17,7 +17,7 @@ set -euo pipefail
 #   - .env file in this directory
 
 DROPLET_NAME="teleclaude"
-DROPLET_SIZE="s-1vcpu-2gb"
+DROPLET_SIZE="s-2vcpu-4gb"
 DROPLET_IMAGE="ubuntu-24-04-x64"
 DROPLET_REGION="sfo3"
 REMOTE_DIR="/opt/teleclaude"
