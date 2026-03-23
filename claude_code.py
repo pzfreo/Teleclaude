@@ -415,6 +415,11 @@ class ClaudeCodeManager:
                             continue
                         if block.get("type") == "text":
                             texts.append(block.get("text", ""))
+                            if on_progress:
+                                try:
+                                    await on_progress(block)
+                                except Exception:
+                                    pass
                         elif block.get("type") == "tool_use":
                             if on_progress:
                                 try:

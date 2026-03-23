@@ -176,7 +176,6 @@ def set_active_branch(chat_id: int, branch: str | None) -> None:
 # ── Helpers ───────────────────────────────────────────────────────────
 
 
-MAX_REASONING_LEN = 250
 
 
 def _format_tool_progress(block: dict) -> str | None:
@@ -216,8 +215,6 @@ def _format_tool_progress(block: dict) -> str | None:
         text = block.get("text", "").strip()
         if not text:
             return None
-        if len(text) > MAX_REASONING_LEN:
-            text = text[:MAX_REASONING_LEN] + "..."
         return text
 
     # Tool use blocks
@@ -715,8 +712,8 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
 
     async def on_progress(block: dict):
         nonlocal tool_count, last_progress_time
-        # Stats and system events bypass the counter and throttle
-        if block.get("_type"):
+        # Stats, system events, and reasoning text bypass the counter and throttle
+        if block.get("_type") or block.get("type") == "text":
             line = _format_tool_progress(block)
             if line:
                 await send_long_message(chat_id, line, bot)

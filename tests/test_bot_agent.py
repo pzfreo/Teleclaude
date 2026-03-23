@@ -95,21 +95,12 @@ class TestFormatProgress:
         result = _format_tool_progress({"type": "text", "text": "   \n  "})
         assert result is None
 
-    def test_text_block_truncated(self):
-        from bot_agent import MAX_REASONING_LEN, _format_tool_progress
+    def test_text_block_not_truncated(self):
+        from bot_agent import _format_tool_progress
 
         long_text = "x" * 400
         result = _format_tool_progress({"type": "text", "text": long_text})
-        assert len(result) == MAX_REASONING_LEN + 3  # +3 for "..."
-        assert result.endswith("...")
-
-    def test_text_block_exactly_at_limit(self):
-        from bot_agent import MAX_REASONING_LEN, _format_tool_progress
-
-        text = "x" * MAX_REASONING_LEN
-        result = _format_tool_progress({"type": "text", "text": text})
-        assert result == text  # no truncation needed
-        assert not result.endswith("...")
+        assert result == long_text
 
 
 class TestShortPath:
