@@ -377,6 +377,8 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     active_repos[chat_id] = repo
     save_active_repo(chat_id, repo)
     set_active_branch(chat_id, None)
+    claude_code_mgr.new_session(chat_id)
+    save_session_id(chat_id, None)
     msg = f"Active repo set to: {repo}\nCloning workspace..."
     await update.message.reply_text(msg)
 

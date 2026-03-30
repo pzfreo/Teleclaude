@@ -390,6 +390,7 @@ class ClaudeCodeManager:
         result_text = ""
         session_id = None
         last_assistant_text = ""  # full text from the last assistant message
+        text_was_streamed = False  # True if any text block was sent via on_progress
         pending_system_events: list[dict] = []  # compaction/system events to emit after loop
         result_stats: dict = {}  # cost/turns/usage from result event
 
@@ -418,6 +419,7 @@ class ClaudeCodeManager:
                             if on_progress:
                                 try:
                                     await on_progress(block)
+                                    text_was_streamed = True
                                 except Exception:
                                     pass
                         elif block.get("type") == "tool_use":
@@ -453,9 +455,12 @@ class ClaudeCodeManager:
                 err_msg = stderr.decode("utf-8", errors="replace").strip()
                 result_text = f"(Claude Code exited with code {proc.returncode}: {err_msg})"
 
-        # The result event's text can be truncated by the CLI. If we captured
-        # longer text directly from the assistant message stream, prefer that.
-        if last_assistant_text and len(last_assistant_text) > len(result_text):
+        # If text was already streamed via on_progress, suppress the final result
+        # to avoid repeating it. Otherwise fall back to captured assistant text
+        # if it's longer than the (sometimes truncated) result event text.
+        if text_was_streamed:
+            result_text = ""
+        elif last_assistant_text and len(last_assistant_text) > len(result_text):
             result_text = last_assistant_text
 
         # Emit deferred system events and stats after the main stream
