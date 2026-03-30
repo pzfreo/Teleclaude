@@ -176,8 +176,6 @@ def set_active_branch(chat_id: int, branch: str | None) -> None:
 # ── Helpers ───────────────────────────────────────────────────────────
 
 
-
-
 def _format_tool_progress(block: dict) -> str | None:
     """Format a progress block into a readable line.
 
