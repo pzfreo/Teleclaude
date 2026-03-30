@@ -393,6 +393,12 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(_clone_notify())
 
 
+async def repo_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /1 through /5 as shortcuts for /repo 1 through /repo 5."""
+    context.args = [update.effective_message.text.lstrip("/").split()[0]]
+    await set_repo(update, context)
+
+
 async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
@@ -857,6 +863,7 @@ def main() -> None:
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(CommandHandler("work", work_command))
+    app.add_handler(CommandHandler([str(i) for i in range(1, 6)], repo_shortcut))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(
         MessageHandler(
