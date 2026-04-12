@@ -120,6 +120,7 @@ class ClaudeCodeManager:
         self.cli_path = cli_path or os.getenv("CLAUDE_CLI_PATH") or shutil.which("claude")
         self._sessions: dict[int, str] = {}  # chat_id → session_id
         self._running_procs: dict[int, asyncio.subprocess.Process] = {}  # chat_id → active proc
+        self._proc_stdins: dict[int, asyncio.StreamWriter] = {}  # chat_id → stdin writer
 
     @property
     def available(self) -> bool:
@@ -226,12 +227,41 @@ class ClaudeCodeManager:
 
     async def abort(self, chat_id: int) -> bool:
         """Kill the running CLI subprocess for a chat. Returns True if a process was killed."""
+        self._proc_stdins.pop(chat_id, None)
         proc = self._running_procs.pop(chat_id, None)
         if proc and proc.returncode is None:
             proc.kill()
             await proc.wait()
             return True
         return False
+
+    def has_running_proc(self, chat_id: int) -> bool:
+        """Check if a CLI subprocess is currently running for a chat."""
+        proc = self._running_procs.get(chat_id)
+        return proc is not None and proc.returncode is None
+
+    async def send_followup(self, chat_id: int, text: str) -> bool:
+        """Send a follow-up message to a running CLI process via stdin.
+
+        Returns True if the message was sent, False if no process is running.
+        """
+        stdin = self._proc_stdins.get(chat_id)
+        if not stdin or stdin.is_closing():
+            return False
+        if not self.has_running_proc(chat_id):
+            self._proc_stdins.pop(chat_id, None)
+            return False
+
+        msg = json.dumps({"type": "user", "message": {"role": "user", "content": text}})
+        try:
+            stdin.write((msg + "\n").encode("utf-8"))
+            await stdin.drain()
+            logger.info("Sent follow-up to chat %d: %s", chat_id, text[:80])
+            return True
+        except Exception as e:
+            logger.warning("Failed to send follow-up to chat %d: %s", chat_id, e)
+            self._proc_stdins.pop(chat_id, None)
+            return False
 
     # ── CLI invocation ───────────────────────────────────────────────
 
@@ -277,7 +307,16 @@ class ClaudeCodeManager:
 
         # Build CLI command
         assert self.cli_path is not None, "Claude CLI not found — install it or set CLAUDE_CLI_PATH"
-        cmd = [self.cli_path, "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
+        cmd = [
+            self.cli_path,
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+        ]
 
         if model:
             cmd.extend(["--model", model])
@@ -305,20 +344,26 @@ class ClaudeCodeManager:
             ]
         )
 
-        cmd.append(prompt)
-
         logger.info("Claude Code: running in %s (session=%s)", repo_dir, session_id or "new")
 
         # Launch subprocess (large limit: CLI emits big JSON lines for tool results)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(repo_dir),
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=10 * 1024 * 1024,  # 10 MB line buffer
         )
 
+        # Send initial prompt via stdin (NDJSON protocol)
+        initial_msg = json.dumps({"type": "user", "message": {"role": "user", "content": prompt}})
+        assert proc.stdin is not None, "stdin pipe not available"
+        proc.stdin.write((initial_msg + "\n").encode("utf-8"))
+        await proc.stdin.drain()
+
         self._running_procs[chat_id] = proc
+        self._proc_stdins[chat_id] = proc.stdin
         result_text = ""
         returned_session_id = None
         cli_timeout = _get_cli_timeout()
@@ -371,6 +416,7 @@ class ClaudeCodeManager:
             result_text = f"(Claude Code error: {e})"
         finally:
             self._running_procs.pop(chat_id, None)
+            self._proc_stdins.pop(chat_id, None)
 
         # Store session ID for continuity
         if returned_session_id:
