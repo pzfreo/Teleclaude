@@ -39,8 +39,10 @@ RUN npm install -g @anthropic-ai/claude-code
 # Install agent-browser (Vercel) + its MCP wrapper and Playwright/Chromium.
 # Browsers are installed to /opt/playwright-browsers so the non-root user can read them.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
-RUN npm install -g agent-browser agent-browser-mcp \
+RUN npm install -g agent-browser agent-browser-mcp
+RUN apt-get update \
     && npx --yes playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
     && chmod -R a+rx /opt/playwright-browsers
 
 # Install uv

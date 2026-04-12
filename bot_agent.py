@@ -306,6 +306,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/plan - Toggle plan mode (read-only)\n"
         "/plan <task> - Plan a specific task\n"
         "/work - Exit plan mode\n"
+        "/btw <question> - Ask a side question without interrupting\n"
         "/stop - Stop current work (keeps session)\n"
         "/new - Start a fresh CLI session (auto-updates Claude CLI)\n"
         "/update - Update Claude CLI to latest version\n"
@@ -604,6 +605,37 @@ async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Already in work mode.")
 
 
+async def btw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /btw — send a side question to the running process."""
+    if not update.message or not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    text = update.message.text or ""
+    question = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+
+    if not question:
+        await update.message.reply_text(
+            "Usage: /btw <question>\nAsk a quick side question without interrupting the main task."
+        )
+        return
+
+    framed = f"BTW (side question — answer briefly, don't change your current task): {question}"
+
+    if claude_code_mgr.has_running_proc(chat_id):
+        sent = await claude_code_mgr.send_followup(chat_id, framed)
+        if sent:
+            await update.message.reply_text("Side question sent.")
+            return
+
+    # Nothing running — run as a one-shot
+    lock = _chat_locks[chat_id]
+    gen = _chat_generation[chat_id]
+    async with lock:
+        if _chat_generation[chat_id] != gen:
+            return
+        await _run_cli(chat_id, framed, update, context)
+
+
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not is_authorized(update.effective_user.id):
         return
@@ -678,6 +710,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id if update.effective_user else None
     text_preview = (text[:80] + "...") if len(text) > 80 else text
     audit_log("agent_message", chat_id=chat_id, user_id=user_id, detail=text_preview)
+
+    # Check for "-" prefix: send as follow-up to running process
+    is_followup = prompt.startswith("-") and len(prompt) > 1
+    if is_followup:
+        followup_text = prompt[1:].lstrip()
+        if claude_code_mgr.has_running_proc(chat_id):
+            sent = await claude_code_mgr.send_followup(chat_id, followup_text)
+            if sent:
+                await update.message.reply_text("Sent to Claude.")
+                return
+        # Nothing running — strip the dash and process as normal message
+        prompt = followup_text
 
     lock = _chat_locks[chat_id]
     gen = _chat_generation[chat_id]
@@ -812,6 +856,7 @@ async def notify_startup(app: Application) -> None:
             ("stop", "Stop current work"),
             ("logs", "View recent bot logs"),
             ("version", "Show bot version"),
+            ("btw", "Ask a side question"),
             ("help", "Show help message"),
         ]
     )
@@ -861,6 +906,7 @@ def main() -> None:
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(CommandHandler("work", work_command))
+    app.add_handler(CommandHandler("btw", btw_command))
     app.add_handler(CommandHandler([str(i) for i in range(1, 6)], repo_shortcut))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(
