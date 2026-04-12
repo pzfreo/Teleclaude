@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 
-# System deps: git, Node.js, GitHub CLI, Docker CLI, build tools for native packages
+# System deps: git, Node.js, GitHub CLI, Docker CLI (with buildx/compose), build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         curl \
@@ -9,17 +9,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         libffi-dev \
         jq \
+        gnupg \
+        openssh-client \
+        rsync \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg \
+        -o /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+        $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        > /etc/apt/sources.list.d/docker.list \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         > /etc/apt/sources.list.d/github-cli.list \
-    && curl -fsSL https://download.docker.com/linux/debian/gpg \
-        -o /usr/share/keyrings/docker-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-keyring.gpg] https://download.docker.com/linux/debian bookworm stable" \
-        > /etc/apt/sources.list.d/docker.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh docker-ce-cli docker-compose-plugin \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        nodejs \
+        docker-ce-cli \
+        docker-buildx-plugin \
+        docker-compose-plugin \
+        gh \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Claude Code CLI into user-writable npm prefix so the non-root
@@ -29,8 +38,6 @@ RUN npm install -g @anthropic-ai/claude-code
 
 # Install agent-browser (Vercel) + its MCP wrapper and Playwright/Chromium.
 # Browsers are installed to /opt/playwright-browsers so the non-root user can read them.
-# Split into two layers: npm install first, then Playwright (which pulls ~350MB of
-# browser deps via apt). Cleaning apt caches between layers avoids disk space issues.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
 RUN npm install -g agent-browser agent-browser-mcp
 RUN apt-get update \
