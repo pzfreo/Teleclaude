@@ -307,6 +307,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/plan <task> - Plan a specific task\n"
         "/work - Exit plan mode\n"
         "/btw <question> - Ask a side question without interrupting\n"
+        "- <message> - Send extra info while Claude is working\n"
         "/stop - Stop current work (keeps session)\n"
         "/new - Start a fresh CLI session (auto-updates Claude CLI)\n"
         "/update - Update Claude CLI to latest version\n"
@@ -621,19 +622,20 @@ async def btw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     framed = f"BTW (side question — answer briefly, don't change your current task): {question}"
 
-    if claude_code_mgr.has_running_proc(chat_id):
+    if claude_code_mgr.is_processing(chat_id):
         sent = await claude_code_mgr.send_followup(chat_id, framed)
         if sent:
             await update.message.reply_text("Side question sent.")
             return
+        await update.message.reply_text("Couldn't reach the running process — running as a new task.")
 
-    # Nothing running — run as a one-shot
+    # Not actively processing — run as a one-shot
     lock = _chat_locks[chat_id]
     gen = _chat_generation[chat_id]
     async with lock:
         if _chat_generation[chat_id] != gen:
             return
-        await _run_cli(chat_id, framed, update, context)
+        await _run_cli(chat_id, question, update, context)
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -715,12 +717,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     is_followup = prompt.startswith("-") and len(prompt) > 1
     if is_followup:
         followup_text = prompt[1:].lstrip()
-        if claude_code_mgr.has_running_proc(chat_id):
+        if claude_code_mgr.is_processing(chat_id):
             sent = await claude_code_mgr.send_followup(chat_id, followup_text)
             if sent:
                 await update.message.reply_text("Sent to Claude.")
                 return
-        # Nothing running — strip the dash and process as normal message
+            # Followup failed (pipe broken etc.) — fall through to process normally
+        # Not actively processing — strip the dash and process as normal message
         prompt = followup_text
 
     lock = _chat_locks[chat_id]

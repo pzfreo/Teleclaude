@@ -123,6 +123,7 @@ class ClaudeCodeManager:
         self._proc_stdins: dict[int, asyncio.StreamWriter] = {}  # chat_id → stdin writer
         self._proc_repos: dict[int, str] = {}  # chat_id → repo the process was launched for
         self._is_processing: dict[int, bool] = {}  # chat_id → True while awaiting a result
+        self._stdin_locks: dict[int, asyncio.Lock] = {}  # chat_id → lock for stdin writes
 
     @property
     def available(self) -> bool:
@@ -248,6 +249,7 @@ class ClaudeCodeManager:
         """Send a follow-up message to a running CLI process via stdin.
 
         Returns True if the message was sent, False if no process is running.
+        Uses a per-chat lock to prevent concurrent writes from interleaving.
         """
         stdin = self._proc_stdins.get(chat_id)
         if not stdin or stdin.is_closing():
@@ -256,16 +258,31 @@ class ClaudeCodeManager:
             self._proc_stdins.pop(chat_id, None)
             return False
 
-        msg = json.dumps({"type": "user", "message": {"role": "user", "content": text}})
-        try:
-            stdin.write((msg + "\n").encode("utf-8"))
-            await stdin.drain()
-            logger.info("Sent follow-up to chat %d: %s", chat_id, text[:80])
-            return True
-        except Exception as e:
-            logger.warning("Failed to send follow-up to chat %d: %s", chat_id, e)
-            self._proc_stdins.pop(chat_id, None)
-            return False
+        lock = self._stdin_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            # Re-check after acquiring lock — process may have died while waiting
+            if not self.has_running_proc(chat_id) or stdin.is_closing():
+                self._proc_stdins.pop(chat_id, None)
+                return False
+
+            msg = json.dumps({"type": "user", "message": {"role": "user", "content": text}})
+            try:
+                stdin.write((msg + "\n").encode("utf-8"))
+                await asyncio.wait_for(stdin.drain(), timeout=5.0)
+                logger.info("Sent follow-up to chat %d: %s", chat_id, text[:80])
+                return True
+            except TimeoutError:
+                logger.warning("Stdin drain timed out for chat %d — process may be hung", chat_id)
+                self._proc_stdins.pop(chat_id, None)
+                return False
+            except BrokenPipeError:
+                logger.warning("Broken pipe sending follow-up to chat %d — process died", chat_id)
+                self._proc_stdins.pop(chat_id, None)
+                return False
+            except Exception as e:
+                logger.warning("Failed to send follow-up to chat %d: %s", chat_id, e)
+                self._proc_stdins.pop(chat_id, None)
+                return False
 
     # ── CLI invocation ───────────────────────────────────────────────
 
@@ -525,8 +542,13 @@ class ClaudeCodeManager:
                 if subtype:
                     pending_system_events.append({"_type": "system_event", "subtype": subtype})
 
-        # If stdout closed without a result event, the process died
+        # If stdout closed without a result event, the process died — clean up stdin
         if not got_result:
+            # Find and clean up the stdin reference for the dead process
+            for cid, p in list(self._running_procs.items()):
+                if p is proc:
+                    self._proc_stdins.pop(cid, None)
+                    break
             await proc.wait()
             if proc.returncode != 0 and not result_text:
                 if proc.returncode == -9:
