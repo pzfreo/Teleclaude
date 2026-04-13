@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+import zoneinfo
 from typing import Any
 
 import anthropic
@@ -534,6 +535,52 @@ MAX_TOOL_ROUNDS = 15
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — reject Telegram file downloads above this
 TYPING_INTERVAL = 4  # seconds between typing indicator refreshes
 PROGRESS_INTERVAL = 15  # seconds before sending a progress message
+BACKGROUND_MODEL = "claude-haiku-4-5-20251001"
+BACKGROUND_MAX_ROUNDS = 5
+
+
+def _get_user_tz() -> datetime.tzinfo:
+    """Return the configured user timezone, falling back to UTC."""
+    try:
+        return zoneinfo.ZoneInfo(USER_TIMEZONE)
+    except Exception:
+        return datetime.UTC
+
+
+def _build_tool_list(*, interactive: bool = False, include_email: bool = True) -> list[dict[str, Any]]:
+    """Build the tool list based on available integrations.
+
+    interactive=True adds internal tools (todo, ask_user, schedule, pulse) and MCP tools.
+    include_email=False excludes email tools (used for read-only background checks).
+    """
+    tools: list[dict[str, Any]] = []
+    if interactive:
+        tools.extend([TODO_TOOL, ASK_USER_TOOL, SCHEDULE_CHECK_TOOL, MANAGE_PULSE_TOOL])
+    if gh_client:
+        tools.extend(GITHUB_TOOLS)
+    if web_client:
+        tools.extend(WEB_TOOLS)
+    if tasks_client:
+        tools.extend(TASKS_TOOLS)
+    if calendar_client:
+        tools.extend(CALENDAR_TOOLS)
+    if include_email and email_client:
+        tools.extend(EMAIL_TOOLS)
+    if contacts_client:
+        tools.extend(CONTACTS_TOOLS)
+    if train_client:
+        tools.extend(TRAIN_TOOLS)
+    if interactive and MCP_TOOLS:
+        tools.extend(MCP_TOOLS)
+    return tools
+
+
+def _truncate_result(text: str, max_len: int = 10000) -> str:
+    """Truncate text and append a marker if it exceeds max_len."""
+    if len(text) > max_len:
+        return text[:max_len] + "\n... (truncated)"
+    return text
+
 
 api_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 async_api_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
@@ -1330,12 +1377,7 @@ def _handle_schedule_check(tool_input: dict, chat_id: int) -> str:
     interval_minutes = max(5, min(60, int(interval_minutes)))
 
     # Parse expiry
-    try:
-        import zoneinfo
-
-        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-    except Exception:
-        tz = datetime.UTC
+    tz = _get_user_tz()
 
     now = datetime.datetime.now(tz)
     try:
@@ -1755,30 +1797,9 @@ async def _process_message(
     trim_history(chat_id)
 
     repo = get_active_repo(chat_id)
-    tools = [TODO_TOOL, ASK_USER_TOOL, SCHEDULE_CHECK_TOOL, MANAGE_PULSE_TOOL]
-    if gh_client:
-        tools.extend(GITHUB_TOOLS)
-    if web_client:
-        tools.extend(WEB_TOOLS)
-    if tasks_client:
-        tools.extend(TASKS_TOOLS)
-    if calendar_client:
-        tools.extend(CALENDAR_TOOLS)
-    if email_client:
-        tools.extend(EMAIL_TOOLS)
-    if contacts_client:
-        tools.extend(CONTACTS_TOOLS)
-    if train_client:
-        tools.extend(TRAIN_TOOLS)
-    if MCP_TOOLS:
-        tools.extend(MCP_TOOLS)
+    tools = _build_tool_list(interactive=True)
 
-    try:
-        import zoneinfo
-
-        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-    except Exception:
-        tz = datetime.UTC
+    tz = _get_user_tz()
     now = datetime.datetime.now(tz)
     date_str = now.strftime("%A, %B %d, %Y at %I:%M %p")
     # Pre-compute upcoming days so the model doesn't do bad date math
@@ -1904,8 +1925,7 @@ async def _process_message(
                         result = await mcp_manager.call_tool(block.name, block.input)
                     else:
                         result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
-                    if len(result) > 10000:
-                        result = result[:10000] + "\n... (truncated)"
+                    result = _truncate_result(result)
                     tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
 
             history.append({"role": "user", "content": tool_results})
@@ -1982,7 +2002,7 @@ def _unregister_monitor(monitor_id: int) -> None:
 
 async def _run_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Job callback for monitor checks."""
-    job_data: dict = context.job.data  # type: ignore[assignment]
+    job_data: dict = context.job.data  # type: ignore[assignment]  # job.data is always a dict in our handlers
     monitor_id = job_data["id"]
     chat_id = job_data["chat_id"]
     check_prompt = job_data["check_prompt"]
@@ -2035,26 +2055,9 @@ async def _run_monitor_prompt(bot, chat_id: int, prompt: str) -> str:
 
     Similar to run_scheduled_prompt but returns text instead of sending it.
     """
-    tools: list[dict[str, Any]] = []
-    if gh_client:
-        tools.extend(GITHUB_TOOLS)
-    if web_client:
-        tools.extend(WEB_TOOLS)
-    if tasks_client:
-        tools.extend(TASKS_TOOLS)
-    if calendar_client:
-        tools.extend(CALENDAR_TOOLS)
-    if contacts_client:
-        tools.extend(CONTACTS_TOOLS)
-    if train_client:
-        tools.extend(TRAIN_TOOLS)
+    tools = _build_tool_list(include_email=False)
 
-    try:
-        import zoneinfo
-
-        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-    except Exception:
-        tz = datetime.UTC
+    tz = _get_user_tz()
     now = datetime.datetime.now(tz)
 
     system = (
@@ -2073,7 +2076,7 @@ async def _run_monitor_prompt(bot, chat_id: int, prompt: str) -> str:
 
     for _ in range(5):  # fewer rounds than interactive — monitors should be quick
         response = await _call_anthropic(
-            model="claude-haiku-4-5-20251001",  # use Haiku for cost efficiency
+            model=BACKGROUND_MODEL,  # use Haiku for cost efficiency
             max_tokens=1024,
             system=system,
             messages=messages,
@@ -2092,8 +2095,7 @@ async def _run_monitor_prompt(bot, chat_id: int, prompt: str) -> str:
                     result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
                 except Exception as e:
                     result = f"Tool error: {e}"
-                if len(result) > 10000:
-                    result = result[:10000] + "\n... (truncated)"
+                result = _truncate_result(result)
                 tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
         messages.append({"role": "user", "content": tool_results})
 
@@ -2118,7 +2120,7 @@ async def _compare_monitor_results(
     )
 
     response = await _call_anthropic(
-        model="claude-haiku-4-5-20251001",
+        model=BACKGROUND_MODEL,
         max_tokens=256,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -2250,12 +2252,7 @@ def _handle_manage_pulse(tool_input: dict, chat_id: int) -> str:
         if config["quiet_start"] and config["quiet_end"]:
             lines.append(f"Quiet hours: {config['quiet_start']} - {config['quiet_end']}")
         if config["last_pulse_at"]:
-            try:
-                import zoneinfo
-
-                tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-            except Exception:
-                tz = datetime.UTC
+            tz = _get_user_tz()
             last_dt = datetime.datetime.fromtimestamp(config["last_pulse_at"], tz=tz)
             lines.append(f"Last pulse: {last_dt.strftime('%H:%M %b %d')}")
         lines.append(f"Goals: {len(goals)}")
@@ -2298,12 +2295,7 @@ async def _build_triage_context(chat_id: int) -> str:
     parts = []
     loop = asyncio.get_running_loop()
 
-    try:
-        import zoneinfo
-
-        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-    except Exception:
-        tz = datetime.UTC
+    tz = _get_user_tz()
     now = datetime.datetime.now(tz)
     parts.append(f"Time: {now.strftime('%A %H:%M %Z')}")
 
@@ -2374,7 +2366,7 @@ async def _run_pulse_triage(chat_id: int) -> dict:
 
     try:
         response = await _call_anthropic(
-            model="claude-haiku-4-5-20251001",
+            model=BACKGROUND_MODEL,
             max_tokens=150,
             messages=[{"role": "user", "content": triage_prompt}],
         )
@@ -2399,12 +2391,7 @@ async def _run_pulse_action(bot, chat_id: int, triage_result: dict) -> None:
     goal_text = "\n".join(f"- [{g['priority']}] {g['goal']}" for g in goals) if goals else "(no specific goals)"
     last_summary = config.get("last_pulse_summary", "") if config else ""
 
-    try:
-        import zoneinfo
-
-        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-    except Exception:
-        tz = datetime.UTC
+    tz = _get_user_tz()
     now = datetime.datetime.now(tz)
 
     action_prompt = (
@@ -2422,21 +2409,7 @@ async def _run_pulse_action(bot, chat_id: int, triage_result: dict) -> None:
     )
 
     # Build tools
-    tools: list[dict[str, Any]] = []
-    if gh_client:
-        tools.extend(GITHUB_TOOLS)
-    if web_client:
-        tools.extend(WEB_TOOLS)
-    if tasks_client:
-        tools.extend(TASKS_TOOLS)
-    if calendar_client:
-        tools.extend(CALENDAR_TOOLS)
-    if email_client:
-        tools.extend(EMAIL_TOOLS)
-    if contacts_client:
-        tools.extend(CONTACTS_TOOLS)
-    if train_client:
-        tools.extend(TRAIN_TOOLS)
+    tools = _build_tool_list()
 
     system = (
         f"Today is {now.strftime('%A, %B %d, %Y at %I:%M %p')} ({USER_TIMEZONE}).\n\n"
@@ -2479,8 +2452,7 @@ async def _run_pulse_action(bot, chat_id: int, triage_result: dict) -> None:
                     result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
                 except Exception as e:
                     result = f"Tool error: {e}"
-                if len(result) > 10000:
-                    result = result[:10000] + "\n... (truncated)"
+                result = _truncate_result(result)
                 tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
         messages.append({"role": "user", "content": tool_results})
 
@@ -2489,7 +2461,7 @@ async def _run_pulse_action(bot, chat_id: int, triage_result: dict) -> None:
 
 async def _run_pulse(context: ContextTypes.DEFAULT_TYPE) -> None:
     """JobQueue callback for pulse checks."""
-    job_data: dict = context.job.data  # type: ignore[assignment]
+    job_data: dict = context.job.data  # type: ignore[assignment]  # job.data is always a dict in our handlers
     chat_id = job_data["chat_id"]
 
     # Reload config in case it changed
@@ -2497,12 +2469,7 @@ async def _run_pulse(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not config or not config["enabled"]:
         return
 
-    try:
-        import zoneinfo
-
-        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-    except Exception:
-        tz = datetime.UTC
+    tz = _get_user_tz()
 
     # Check quiet hours
     if _is_quiet_hours(config.get("quiet_start"), config.get("quiet_end"), tz):
@@ -2593,12 +2560,7 @@ async def pulse_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if config["quiet_start"] and config["quiet_end"]:
             lines.append(f"Quiet hours: {config['quiet_start']} - {config['quiet_end']}")
         if config.get("last_pulse_at"):
-            try:
-                import zoneinfo
-
-                tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-            except Exception:
-                tz = datetime.UTC
+            tz = _get_user_tz()
             last_dt = datetime.datetime.fromtimestamp(config["last_pulse_at"], tz=tz)
             lines.append(f"Last active pulse: {last_dt.strftime('%H:%M %b %d')}")
 
@@ -2743,28 +2705,9 @@ async def pulse_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
     """Run a prompt through the tool loop with all enabled tools. No conversation history."""
-    tools: list[dict[str, Any]] = []
-    if gh_client:
-        tools.extend(GITHUB_TOOLS)
-    if web_client:
-        tools.extend(WEB_TOOLS)
-    if tasks_client:
-        tools.extend(TASKS_TOOLS)
-    if calendar_client:
-        tools.extend(CALENDAR_TOOLS)
-    if email_client:
-        tools.extend(EMAIL_TOOLS)
-    if contacts_client:
-        tools.extend(CONTACTS_TOOLS)
-    if train_client:
-        tools.extend(TRAIN_TOOLS)
+    tools = _build_tool_list()
 
-    try:
-        import zoneinfo
-
-        tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-    except Exception:
-        tz = datetime.UTC
+    tz = _get_user_tz()
     now = datetime.datetime.now(tz)
 
     system = (
@@ -2806,8 +2749,7 @@ async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
                     result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
                 except Exception as e:
                     result = f"Tool error: {e}"
-                if len(result) > 10000:
-                    result = result[:10000] + "\n... (truncated)"
+                result = _truncate_result(result)
                 tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
         messages.append({"role": "user", "content": tool_results})
 
@@ -2844,7 +2786,7 @@ async def trigger_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def _run_scheduled_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Job callback for scheduled prompts."""
-    job_data: dict = context.job.data  # type: ignore[assignment]
+    job_data: dict = context.job.data  # type: ignore[assignment]  # job.data is always a dict in our handlers
     chat_id = job_data["chat_id"]
     prompt = job_data["prompt"]
     try:
@@ -2864,12 +2806,7 @@ def _register_schedule(job_queue, schedule: dict) -> None:
     job_name = f"schedule_{schedule_id}"
 
     if interval_type == "daily":
-        try:
-            import zoneinfo
-
-            tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-        except Exception:
-            tz = datetime.UTC
+        tz = _get_user_tz()
         hour, minute = (int(x) for x in interval_value.split(":"))
         run_time = datetime.time(hour=hour, minute=minute, tzinfo=tz)
         job = job_queue.run_daily(_run_scheduled_job, time=run_time, data=job_data, name=job_name)
@@ -3017,12 +2954,7 @@ async def monitors_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not monitors:
             await update.message.reply_text("No active monitors. Ask me to watch something and I'll set one up.")
             return
-        try:
-            import zoneinfo
-
-            tz: datetime.tzinfo = zoneinfo.ZoneInfo(USER_TIMEZONE)
-        except Exception:
-            tz = datetime.UTC
+        tz = _get_user_tz()
         lines = []
         for m in monitors:
             expires_dt = datetime.datetime.fromtimestamp(m["expires_at"], tz=tz)

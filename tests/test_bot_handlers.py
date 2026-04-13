@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import anthropic
 import pytest
+from helpers import make_context as _make_context
+from helpers import make_update as _make_update
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -18,44 +20,6 @@ _STREAM_FALLBACK_ERROR = anthropic.RateLimitError(
 def _patch_stream_fallback():
     """Patch _stream_round to raise RateLimitError so tests exercise the non-streaming path."""
     return patch("bot._stream_round", new_callable=AsyncMock, side_effect=_STREAM_FALLBACK_ERROR)
-
-
-# ── Helpers to build mock Telegram Update objects ──────────────────────
-
-
-def _make_update(chat_id=1001, user_id=42, text="hello", message=None):
-    """Create a minimal mock Update for handler tests."""
-    update = MagicMock()
-    # effective_chat needs AsyncMock because keep_typing calls chat.send_action() which is awaited
-    update.effective_chat = AsyncMock()
-    update.effective_chat.id = chat_id
-    update.effective_user.id = user_id
-    if message is None:
-        msg = MagicMock()
-        msg.text = text
-        msg.caption = None
-        msg.photo = None
-        msg.sticker = None
-        msg.document = None
-        msg.voice = None
-        msg.audio = None
-        msg.video = None
-        msg.video_note = None
-        msg.location = None
-        msg.contact = None
-        msg.reply_text = AsyncMock()
-        update.message = msg
-    else:
-        update.message = message
-    return update
-
-
-def _make_context(bot=None, args=None):
-    """Create a minimal mock ContextTypes.DEFAULT_TYPE."""
-    ctx = MagicMock()
-    ctx.bot = bot or AsyncMock()
-    ctx.args = args or []
-    return ctx
 
 
 # ── _call_anthropic tests ─────────────────────────────────────────────

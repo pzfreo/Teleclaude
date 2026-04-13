@@ -339,7 +339,7 @@ def save_schedule(chat_id: int, interval_type: str, interval_value: str, prompt:
     schedule_id = cursor.lastrowid
     conn.commit()
     conn.close()
-    return schedule_id  # type: ignore[return-value]
+    return schedule_id  # type: ignore[return-value]  # lastrowid is never None after successful INSERT
 
 
 def delete_schedule(schedule_id: int, chat_id: int) -> bool:
@@ -376,7 +376,7 @@ def save_monitor(
     monitor_id = cursor.lastrowid
     conn.commit()
     conn.close()
-    return monitor_id  # type: ignore[return-value]
+    return monitor_id  # type: ignore[return-value]  # lastrowid is never None after successful INSERT
 
 
 def load_monitors(chat_id: int) -> list[dict]:
@@ -531,7 +531,7 @@ def save_pulse_goal(chat_id: int, goal: str, priority: str = "normal") -> int:
     goal_id = cursor.lastrowid
     conn.commit()
     conn.close()
-    return goal_id  # type: ignore[return-value]
+    return goal_id  # type: ignore[return-value]  # lastrowid is never None after successful INSERT
 
 
 def delete_pulse_goal(goal_id: int, chat_id: int) -> bool:

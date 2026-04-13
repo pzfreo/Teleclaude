@@ -1,31 +1,14 @@
 """Tests for the Pulse autonomous agent feature."""
 
 import datetime
+from functools import partial
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from helpers import make_context as _make_context
+from helpers import make_update
 
-# ── Helpers ──────────────────────────────────────────────────────────
-
-
-def _make_update(chat_id=1001, user_id=42, text="/pulse"):
-    update = MagicMock()
-    update.effective_chat = AsyncMock()
-    update.effective_chat.id = chat_id
-    update.effective_user.id = user_id
-    msg = MagicMock()
-    msg.text = text
-    msg.reply_text = AsyncMock()
-    update.message = msg
-    return update
-
-
-def _make_context(bot=None, args=None, job_queue=None):
-    ctx = MagicMock()
-    ctx.bot = bot or AsyncMock()
-    ctx.args = args or []
-    ctx.application.job_queue = job_queue
-    return ctx
+_make_update = partial(make_update, text="/pulse")
 
 
 # ── Persistence CRUD tests ──────────────────────────────────────────
