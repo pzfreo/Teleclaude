@@ -350,6 +350,7 @@ class ClaudeCodeManager:
         )
 
         self._running_procs[chat_id] = proc
+        assert proc.stdin is not None, "stdin pipe not available"
         self._proc_stdins[chat_id] = proc.stdin
         self._proc_repos[chat_id] = repo
         return proc
