@@ -124,6 +124,7 @@ class ClaudeCodeManager:
         self._proc_repos: dict[int, str] = {}  # chat_id → repo the process was launched for
         self._is_processing: dict[int, bool] = {}  # chat_id → True while awaiting a result
         self._stdin_locks: dict[int, asyncio.Lock] = {}  # chat_id → lock for stdin writes
+        self._text_was_streamed: dict[int, bool] = {}  # chat_id → True if last turn streamed text
 
     @property
     def available(self) -> bool:
@@ -244,6 +245,10 @@ class ClaudeCodeManager:
     def is_processing(self, chat_id: int) -> bool:
         """Check if a CLI turn is actively being processed (mid-turn, not idle between turns)."""
         return self._is_processing.get(chat_id, False)
+
+    def was_text_streamed(self, chat_id: int) -> bool:
+        """Check if the last completed turn streamed text via progress callbacks."""
+        return self._text_was_streamed.get(chat_id, False)
 
     async def send_followup(self, chat_id: int, text: str) -> bool:
         """Send a follow-up message to a running CLI process via stdin.
@@ -422,6 +427,7 @@ class ClaudeCodeManager:
         await proc.stdin.drain()
 
         self._is_processing[chat_id] = True
+        self._text_was_streamed[chat_id] = False
         result_text = ""
         returned_session_id = None
         cli_timeout = _get_cli_timeout()
@@ -432,13 +438,15 @@ class ClaudeCodeManager:
 
             while True:
                 try:
-                    result_text, returned_session_id = await asyncio.wait_for(
+                    result_text, returned_session_id, text_streamed = await asyncio.wait_for(
                         asyncio.shield(stream_task), timeout=cli_timeout
                     )
+                    self._text_was_streamed[chat_id] = text_streamed
                     break
                 except TimeoutError:
                     if stream_task.done():
-                        result_text, returned_session_id = stream_task.result()
+                        result_text, returned_session_id, text_streamed = stream_task.result()
+                        self._text_was_streamed[chat_id] = text_streamed
                         break
 
                     elapsed = int(time.monotonic() - start_time)
@@ -474,14 +482,14 @@ class ClaudeCodeManager:
 
         return result_text
 
-    async def _read_stream(self, proc, on_progress) -> tuple[str, str | None]:
+    async def _read_stream(self, proc, on_progress) -> tuple[str, str | None, bool]:
         """Read stream-json output until the result event (one turn).
 
         The process stays alive after this returns — it's waiting for the next
         stdin message. We break out of the read loop on the result event rather
         than waiting for stdout EOF / process exit.
 
-        Returns (result_text, session_id).
+        Returns (result_text, session_id, text_was_streamed).
         """
         result_text = ""
         session_id = None
@@ -558,9 +566,7 @@ class ClaudeCodeManager:
                     err_msg = stderr.decode("utf-8", errors="replace").strip()
                     result_text = f"(Claude Code exited with code {proc.returncode}: {err_msg})"
 
-        if text_was_streamed:
-            result_text = ""
-        elif last_assistant_text and len(last_assistant_text) > len(result_text):
+        if last_assistant_text and len(last_assistant_text) > len(result_text):
             result_text = last_assistant_text
 
         if on_progress:
@@ -575,4 +581,4 @@ class ClaudeCodeManager:
                 except Exception:
                     pass
 
-        return result_text, session_id
+        return result_text, session_id, text_was_streamed
