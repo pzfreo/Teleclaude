@@ -121,6 +121,8 @@ class ClaudeCodeManager:
         self._sessions: dict[int, str] = {}  # chat_id → session_id
         self._running_procs: dict[int, asyncio.subprocess.Process] = {}  # chat_id → active proc
         self._proc_stdins: dict[int, asyncio.StreamWriter] = {}  # chat_id → stdin writer
+        self._proc_repos: dict[int, str] = {}  # chat_id → repo the process was launched for
+        self._is_processing: dict[int, bool] = {}  # chat_id → True while awaiting a result
 
     @property
     def available(self) -> bool:
@@ -224,21 +226,23 @@ class ClaudeCodeManager:
     def new_session(self, chat_id: int) -> None:
         """Clear the session so the next message starts fresh."""
         self._sessions.pop(chat_id, None)
+        self._proc_repos.pop(chat_id, None)
 
     async def abort(self, chat_id: int) -> bool:
         """Kill the running CLI subprocess for a chat. Returns True if a process was killed."""
-        self._proc_stdins.pop(chat_id, None)
-        proc = self._running_procs.pop(chat_id, None)
-        if proc and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-            return True
-        return False
+        had_proc = chat_id in self._running_procs and self.has_running_proc(chat_id)
+        await self._kill_proc(chat_id)
+        self._is_processing.pop(chat_id, None)
+        return had_proc
 
     def has_running_proc(self, chat_id: int) -> bool:
         """Check if a CLI subprocess is currently running for a chat."""
         proc = self._running_procs.get(chat_id)
         return proc is not None and proc.returncode is None
+
+    def is_processing(self, chat_id: int) -> bool:
+        """Check if a CLI turn is actively being processed (mid-turn, not idle between turns)."""
+        return self._is_processing.get(chat_id, False)
 
     async def send_followup(self, chat_id: int, text: str) -> bool:
         """Send a follow-up message to a running CLI process via stdin.
@@ -265,47 +269,37 @@ class ClaudeCodeManager:
 
     # ── CLI invocation ───────────────────────────────────────────────
 
-    async def run(
+    async def _kill_proc(self, chat_id: int) -> None:
+        """Kill an existing CLI process for a chat and clean up."""
+        self._proc_stdins.pop(chat_id, None)
+        proc = self._running_procs.pop(chat_id, None)
+        self._proc_repos.pop(chat_id, None)
+        if proc and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+
+    async def _ensure_proc(
         self,
         chat_id: int,
         repo: str,
-        prompt: str,
-        branch: str | None = None,
-        model: str | None = None,
-        on_progress=None,
-        on_timeout=None,
-        permission_mode: str | None = None,
-    ) -> str:
-        """Run a prompt through Claude Code CLI and return the result.
+        model: str | None,
+        permission_mode: str | None,
+    ) -> asyncio.subprocess.Process:
+        """Return a running CLI process for this chat, launching one if needed.
 
-        Args:
-            chat_id: Telegram chat ID (for session tracking)
-            repo: GitHub repo in owner/name format
-            prompt: The user's message
-            branch: Optional branch to work on
-            model: Claude model ID
-            on_progress: async callback(block: dict) for progress updates
-            on_timeout: async callback(elapsed_seconds: int) -> bool; return True to continue
-            permission_mode: CLI permission mode override (e.g. "plan")
-
-        Returns:
-            The final text result from Claude Code
+        Reuses the existing process when the repo hasn't changed. Kills and
+        restarts if the repo changed or the process exited.
         """
+        existing = self._running_procs.get(chat_id)
+        same_repo = self._proc_repos.get(chat_id) == repo
+
+        if existing and existing.returncode is None and same_repo:
+            return existing
+
+        # Different repo or dead process — start fresh
+        await self._kill_proc(chat_id)
+
         repo_dir = self.workspace_path(repo)
-        if not (repo_dir / ".git").is_dir():
-            await self.ensure_clone(repo)
-
-        # Checkout branch if specified
-        if branch:
-            try:
-                await self.checkout_branch(repo, branch)
-            except RuntimeError as e:
-                logger.warning("Branch checkout failed: %s", e)
-
-        # Pull latest
-        await self.pull_latest(repo)
-
-        # Build CLI command
         assert self.cli_path is not None, "Claude CLI not found — install it or set CLAUDE_CLI_PATH"
         cmd = [
             self.cli_path,
@@ -324,13 +318,13 @@ class ClaudeCodeManager:
         if permission_mode:
             cmd.extend(["--permission-mode", permission_mode])
 
-        # Session handling: resume existing or start new
         session_id = self._sessions.get(chat_id)
         if session_id:
             cmd.extend(["--resume", session_id])
         else:
             new_id = str(uuid.uuid4())
             cmd.extend(["--session-id", new_id])
+            self._sessions[chat_id] = new_id
 
         cmd.extend(
             [
@@ -344,26 +338,73 @@ class ClaudeCodeManager:
             ]
         )
 
-        logger.info("Claude Code: running in %s (session=%s)", repo_dir, session_id or "new")
+        logger.info("Claude Code: launching process in %s (session=%s)", repo_dir, session_id or "new")
 
-        # Launch subprocess (large limit: CLI emits big JSON lines for tool results)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(repo_dir),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            limit=10 * 1024 * 1024,  # 10 MB line buffer
+            limit=10 * 1024 * 1024,
         )
 
-        # Send initial prompt via stdin (NDJSON protocol)
-        initial_msg = json.dumps({"type": "user", "message": {"role": "user", "content": prompt}})
+        self._running_procs[chat_id] = proc
         assert proc.stdin is not None, "stdin pipe not available"
-        proc.stdin.write((initial_msg + "\n").encode("utf-8"))
+        self._proc_stdins[chat_id] = proc.stdin
+        self._proc_repos[chat_id] = repo
+        return proc
+
+    async def run(
+        self,
+        chat_id: int,
+        repo: str,
+        prompt: str,
+        branch: str | None = None,
+        model: str | None = None,
+        on_progress=None,
+        on_timeout=None,
+        permission_mode: str | None = None,
+    ) -> str:
+        """Run a prompt through Claude Code CLI and return the result.
+
+        Reuses an existing CLI process when possible (same repo, process alive).
+        The process stays alive between turns for fast follow-ups via stdin.
+
+        Args:
+            chat_id: Telegram chat ID (for session tracking)
+            repo: GitHub repo in owner/name format
+            prompt: The user's message
+            branch: Optional branch to work on
+            model: Claude model ID
+            on_progress: async callback(block: dict) for progress updates
+            on_timeout: async callback(elapsed_seconds: int) -> bool; return True to continue
+            permission_mode: CLI permission mode override (e.g. "plan")
+
+        Returns:
+            The final text result from Claude Code
+        """
+        repo_dir = self.workspace_path(repo)
+        if not (repo_dir / ".git").is_dir():
+            await self.ensure_clone(repo)
+
+        if branch:
+            try:
+                await self.checkout_branch(repo, branch)
+            except RuntimeError as e:
+                logger.warning("Branch checkout failed: %s", e)
+
+        await self.pull_latest(repo)
+
+        proc = await self._ensure_proc(chat_id, repo, model, permission_mode)
+
+        # Send prompt via stdin
+        msg = json.dumps({"type": "user", "message": {"role": "user", "content": prompt}})
+        assert proc.stdin is not None, "stdin pipe not available"
+        proc.stdin.write((msg + "\n").encode("utf-8"))
         await proc.stdin.drain()
 
-        self._running_procs[chat_id] = proc
-        self._proc_stdins[chat_id] = proc.stdin
+        self._is_processing[chat_id] = True
         result_text = ""
         returned_session_id = None
         cli_timeout = _get_cli_timeout()
@@ -377,16 +418,14 @@ class ClaudeCodeManager:
                     result_text, returned_session_id = await asyncio.wait_for(
                         asyncio.shield(stream_task), timeout=cli_timeout
                     )
-                    break  # completed normally
+                    break
                 except TimeoutError:
-                    # Check if stream actually finished (race condition)
                     if stream_task.done():
                         result_text, returned_session_id = stream_task.result()
                         break
 
                     elapsed = int(time.monotonic() - start_time)
 
-                    # Ask the on_timeout callback whether to continue
                     should_continue = False
                     if on_timeout:
                         try:
@@ -398,47 +437,42 @@ class ClaudeCodeManager:
                         logger.info("CLI timeout extended for chat %d (elapsed %ds)", chat_id, elapsed)
                         continue
 
-                    # No callback or callback said stop
                     logger.warning("Claude Code CLI timed out after %ds for chat %d", elapsed, chat_id)
-                    proc.kill()
-                    await proc.wait()
+                    await self._kill_proc(chat_id)
                     result_text = f"(Claude Code timed out after {elapsed // 60} minutes)"
                     break
 
         except asyncio.CancelledError:
-            proc.kill()
-            await proc.wait()
+            await self._kill_proc(chat_id)
             return "(aborted)"
         except Exception as e:
             logger.error("Claude Code stream error: %s", e, exc_info=True)
-            proc.kill()
-            await proc.wait()
+            await self._kill_proc(chat_id)
             result_text = f"(Claude Code error: {e})"
         finally:
-            self._running_procs.pop(chat_id, None)
-            self._proc_stdins.pop(chat_id, None)
+            self._is_processing[chat_id] = False
 
-        # Store session ID for continuity
         if returned_session_id:
             self._sessions[chat_id] = returned_session_id
-        elif not session_id:
-            # If we started a new session but didn't get one back,
-            # store the one we generated so --resume works next time
-            self._sessions[chat_id] = new_id
 
         return result_text
 
     async def _read_stream(self, proc, on_progress) -> tuple[str, str | None]:
-        """Read stream-json output from Claude Code.
+        """Read stream-json output until the result event (one turn).
+
+        The process stays alive after this returns — it's waiting for the next
+        stdin message. We break out of the read loop on the result event rather
+        than waiting for stdout EOF / process exit.
 
         Returns (result_text, session_id).
         """
         result_text = ""
         session_id = None
-        last_assistant_text = ""  # full text from the last assistant message
-        text_was_streamed = False  # True if any text block was sent via on_progress
-        pending_system_events: list[dict] = []  # compaction/system events to emit after loop
-        result_stats: dict = {}  # cost/turns/usage from result event
+        last_assistant_text = ""
+        text_was_streamed = False
+        pending_system_events: list[dict] = []
+        result_stats: dict = {}
+        got_result = False
 
         async for raw_line in proc.stdout:
             line = raw_line.decode("utf-8", errors="replace").strip()
@@ -483,33 +517,30 @@ class ClaudeCodeManager:
                 for key in ("cost_usd", "num_turns", "usage"):
                     if key in event:
                         result_stats[key] = event[key]
+                got_result = True
+                break  # Turn complete — process stays alive for next turn
 
             elif event_type == "system":
                 subtype = event.get("subtype", "")
                 if subtype:
                     pending_system_events.append({"_type": "system_event", "subtype": subtype})
 
-        # Wait for process to finish
-        await proc.wait()
+        # If stdout closed without a result event, the process died
+        if not got_result:
+            await proc.wait()
+            if proc.returncode != 0 and not result_text:
+                if proc.returncode == -9:
+                    result_text = "(stopped)"
+                else:
+                    stderr = await proc.stderr.read()
+                    err_msg = stderr.decode("utf-8", errors="replace").strip()
+                    result_text = f"(Claude Code exited with code {proc.returncode}: {err_msg})"
 
-        if proc.returncode != 0 and not result_text:
-            if proc.returncode == -9:
-                # Killed by abort() — don't show an error
-                result_text = "(stopped)"
-            else:
-                stderr = await proc.stderr.read()
-                err_msg = stderr.decode("utf-8", errors="replace").strip()
-                result_text = f"(Claude Code exited with code {proc.returncode}: {err_msg})"
-
-        # If text was already streamed via on_progress, suppress the final result
-        # to avoid repeating it. Otherwise fall back to captured assistant text
-        # if it's longer than the (sometimes truncated) result event text.
         if text_was_streamed:
             result_text = ""
         elif last_assistant_text and len(last_assistant_text) > len(result_text):
             result_text = last_assistant_text
 
-        # Emit deferred system events and stats after the main stream
         if on_progress:
             for sys_event in pending_system_events:
                 try:
