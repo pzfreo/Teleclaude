@@ -185,6 +185,7 @@ class TestRunCli:
             patch("bot_agent.load_session_id", return_value=None),
         ):
             mock_mgr.run = AsyncMock(return_value="CLI output here")
+            mock_mgr.was_text_streamed.return_value = False
             await _run_cli(3332, "do something", update, ctx)
         mock_send.assert_called_once()
         assert "CLI output here" in mock_send.call_args[0][1]
@@ -206,9 +207,34 @@ class TestRunCli:
             patch("bot_agent.load_session_id", return_value=None),
         ):
             mock_mgr.run = AsyncMock(return_value="")
+            mock_mgr.was_text_streamed.return_value = False
             await _run_cli(3331, "do something", update, ctx)
         sent = mock_send.call_args[0][1]
         assert "no output" in sent.lower()
+
+    async def test_streamed_text_not_double_sent(self):
+        from bot_agent import _run_cli
+
+        update = _make_update(chat_id=3335)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.get_active_repo", return_value="owner/repo"),
+            patch("bot_agent.get_model", return_value="claude-test"),
+            patch("bot_agent.get_active_branch", return_value=None),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+            patch("bot_agent.save_conversation") as mock_save,
+            patch("bot_agent.load_conversation", return_value=[]),
+            patch("bot_agent.save_session_id"),
+            patch("bot_agent.load_session_id", return_value=None),
+        ):
+            mock_mgr.run = AsyncMock(return_value="Already streamed text")
+            mock_mgr.was_text_streamed.return_value = True
+            await _run_cli(3335, "do something", update, ctx)
+        mock_send.assert_not_called()
+        mock_save.assert_called_once()
+        saved_history = mock_save.call_args[0][1]
+        assert saved_history[-1]["content"] == "Already streamed text"
 
     async def test_cli_error_caught(self):
         from bot_agent import _run_cli
@@ -227,6 +253,7 @@ class TestRunCli:
             patch("bot_agent.load_session_id", return_value=None),
         ):
             mock_mgr.run = AsyncMock(side_effect=RuntimeError("CLI crashed"))
+            mock_mgr.was_text_streamed.return_value = False
             await _run_cli(3330, "do something", update, ctx)
         sent = mock_send.call_args[0][1]
         assert "error" in sent.lower()
@@ -248,6 +275,7 @@ class TestRunCli:
             patch("bot_agent.load_session_id", return_value=None),
         ):
             mock_mgr.run = AsyncMock(return_value="result")
+            mock_mgr.was_text_streamed.return_value = False
             await _run_cli(3329, "prompt", update, ctx)
         mock_save.assert_called_once()
         saved_msgs = mock_save.call_args[0][1]
@@ -274,6 +302,7 @@ class TestRunCli:
             mock_mgr.get_session_id.return_value = None
             mock_mgr._sessions = {}
             mock_mgr.run = AsyncMock(return_value="result")
+            mock_mgr.was_text_streamed.return_value = False
             await _run_cli(3328, "prompt", update, ctx)
         # Session should have been restored into _sessions
         assert mock_mgr._sessions.get(3328) == "saved-session-xyz"

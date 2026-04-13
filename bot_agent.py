@@ -821,7 +821,9 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
         if current_session:
             save_session_id(chat_id, current_session)
 
-    if not result:
+    text_was_streamed = claude_code_mgr.was_text_streamed(chat_id)
+
+    if not result and not text_was_streamed:
         result = "(no output)"
 
     # Save to conversation history for persistence
@@ -838,7 +840,12 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
     if result in ("(stopped)", "(aborted)"):
         return
 
-    await send_long_message(chat_id, result, bot)
+    # Skip sending if text was already shown via progress callbacks
+    if text_was_streamed:
+        return
+
+    if result:
+        await send_long_message(chat_id, result, bot)
 
 
 # ── Startup ───────────────────────────────────────────────────────────
