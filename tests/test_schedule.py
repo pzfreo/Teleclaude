@@ -1,28 +1,12 @@
 """Tests for user-configurable scheduled jobs."""
 
+from functools import partial
 from unittest.mock import AsyncMock, MagicMock, patch
 
-# ── Helpers ──────────────────────────────────────────────────────────
+from helpers import make_context as _make_context
+from helpers import make_update
 
-
-def _make_update(chat_id=1001, user_id=42, text="/schedule"):
-    update = MagicMock()
-    update.effective_chat = AsyncMock()
-    update.effective_chat.id = chat_id
-    update.effective_user.id = user_id
-    msg = MagicMock()
-    msg.text = text
-    msg.reply_text = AsyncMock()
-    update.message = msg
-    return update
-
-
-def _make_context(bot=None, args=None, job_queue=None):
-    ctx = MagicMock()
-    ctx.bot = bot or AsyncMock()
-    ctx.args = args or []
-    ctx.application.job_queue = job_queue
-    return ctx
+_make_update = partial(make_update, text="/schedule")
 
 
 # ── Persistence CRUD tests ──────────────────────────────────────────

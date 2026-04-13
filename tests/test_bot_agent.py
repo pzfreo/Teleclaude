@@ -149,35 +149,8 @@ class TestSaveAttachment:
 
 # ── Helpers for async tests ───────────────────────────────────────────
 
-
-def _make_update(chat_id=1001, user_id=42, text="hello"):
-    """Create a minimal mock Update for handler tests."""
-    update = MagicMock()
-    update.effective_chat.id = chat_id
-    update.effective_user.id = user_id
-    msg = MagicMock()
-    msg.text = text
-    msg.caption = None
-    msg.photo = None
-    msg.sticker = None
-    msg.document = None
-    msg.voice = None
-    msg.audio = None
-    msg.video = None
-    msg.video_note = None
-    msg.location = None
-    msg.contact = None
-    msg.reply_text = AsyncMock()
-    update.message = msg
-    return update
-
-
-def _make_context(bot=None, args=None):
-    ctx = MagicMock()
-    ctx.bot = bot or AsyncMock()
-    ctx.args = args or []
-    return ctx
-
+from helpers import make_context as _make_context
+from helpers import make_update as _make_update
 
 # ── _run_cli tests ────────────────────────────────────────────────────
 
