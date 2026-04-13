@@ -291,6 +291,31 @@ class ClaudeCodeManager:
 
     # ── CLI invocation ───────────────────────────────────────────────
 
+    @staticmethod
+    async def _drain_stdout(proc: asyncio.subprocess.Process, timeout: float = 0.1) -> int:
+        """Read and discard any pending events from stdout.
+
+        Called before sending a new prompt to ensure no stale events from a
+        previous turn (or process init) leak into the next _read_stream call.
+        Returns the number of events drained.
+        """
+        drained = 0
+        assert proc.stdout is not None
+        while True:
+            try:
+                raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
+                if not raw_line:
+                    break  # EOF
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if line:
+                    drained += 1
+                    logger.warning("Drained stale stdout event: %.300s", line)
+            except TimeoutError:
+                break
+        if drained:
+            logger.warning("Drained %d stale event(s) from stdout before new prompt", drained)
+        return drained
+
     async def _kill_proc(self, chat_id: int) -> None:
         """Kill an existing CLI process for a chat and clean up."""
         self._proc_stdins.pop(chat_id, None)
@@ -420,6 +445,9 @@ class ClaudeCodeManager:
 
         proc = await self._ensure_proc(chat_id, repo, model, permission_mode)
 
+        # Drain any stale events left in stdout from previous turn or process init
+        await self._drain_stdout(proc)
+
         # Send prompt via stdin
         msg = json.dumps({"type": "user", "message": {"role": "user", "content": prompt}})
         assert proc.stdin is not None, "stdin pipe not available"
@@ -511,6 +539,8 @@ class ClaudeCodeManager:
 
             event_type = event.get("type")
 
+            logger.debug("Stream event: type=%s", event_type)
+
             if event_type == "assistant":
                 message = event.get("message", {})
                 content = message.get("content", [])
@@ -549,6 +579,10 @@ class ClaudeCodeManager:
                 subtype = event.get("subtype", "")
                 if subtype:
                     pending_system_events.append({"_type": "system_event", "subtype": subtype})
+
+        # Drain any trailing events the CLI emits after the result
+        if got_result:
+            await self._drain_stdout(proc, timeout=0.15)
 
         # If stdout closed without a result event, the process died — clean up stdin
         if not got_result:
