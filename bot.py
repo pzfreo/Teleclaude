@@ -1166,7 +1166,7 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     save_todos(chat_id, [])
     save_plan_mode(chat_id, False)
     set_active_branch(chat_id, None)
-    await update.message.reply_text("Conversation cleared. Starting fresh.")
+    await update.message.reply_text(f"Conversation cleared. Starting fresh.\nModel: {get_model(chat_id)}")
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

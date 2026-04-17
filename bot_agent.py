@@ -493,6 +493,7 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         parts.append(f"Repo: {label}")
     else:
         parts.append("No repo set.")
+    parts.append(f"Model: `{get_model(chat_id)}`")
 
     # Check for Claude CLI updates
     await update.message.reply_text(" ".join(parts) + "\n\nChecking for Claude CLI updates...", parse_mode="Markdown")
@@ -518,8 +519,15 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     if not context.args:
         model = get_model(chat_id)
+        resolved = claude_code_mgr.get_last_model(chat_id)
+        if resolved and resolved != model:
+            line = f"Current model: {model} (resolved: {resolved})"
+        elif resolved:
+            line = f"Current model: {resolved}"
+        else:
+            line = f"Current model: {model} (resolves on first use)"
         shortcuts = ", ".join(AVAILABLE_MODELS.keys())
-        await update.message.reply_text(f"Current model: {model}\nSwitch with: /model <name>\nShortcuts: {shortcuts}")
+        await update.message.reply_text(f"{line}\nSwitch with: /model <name>\nShortcuts: {shortcuts}")
         return
 
     choice = context.args[0].lower().strip()
