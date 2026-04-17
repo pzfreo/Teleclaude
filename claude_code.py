@@ -125,6 +125,7 @@ class ClaudeCodeManager:
         self._is_processing: dict[int, bool] = {}  # chat_id → True while awaiting a result
         self._stdin_locks: dict[int, asyncio.Lock] = {}  # chat_id → lock for stdin writes
         self._text_was_streamed: dict[int, bool] = {}  # chat_id → True if last turn streamed text
+        self._last_models: dict[int, str] = {}  # chat_id → resolved model id from most recent CLI init
 
     @property
     def available(self) -> bool:
@@ -229,6 +230,7 @@ class ClaudeCodeManager:
         """Clear the session so the next message starts fresh."""
         self._sessions.pop(chat_id, None)
         self._proc_repos.pop(chat_id, None)
+        self._last_models.pop(chat_id, None)
 
     async def abort(self, chat_id: int) -> bool:
         """Kill the running CLI subprocess for a chat. Returns True if a process was killed."""
@@ -249,6 +251,10 @@ class ClaudeCodeManager:
     def was_text_streamed(self, chat_id: int) -> bool:
         """Check if the last completed turn streamed text via progress callbacks."""
         return self._text_was_streamed.get(chat_id, False)
+
+    def get_last_model(self, chat_id: int) -> str | None:
+        """Return the resolved model id from the most recent CLI init event, if any."""
+        return self._last_models.get(chat_id)
 
     async def send_followup(self, chat_id: int, text: str) -> bool:
         """Send a follow-up message to a running CLI process via stdin.
@@ -462,7 +468,7 @@ class ClaudeCodeManager:
 
         try:
             start_time = time.monotonic()
-            stream_task = asyncio.create_task(self._read_stream(proc, on_progress))
+            stream_task = asyncio.create_task(self._read_stream(proc, on_progress, chat_id))
 
             while True:
                 try:
@@ -510,7 +516,7 @@ class ClaudeCodeManager:
 
         return result_text
 
-    async def _read_stream(self, proc, on_progress) -> tuple[str, str | None, bool]:
+    async def _read_stream(self, proc, on_progress, chat_id: int) -> tuple[str, str | None, bool]:
         """Read stream-json output until the result event (one turn).
 
         The process stays alive after this returns — it's waiting for the next
@@ -577,6 +583,10 @@ class ClaudeCodeManager:
 
             elif event_type == "system":
                 subtype = event.get("subtype", "")
+                if subtype == "init":
+                    model_id = event.get("model")
+                    if isinstance(model_id, str) and model_id:
+                        self._last_models[chat_id] = model_id
                 if subtype:
                     pending_system_events.append({"_type": "system_event", "subtype": subtype})
 

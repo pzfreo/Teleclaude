@@ -303,6 +303,7 @@ class TestCommandHandlers:
             patch("bot.save_todos"),
             patch("bot.save_plan_mode"),
             patch("bot.save_active_branch"),
+            patch("bot.get_model", return_value="claude-sonnet-4-6"),
         ):
             await new_conversation(update, ctx)
         assert conversations[7777] == []

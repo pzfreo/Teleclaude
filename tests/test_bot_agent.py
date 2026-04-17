@@ -407,6 +407,7 @@ class TestAgentCommands:
             patch("bot_agent.save_active_branch"),
             patch("bot_agent.get_active_repo", return_value=None),
             patch("bot_agent.get_active_branch", return_value=None),
+            patch("bot_agent.get_model", return_value="opus"),
             patch("bot_agent.claude_code_mgr") as mock_mgr,
             patch("bot_agent.save_session_id") as mock_save_session,
             patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
@@ -427,11 +428,14 @@ class TestAgentCommands:
         ctx = _make_context(args=[])
         with (
             patch("bot_agent.is_authorized", return_value=True),
-            patch("bot_agent.get_model", return_value="claude-opus-4-6"),
+            patch("bot_agent.get_model", return_value="opus"),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
         ):
+            mock_mgr.get_last_model = MagicMock(return_value="claude-opus-4-7")
             await show_model(update, ctx)
         text = update.message.reply_text.call_args[0][0]
         assert "opus" in text.lower()
+        assert "claude-opus-4-7" in text
 
     async def test_show_version(self):
         from bot_agent import show_version
