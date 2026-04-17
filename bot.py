@@ -107,6 +107,28 @@ AVAILABLE_MODELS = {
 }
 
 
+def _resolve_latest_models(fallback: dict[str, str]) -> dict[str, str]:
+    """Query Anthropic API for the newest model per family. Returns fallback on failure."""
+    if not ANTHROPIC_API_KEY:
+        return dict(fallback)
+    try:
+        from anthropic import Anthropic
+
+        client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        models = list(client.models.list(limit=50).data)
+        result = dict(fallback)
+        for family in ("opus", "sonnet", "haiku"):
+            candidates = [m for m in models if f"claude-{family}-" in m.id]
+            if candidates:
+                candidates.sort(key=lambda m: m.created_at, reverse=True)
+                result[family] = candidates[0].id
+                logger.info("Latest %s model: %s", family, candidates[0].id)
+        return result
+    except Exception as e:
+        logger.warning("Failed to resolve latest models, using fallback: %s", e)
+        return dict(fallback)
+
+
 def _check_required_config() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN is not set. Bot cannot start.")
@@ -535,7 +557,7 @@ MAX_TOOL_ROUNDS = 15
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — reject Telegram file downloads above this
 TYPING_INTERVAL = 4  # seconds between typing indicator refreshes
 PROGRESS_INTERVAL = 15  # seconds before sending a progress message
-BACKGROUND_MODEL = "claude-haiku-4-5-20251001"
+BACKGROUND_MODEL = AVAILABLE_MODELS["haiku"]
 BACKGROUND_MAX_ROUNDS = 5
 
 
@@ -3126,6 +3148,13 @@ async def notify_startup(app: Application) -> None:
 def main() -> None:
     _check_required_config()
     init_db()
+
+    # Resolve latest models from Anthropic API (falls back to hardcoded defaults)
+    global AVAILABLE_MODELS, BACKGROUND_MODEL, DEFAULT_MODEL
+    AVAILABLE_MODELS = _resolve_latest_models(AVAILABLE_MODELS)
+    BACKGROUND_MODEL = AVAILABLE_MODELS["haiku"]
+    if not os.getenv("CLAUDE_MODEL"):
+        DEFAULT_MODEL = AVAILABLE_MODELS["sonnet"]
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
