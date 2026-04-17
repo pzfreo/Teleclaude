@@ -49,7 +49,7 @@ GITHUB_TOKEN=ghp_...
 ```
 
 Optional settings:
-- `CLAUDE_MODEL` — which Claude model to use (default: `claude-sonnet-4-20250514`)
+- `CLAUDE_MODEL` — which Claude model to use (default: `sonnet`; use `opus`/`sonnet`/`haiku` to auto-track the latest, or pin a full id)
 - `ALLOWED_USER_IDS` — comma-separated Telegram user IDs to restrict access
 
 ### 6. Run Locally
