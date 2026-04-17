@@ -230,7 +230,9 @@ class ClaudeCodeManager:
         """Clear the session so the next message starts fresh."""
         self._sessions.pop(chat_id, None)
         self._proc_repos.pop(chat_id, None)
-        self._last_models.pop(chat_id, None)
+        # _last_models intentionally preserved: the alias hasn't changed, so the
+        # CLI will resolve to the same id on the next turn. Cleared in
+        # clear_last_model() when the user switches model via /model.
 
     async def abort(self, chat_id: int) -> bool:
         """Kill the running CLI subprocess for a chat. Returns True if a process was killed."""
@@ -255,6 +257,72 @@ class ClaudeCodeManager:
     def get_last_model(self, chat_id: int) -> str | None:
         """Return the resolved model id from the most recent CLI init event, if any."""
         return self._last_models.get(chat_id)
+
+    def clear_last_model(self, chat_id: int) -> None:
+        """Drop the cached resolved model — call this when the user switches alias."""
+        self._last_models.pop(chat_id, None)
+
+    async def probe_resolved_model(self, alias: str, timeout: float = 20.0) -> str | None:
+        """Spawn a short-lived CLI process to resolve a model alias to its full id.
+
+        The CLI only reports the resolved model in the system/init event that it
+        emits after receiving a prompt on stdin. We send a trivial prompt, read
+        until the init event, grab the model, and kill the process before it
+        finishes the turn. Costs one tiny Claude request.
+
+        Returns the resolved model id, or None if the probe failed.
+        """
+        if not self.available or not self.cli_path:
+            return None
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.cli_path,
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--model",
+                alias,
+                "--print",
+                "--verbose",
+                "--dangerously-skip-permissions",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            assert proc.stdin is not None and proc.stdout is not None
+            msg = json.dumps({"type": "user", "message": {"role": "user", "content": "ok"}})
+            proc.stdin.write((msg + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+
+            async def _read_until_init() -> str | None:
+                assert proc is not None and proc.stdout is not None
+                async for raw in proc.stdout:
+                    try:
+                        event = json.loads(raw.decode("utf-8", errors="replace").strip())
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if event.get("type") == "system" and event.get("subtype") == "init":
+                        model_id = event.get("model")
+                        if isinstance(model_id, str) and model_id:
+                            return model_id
+                return None
+
+            return await asyncio.wait_for(_read_until_init(), timeout=timeout)
+        except (TimeoutError, OSError) as e:
+            logger.warning("Model probe for %s failed: %s", alias, e)
+            return None
+        finally:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except TimeoutError:
+                    pass
 
     async def send_followup(self, chat_id: int, text: str) -> bool:
         """Send a follow-up message to a running CLI process via stdin.
