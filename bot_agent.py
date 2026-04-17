@@ -520,12 +520,14 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not context.args:
         model = get_model(chat_id)
         resolved = claude_code_mgr.get_last_model(chat_id)
+        if resolved is None:
+            resolved = await claude_code_mgr.probe_resolved_model(model)
         if resolved and resolved != model:
             line = f"Current model: {model} (resolved: {resolved})"
         elif resolved:
             line = f"Current model: {resolved}"
         else:
-            line = f"Current model: {model} (resolves on first use)"
+            line = f"Current model: {model} (unable to resolve version)"
         shortcuts = ", ".join(AVAILABLE_MODELS.keys())
         await update.message.reply_text(f"{line}\nSwitch with: /model <name>\nShortcuts: {shortcuts}")
         return
@@ -541,6 +543,7 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     chat_models[chat_id] = model_id
     save_model(chat_id, model_id)
+    claude_code_mgr.clear_last_model(chat_id)
     await update.message.reply_text(f"Model switched to: {model_id}")
 
 
