@@ -126,6 +126,7 @@ class ClaudeCodeManager:
         self._stdin_locks: dict[int, asyncio.Lock] = {}  # chat_id → lock for stdin writes
         self._text_was_streamed: dict[int, bool] = {}  # chat_id → True if last turn streamed text
         self._last_models: dict[int, str] = {}  # chat_id → resolved model id from most recent CLI init
+        self._stream_tasks: dict[int, asyncio.Task] = {}  # chat_id → continuous reader task (stream mode)
 
     @property
     def available(self) -> bool:
@@ -237,6 +238,14 @@ class ClaudeCodeManager:
     async def abort(self, chat_id: int) -> bool:
         """Kill the running CLI subprocess for a chat. Returns True if a process was killed."""
         had_proc = chat_id in self._running_procs and self.has_running_proc(chat_id)
+        # Cancel stream reader first so stdout EOF doesn't race with cleanup
+        task = self._stream_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         await self._kill_proc(chat_id)
         self._is_processing.pop(chat_id, None)
         return had_proc
@@ -694,3 +703,116 @@ class ClaudeCodeManager:
                     pass
 
         return result_text, session_id, text_was_streamed
+
+    # ── Stream mode (continuous) ─────────────────────────────────────
+
+    def stream_mode_active(self, chat_id: int) -> bool:
+        """Return True if a continuous stream reader is running for this chat."""
+        task = self._stream_tasks.get(chat_id)
+        return task is not None and not task.done()
+
+    async def start_stream(
+        self,
+        chat_id: int,
+        repo: str,
+        on_event,
+        branch: str | None = None,
+        model: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
+        """Launch CC and start a continuous reader that dispatches every stdout event.
+
+        Unlike run(), this never stops on the result event — events emitted by
+        scheduled wakeups, monitors, background agents, etc., flow to on_event
+        as they arrive. Tear down with stop_stream().
+        """
+        # Tear down any prior stream for this chat
+        await self.stop_stream(chat_id, kill_proc=True)
+
+        repo_dir = self.workspace_path(repo)
+        if not (repo_dir / ".git").is_dir():
+            await self.ensure_clone(repo)
+        if branch:
+            try:
+                await self.checkout_branch(repo, branch)
+            except RuntimeError as e:
+                logger.warning("Branch checkout failed: %s", e)
+        await self.pull_latest(repo)
+
+        proc = await self._ensure_proc(chat_id, repo, model, permission_mode)
+        task = asyncio.create_task(self._stream_forever(proc, chat_id, on_event))
+        self._stream_tasks[chat_id] = task
+        logger.info("Stream mode started for chat %d (repo=%s)", chat_id, repo)
+
+    async def stop_stream(self, chat_id: int, kill_proc: bool = False) -> None:
+        """Cancel the continuous reader. Optionally kill the CLI process too."""
+        task = self._stream_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if kill_proc:
+            await self._kill_proc(chat_id)
+        self._is_processing.pop(chat_id, None)
+
+    async def feed(self, chat_id: int, text: str) -> bool:
+        """Send a user message via stdin while in stream mode.
+
+        Thin wrapper over send_followup — the stream reader handles the response.
+        Returns True if the message was written, False if the process is gone.
+        """
+        return await self.send_followup(chat_id, text)
+
+    async def _stream_forever(self, proc, chat_id: int, on_event) -> None:
+        """Read stdout indefinitely, dispatching every event to on_event.
+
+        Does not break on the result event — keeps reading so scheduled-wakeup
+        events and other async output reach the chat. Exits on stdout EOF
+        (process death) or cancellation.
+        """
+        assert proc.stdout is not None
+        try:
+            async for raw_line in proc.stdout:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event_type = event.get("type")
+
+                # Update manager-internal state from events
+                if event_type == "result":
+                    sid = event.get("session_id")
+                    if isinstance(sid, str) and sid:
+                        self._sessions[chat_id] = sid
+                elif event_type == "system" and event.get("subtype") == "init":
+                    model_id = event.get("model")
+                    if isinstance(model_id, str) and model_id:
+                        self._last_models[chat_id] = model_id
+
+                try:
+                    await on_event(event)
+                except Exception as e:
+                    logger.warning("Stream on_event handler raised for chat %d: %s", chat_id, e)
+
+            # stdout EOF — process has exited
+            logger.info("Stream reader: stdout EOF for chat %d", chat_id)
+            self._proc_stdins.pop(chat_id, None)
+            try:
+                await on_event({"_type": "stream_end", "reason": "eof"})
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            logger.info("Stream reader cancelled for chat %d", chat_id)
+            raise
+        except Exception as e:
+            logger.error("Stream reader error for chat %d: %s", chat_id, e, exc_info=True)
+            try:
+                await on_event({"_type": "stream_end", "reason": f"error: {e}"})
+            except Exception:
+                pass

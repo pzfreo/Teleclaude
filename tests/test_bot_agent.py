@@ -526,3 +526,225 @@ class TestAgentKeepTyping:
         stop.set()
         await keep_typing(chat, stop, bot)
         # Should complete quickly
+
+
+# ── Stream mode (/newstream) tests ────────────────────────────────────
+
+
+class TestNewStream:
+    """Tests for /newstream command and stream-mode routing in handle_message."""
+
+    async def test_new_stream_requires_repo(self):
+        from bot_agent import new_stream
+
+        update = _make_update(chat_id=6001)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value=None),
+        ):
+            await new_stream(update, ctx)
+        text = update.message.reply_text.call_args[0][0]
+        assert "No repo set" in text
+
+    async def test_new_stream_starts_and_sets_flag(self):
+        import bot_agent
+        from bot_agent import new_stream
+
+        update = _make_update(chat_id=6002)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value="owner/repo"),
+            patch("bot_agent.get_active_branch", return_value=None),
+            patch("bot_agent.get_model", return_value="opus"),
+            patch("bot_agent.save_session_id"),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+        ):
+            mock_mgr.stop_stream = AsyncMock()
+            mock_mgr.abort = AsyncMock(return_value=False)
+            mock_mgr.new_session = MagicMock()
+            mock_mgr.start_stream = AsyncMock()
+            bot_agent._stream_mode.discard(6002)
+            await new_stream(update, ctx)
+        assert 6002 in bot_agent._stream_mode
+        mock_mgr.start_stream.assert_awaited_once()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "Stream mode ON" in reply
+        bot_agent._stream_mode.discard(6002)  # cleanup
+
+    async def test_new_stream_failure_does_not_set_flag(self):
+        import bot_agent
+        from bot_agent import new_stream
+
+        update = _make_update(chat_id=6003)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value="owner/repo"),
+            patch("bot_agent.get_active_branch", return_value=None),
+            patch("bot_agent.get_model", return_value="opus"),
+            patch("bot_agent.save_session_id"),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+        ):
+            mock_mgr.stop_stream = AsyncMock()
+            mock_mgr.abort = AsyncMock(return_value=False)
+            mock_mgr.new_session = MagicMock()
+            mock_mgr.start_stream = AsyncMock(side_effect=RuntimeError("launch failed"))
+            bot_agent._stream_mode.discard(6003)
+            await new_stream(update, ctx)
+        assert 6003 not in bot_agent._stream_mode
+        # Error reply sent
+        replies = [c[0][0] for c in update.message.reply_text.call_args_list]
+        assert any("Failed to start stream" in r for r in replies)
+
+    async def test_handle_message_in_stream_mode_feeds_stdin(self):
+        import bot_agent
+        from bot_agent import handle_message
+
+        update = _make_update(chat_id=6004, text="hello claude")
+        ctx = _make_context()
+        bot_agent._stream_mode.add(6004)
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.audit_log"),
+                patch("bot_agent._run_cli", new_callable=AsyncMock) as mock_run_cli,
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr.is_processing = MagicMock(return_value=False)
+                mock_mgr.stream_mode_active = MagicMock(return_value=True)
+                mock_mgr.feed = AsyncMock(return_value=True)
+                await handle_message(update, ctx)
+            mock_mgr.feed.assert_awaited_once_with(6004, "hello claude")
+            mock_run_cli.assert_not_called()
+        finally:
+            bot_agent._stream_mode.discard(6004)
+
+    async def test_handle_message_stream_inactive_falls_back(self):
+        """If _stream_mode flag is set but reader task died, drop flag and run one-shot."""
+        import bot_agent
+        from bot_agent import handle_message
+
+        update = _make_update(chat_id=6005, text="hi")
+        ctx = _make_context()
+        bot_agent._stream_mode.add(6005)
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.audit_log"),
+                patch("bot_agent._run_cli", new_callable=AsyncMock) as mock_run_cli,
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr.is_processing = MagicMock(return_value=False)
+                mock_mgr.stream_mode_active = MagicMock(return_value=False)
+                mock_mgr.feed = AsyncMock()
+                await handle_message(update, ctx)
+            assert 6005 not in bot_agent._stream_mode
+            mock_mgr.feed.assert_not_called()
+            mock_run_cli.assert_called_once()
+        finally:
+            bot_agent._stream_mode.discard(6005)
+
+    async def test_stop_work_clears_stream_mode_flag(self):
+        import bot_agent
+        from bot_agent import stop_work
+
+        update = _make_update(chat_id=6006)
+        ctx = _make_context()
+        bot_agent._stream_mode.add(6006)
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr.abort = AsyncMock(return_value=False)
+                await stop_work(update, ctx)
+            assert 6006 not in bot_agent._stream_mode
+            text = update.message.reply_text.call_args[0][0]
+            assert "Stream stopped" in text
+        finally:
+            bot_agent._stream_mode.discard(6006)
+
+    async def test_new_conversation_tears_down_stream(self):
+        import bot_agent
+        from bot_agent import new_conversation
+
+        update = _make_update(chat_id=6007)
+        ctx = _make_context()
+        bot_agent._stream_mode.add(6007)
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.clear_conversation"),
+                patch("bot_agent.save_active_branch"),
+                patch("bot_agent.get_active_repo", return_value=None),
+                patch("bot_agent.get_active_branch", return_value=None),
+                patch("bot_agent.get_model", return_value="opus"),
+                patch("bot_agent.save_session_id"),
+                patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr.new_session = MagicMock()
+                mock_mgr.abort = AsyncMock(return_value=False)
+                mock_mgr.stop_stream = AsyncMock()
+                await new_conversation(update, ctx)
+            assert 6007 not in bot_agent._stream_mode
+            mock_mgr.stop_stream.assert_awaited_once_with(6007, kill_proc=True)
+        finally:
+            bot_agent._stream_mode.discard(6007)
+
+
+class TestStreamEventHandler:
+    """Test the on_event callback built by _make_stream_event_handler."""
+
+    async def test_assistant_text_posts_to_chat(self):
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send:
+            handler = _make_stream_event_handler(7001, bot)
+            await handler({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}})
+        mock_send.assert_awaited()
+        # chat_id argument passed through
+        assert mock_send.call_args[0][0] == 7001
+
+    async def test_tool_use_block_posts_formatted_line(self):
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send:
+            handler = _make_stream_event_handler(7002, bot)
+            await handler(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/x/y/z.py"}}]},
+                }
+            )
+        mock_send.assert_awaited()
+        text = mock_send.call_args[0][1]
+        assert "Reading" in text
+
+    async def test_stream_end_clears_mode(self):
+        import bot_agent
+        from bot_agent import _make_stream_event_handler
+
+        bot_agent._stream_mode.add(7003)
+        try:
+            bot = AsyncMock()
+            with patch("bot_agent.send_long_message", new_callable=AsyncMock):
+                handler = _make_stream_event_handler(7003, bot)
+                await handler({"_type": "stream_end", "reason": "eof"})
+            assert 7003 not in bot_agent._stream_mode
+        finally:
+            bot_agent._stream_mode.discard(7003)
+
+    async def test_init_system_event_ignored(self):
+        """init events should NOT post to chat (they're already used for model tracking)."""
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send:
+            handler = _make_stream_event_handler(7004, bot)
+            await handler({"type": "system", "subtype": "init", "model": "claude-opus-4-7"})
+        mock_send.assert_not_called()
