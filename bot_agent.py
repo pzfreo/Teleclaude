@@ -127,6 +127,7 @@ active_repos: dict[int, str] = {}
 active_branches: dict[int, str] = {}
 chat_models: dict[int, str] = {}
 _plan_mode: set[int] = set()  # chat IDs with plan mode enabled
+_stream_mode: set[int] = set()  # chat IDs with /new-stream continuous mode
 _chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 _chat_generation: dict[int, int] = collections.defaultdict(int)
 
@@ -312,6 +313,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- <message> - Send extra info while Claude is working\n"
         "/stop - Stop current work (keeps session)\n"
         "/new - Start a fresh CLI session (auto-updates Claude CLI)\n"
+        "/newstream - Experimental: continuous stream session (scheduled events post to chat)\n"
         "/update - Update Claude CLI to latest version\n"
         "/model - Show or switch model (opus/sonnet/haiku)\n"
         "/logs [min] - Download recent logs\n"
@@ -442,8 +444,12 @@ async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     chat_id = update.effective_chat.id
     _chat_generation[chat_id] += 1  # invalidate all queued coroutines
+    was_streaming = chat_id in _stream_mode
+    _stream_mode.discard(chat_id)
     was_running = await claude_code_mgr.abort(chat_id)
-    if was_running:
+    if was_streaming:
+        await update.message.reply_text("Stream stopped.")
+    elif was_running:
         await update.message.reply_text("Stopped.")
     else:
         await update.message.reply_text("Nothing running.")
@@ -475,7 +481,13 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     repo = get_active_repo(chat_id)
     branch = get_active_branch(chat_id)
 
-    # Kill any running CLI process immediately
+    # Tear down stream mode if active (cancels reader and kills proc)
+    was_streaming = chat_id in _stream_mode
+    if was_streaming:
+        _stream_mode.discard(chat_id)
+        await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
+
+    # Kill any running CLI process immediately (in case it wasn't a stream)
     was_running = await claude_code_mgr.abort(chat_id)
 
     clear_conversation(chat_id)
@@ -484,6 +496,8 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     save_session_id(chat_id, None)
 
     parts = ["Session cleared."]
+    if was_streaming:
+        parts.append("Stream mode ended.")
     if was_running:
         parts.append("Stopped running task.")
     if repo:
@@ -510,6 +524,108 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             version = await get_claude_cli_version()
             if version:
                 await update.message.reply_text(f"Claude CLI version: {version}")
+
+
+def _make_stream_event_handler(chat_id: int, bot):
+    """Build an on_event callback that renders CC stream-json events into Telegram."""
+
+    async def on_event(event: dict) -> None:
+        event_type = event.get("type")
+
+        if event_type == "assistant":
+            message = event.get("message", {})
+            content = message.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype in ("text", "tool_use"):
+                        line = _format_tool_progress(block)
+                        if line:
+                            try:
+                                await send_long_message(chat_id, line, bot)
+                            except TelegramError:
+                                pass
+            return
+
+        if event_type == "result":
+            stats = {k: event[k] for k in ("cost_usd", "num_turns", "usage") if k in event}
+            if stats:
+                line = _format_tool_progress({"_type": "stats", **stats})
+                if line:
+                    try:
+                        await send_long_message(chat_id, line, bot)
+                    except TelegramError:
+                        pass
+            return
+
+        if event_type == "system":
+            subtype = event.get("subtype")
+            if subtype and subtype != "init":
+                line = _format_tool_progress({"_type": "system_event", "subtype": subtype})
+                if line:
+                    try:
+                        await send_long_message(chat_id, line, bot)
+                    except TelegramError:
+                        pass
+            return
+
+        # Synthetic stream-end signal emitted by ClaudeCodeManager._stream_forever
+        if event.get("_type") == "stream_end":
+            _stream_mode.discard(chat_id)
+            try:
+                await send_long_message(chat_id, "Stream ended — send a message to start a new one.", bot)
+            except TelegramError:
+                pass
+
+    return on_event
+
+
+async def new_stream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start continuous stream mode — CC runs and posts events to chat as they arrive."""
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+
+    repo = get_active_repo(chat_id)
+    if not repo:
+        await update.message.reply_text("No repo set. Use /repo owner/name first.")
+        return
+
+    # Tear down any existing stream or running one-shot; start fresh session
+    _stream_mode.discard(chat_id)
+    await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
+    await claude_code_mgr.abort(chat_id)
+    claude_code_mgr.new_session(chat_id)
+    save_session_id(chat_id, None)
+
+    on_event = _make_stream_event_handler(chat_id, context.bot)
+    model = get_model(chat_id)
+    branch = get_active_branch(chat_id)
+
+    try:
+        await claude_code_mgr.start_stream(
+            chat_id=chat_id,
+            repo=repo,
+            on_event=on_event,
+            branch=branch,
+            model=model,
+            permission_mode="plan" if chat_id in _plan_mode else None,
+        )
+    except Exception as e:
+        logger.error("Failed to start stream: %s", e, exc_info=True)
+        await update.message.reply_text(f"Failed to start stream: {e}")
+        return
+
+    _stream_mode.add(chat_id)
+    label = f"`{repo}`" + (f" on `{branch}`" if branch else "")
+    await update.message.reply_text(
+        f"Stream mode ON — {label}\n"
+        "Messages feed into CC continuously. Scheduled events post here as they fire.\n"
+        "/new to end.",
+        parse_mode="Markdown",
+    )
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -730,7 +846,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     is_followup = prompt.startswith("-") and len(prompt) > 1
     if is_followup:
         followup_text = prompt[1:].lstrip()
-        if claude_code_mgr.is_processing(chat_id):
+        if claude_code_mgr.is_processing(chat_id) or claude_code_mgr.stream_mode_active(chat_id):
             sent = await claude_code_mgr.send_followup(chat_id, followup_text)
             if sent:
                 await update.message.reply_text("Sent to Claude.")
@@ -738,6 +854,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # Followup failed (pipe broken etc.) — fall through to process normally
         # Not actively processing — strip the dash and process as normal message
         prompt = followup_text
+
+    # Stream mode: pipe straight to CC via stdin; the continuous reader posts responses
+    if chat_id in _stream_mode:
+        if not claude_code_mgr.stream_mode_active(chat_id):
+            # Reader task died (process crashed etc.) — drop out of stream mode
+            _stream_mode.discard(chat_id)
+            await update.message.reply_text("Stream is no longer active. Falling back to one-shot.")
+        else:
+            sent = await claude_code_mgr.feed(chat_id, prompt)
+            if sent:
+                return
+            _stream_mode.discard(chat_id)
+            await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
+            await update.message.reply_text("Stream died mid-send. Falling back to one-shot.")
 
     lock = _chat_locks[chat_id]
     gen = _chat_generation[chat_id]
@@ -871,6 +1001,7 @@ async def notify_startup(app: Application) -> None:
     await app.bot.set_my_commands(
         [
             ("new", "Start a new conversation"),
+            ("newstream", "Start a continuous stream session (experimental)"),
             ("repo", "Set active GitHub repo"),
             ("branch", "Set active branch"),
             ("model", "Show or change AI model"),
@@ -923,6 +1054,7 @@ def main() -> None:
     app.add_handler(CommandHandler("branch", set_branch))
     app.add_handler(CommandHandler("stop", stop_work))
     app.add_handler(CommandHandler("new", new_conversation))
+    app.add_handler(CommandHandler("newstream", new_stream))
     app.add_handler(CommandHandler("update", update_cli))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("logs", send_logs))
