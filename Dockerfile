@@ -67,6 +67,11 @@ RUN uv sync --frozen --no-dev --no-editable
 # Copy application code
 COPY *.py VERSION ./
 
+# Agent-bot personal Claude Code guidelines. The ~/.claude dir is a volume,
+# so we stage the file outside it and copy into place at container start
+# (see docker-compose.yml teleclaude-agent entrypoint).
+COPY agent/CLAUDE.md /opt/teleclaude-agent/CLAUDE.md
+
 # Pre-create volume mount points owned by teleclaude so fresh volumes work
 RUN mkdir -p /app/data /app/workspaces && chown -R teleclaude:teleclaude /app
 

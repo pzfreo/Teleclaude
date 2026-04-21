@@ -127,6 +127,7 @@ class ClaudeCodeManager:
         self._text_was_streamed: dict[int, bool] = {}  # chat_id → True if last turn streamed text
         self._last_models: dict[int, str] = {}  # chat_id → resolved model id from most recent CLI init
         self._stream_tasks: dict[int, asyncio.Task] = {}  # chat_id → continuous reader task (stream mode)
+        self._control_request_counter: dict[int, int] = {}  # chat_id → monotonic request counter
 
     @property
     def available(self) -> bool:
@@ -370,6 +371,54 @@ class ClaudeCodeManager:
             except Exception as e:
                 logger.warning("Failed to send follow-up to chat %d: %s", chat_id, e)
                 self._proc_stdins.pop(chat_id, None)
+                return False
+
+    async def interrupt(self, chat_id: int) -> bool:
+        """Send a control_request interrupt to the running CLI process.
+
+        Unlike abort(), this does NOT kill the process. It asks CC to stop
+        the current turn while keeping the process and session alive. Uses
+        the same protocol the Claude Agent SDK uses: a JSON control_request
+        with subtype "interrupt" written to stdin.
+
+        Returns True if the request was written, False if there's no live
+        process or stdin was unavailable.
+        """
+        stdin = self._proc_stdins.get(chat_id)
+        if not stdin or stdin.is_closing():
+            return False
+        if not self.has_running_proc(chat_id):
+            self._proc_stdins.pop(chat_id, None)
+            return False
+
+        counter = self._control_request_counter.get(chat_id, 0) + 1
+        self._control_request_counter[chat_id] = counter
+        request_id = f"req_{counter}_{uuid.uuid4().hex[:8]}"
+        payload = {
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {"subtype": "interrupt"},
+        }
+
+        lock = self._stdin_locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            if not self.has_running_proc(chat_id) or stdin.is_closing():
+                self._proc_stdins.pop(chat_id, None)
+                return False
+            try:
+                stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+                await asyncio.wait_for(stdin.drain(), timeout=5.0)
+                logger.info("Sent interrupt control_request to chat %d (request_id=%s)", chat_id, request_id)
+                return True
+            except TimeoutError:
+                logger.warning("Stdin drain timed out sending interrupt to chat %d", chat_id)
+                return False
+            except BrokenPipeError:
+                logger.warning("Broken pipe sending interrupt to chat %d — process died", chat_id)
+                self._proc_stdins.pop(chat_id, None)
+                return False
+            except Exception as e:
+                logger.warning("Failed to send interrupt to chat %d: %s", chat_id, e)
                 return False
 
     # ── CLI invocation ───────────────────────────────────────────────
