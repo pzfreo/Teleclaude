@@ -311,7 +311,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/work - Exit plan mode\n"
         "/btw <question> - Ask a side question without interrupting\n"
         "- <message> - Send extra info while Claude is working\n"
-        "/stop - Stop current work (keeps session)\n"
+        "/cancel - Soft interrupt (Esc equivalent — keeps process + session)\n"
+        "/stop - Stop current work (kills CC process, keeps session)\n"
         "/new - Start a fresh CLI session (auto-updates Claude CLI)\n"
         "/newstream - Experimental: continuous stream session (scheduled events post to chat)\n"
         "/update - Update Claude CLI to latest version\n"
@@ -378,6 +379,14 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Format: /repo owner/name")
             return
 
+    # If stream mode is active, tear it down before switching repos — the
+    # running CC process has cwd pointing at the old repo and a session tied
+    # to it. We'll relaunch against the new repo after the clone finishes.
+    was_streaming = chat_id in _stream_mode
+    if was_streaming:
+        _stream_mode.discard(chat_id)
+        await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
+
     active_repos[chat_id] = repo
     save_active_repo(chat_id, repo)
     set_active_branch(chat_id, None)
@@ -393,6 +402,25 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:
             logger.error("Clone failed: %s", e)
             await update.message.reply_text(f"Clone failed: {e}")
+            return
+
+        if was_streaming:
+            on_event = _make_stream_event_handler(chat_id, context.bot)
+            try:
+                await claude_code_mgr.start_stream(
+                    chat_id=chat_id,
+                    repo=repo,
+                    on_event=on_event,
+                    branch=None,
+                    model=get_model(chat_id),
+                    permission_mode="plan" if chat_id in _plan_mode else None,
+                )
+            except Exception as e:
+                logger.error("Failed to restart stream on new repo: %s", e, exc_info=True)
+                await update.message.reply_text(f"Stream restart failed: {e}")
+                return
+            _stream_mode.add(chat_id)
+            await update.message.reply_text(f"Stream mode restarted on `{repo}`.", parse_mode="Markdown")
 
     asyncio.create_task(_clone_notify())
 
@@ -437,6 +465,29 @@ async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 msg += f" (local checkout failed: {e})"
 
     await update.message.reply_text(msg)
+
+
+async def cancel_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Softly interrupt the current turn — keeps CC process and session alive.
+
+    Equivalent to pressing Esc in interactive Claude Code. Use /stop to kill
+    the process entirely.
+    """
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+
+    if not claude_code_mgr.has_running_proc(chat_id):
+        await update.message.reply_text("Nothing running.")
+        return
+
+    sent = await claude_code_mgr.interrupt(chat_id)
+    if sent:
+        await update.message.reply_text("Interrupt sent. Session preserved — send a new message to continue.")
+    else:
+        await update.message.reply_text(
+            "Couldn't send interrupt (process may have already exited). Use /stop if it's stuck."
+        )
 
 
 async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1007,7 +1058,8 @@ async def notify_startup(app: Application) -> None:
             ("model", "Show or change AI model"),
             ("plan", "Toggle plan mode / plan a task"),
             ("work", "Exit plan mode"),
-            ("stop", "Stop current work"),
+            ("cancel", "Soft interrupt (keeps session)"),
+            ("stop", "Stop current work (kills CC process)"),
             ("logs", "View recent bot logs"),
             ("version", "Show bot version"),
             ("btw", "Ask a side question"),
@@ -1053,6 +1105,7 @@ def main() -> None:
     app.add_handler(CommandHandler("repo", set_repo))
     app.add_handler(CommandHandler("branch", set_branch))
     app.add_handler(CommandHandler("stop", stop_work))
+    app.add_handler(CommandHandler("cancel", cancel_work))
     app.add_handler(CommandHandler("new", new_conversation))
     app.add_handler(CommandHandler("newstream", new_stream))
     app.add_handler(CommandHandler("update", update_cli))

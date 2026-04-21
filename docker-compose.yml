@@ -23,6 +23,13 @@ services:
           fi
           usermod -aG "$$SOCK_GID" teleclaude
         fi
+        # Install personal CLAUDE.md into the volume-mounted ~/.claude dir.
+        # Copied unconditionally so the repo is the source of truth.
+        if [ -f /opt/teleclaude-agent/CLAUDE.md ]; then
+          install -o teleclaude -g teleclaude -m 0644 \
+            /opt/teleclaude-agent/CLAUDE.md \
+            /home/teleclaude/.claude/CLAUDE.md
+        fi
         exec runuser -u teleclaude -- python bot_agent.py
     volumes:
       - teleclaude-agent-data:/app/data

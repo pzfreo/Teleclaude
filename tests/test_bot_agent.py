@@ -748,3 +748,165 @@ class TestStreamEventHandler:
             handler = _make_stream_event_handler(7004, bot)
             await handler({"type": "system", "subtype": "init", "model": "claude-opus-4-7"})
         mock_send.assert_not_called()
+
+
+class TestCancelCommand:
+    """Tests for /cancel — soft interrupt that keeps the session alive."""
+
+    async def test_cancel_no_running_proc(self):
+        from bot_agent import cancel_work
+
+        update = _make_update(chat_id=8001)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+        ):
+            mock_mgr.has_running_proc = MagicMock(return_value=False)
+            mock_mgr.interrupt = AsyncMock()
+            await cancel_work(update, ctx)
+        mock_mgr.interrupt.assert_not_called()
+        text = update.message.reply_text.call_args[0][0]
+        assert "nothing" in text.lower()
+
+    async def test_cancel_sends_interrupt(self):
+        from bot_agent import cancel_work
+
+        update = _make_update(chat_id=8002)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+        ):
+            mock_mgr.has_running_proc = MagicMock(return_value=True)
+            mock_mgr.interrupt = AsyncMock(return_value=True)
+            await cancel_work(update, ctx)
+        mock_mgr.interrupt.assert_awaited_once_with(8002)
+        text = update.message.reply_text.call_args[0][0]
+        assert "interrupt" in text.lower()
+        assert "preserved" in text.lower()
+
+    async def test_cancel_write_failure(self):
+        from bot_agent import cancel_work
+
+        update = _make_update(chat_id=8003)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+        ):
+            mock_mgr.has_running_proc = MagicMock(return_value=True)
+            mock_mgr.interrupt = AsyncMock(return_value=False)
+            await cancel_work(update, ctx)
+        text = update.message.reply_text.call_args[0][0]
+        assert "couldn't" in text.lower() or "stop" in text.lower()
+
+    async def test_cancel_unauthorized(self):
+        from bot_agent import cancel_work
+
+        update = _make_update()
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=False),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+        ):
+            mock_mgr.interrupt = AsyncMock()
+            await cancel_work(update, ctx)
+        mock_mgr.interrupt.assert_not_called()
+
+
+class TestRepoSwitchInStreamMode:
+    """Tests for /repo switching while /newstream is active."""
+
+    async def test_repo_switch_tears_down_stream(self):
+        import bot_agent
+        from bot_agent import set_repo
+
+        update = _make_update(chat_id=9001)
+        ctx = _make_context(args=["owner/new-repo"])
+        bot_agent._stream_mode.add(9001)
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.save_active_repo"),
+                patch("bot_agent.save_session_id"),
+                patch("bot_agent.set_active_branch"),
+                patch("bot_agent.get_model", return_value="opus"),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("asyncio.create_task") as mock_create_task,
+            ):
+                mock_mgr.stop_stream = AsyncMock()
+                mock_mgr.new_session = MagicMock()
+                # capture the clone-notify coroutine so we can drive it
+                mock_create_task.side_effect = lambda coro: coro.close() or MagicMock()
+                await set_repo(update, ctx)
+            # Stream was torn down immediately (before clone starts)
+            mock_mgr.stop_stream.assert_awaited_once_with(9001, kill_proc=True)
+            assert 9001 not in bot_agent._stream_mode
+        finally:
+            bot_agent._stream_mode.discard(9001)
+
+    async def test_repo_switch_not_in_stream_mode_does_not_call_stop_stream(self):
+        import bot_agent
+        from bot_agent import set_repo
+
+        update = _make_update(chat_id=9002)
+        ctx = _make_context(args=["owner/new-repo"])
+        bot_agent._stream_mode.discard(9002)
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.save_active_repo"),
+            patch("bot_agent.save_session_id"),
+            patch("bot_agent.set_active_branch"),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+            patch("asyncio.create_task") as mock_create_task,
+        ):
+            mock_mgr.stop_stream = AsyncMock()
+            mock_mgr.new_session = MagicMock()
+            mock_create_task.side_effect = lambda coro: coro.close() or MagicMock()
+            await set_repo(update, ctx)
+        mock_mgr.stop_stream.assert_not_called()
+
+    async def test_repo_switch_restarts_stream_after_clone(self):
+        """After a successful clone in stream-mode switch, stream is relaunched."""
+        import bot_agent
+        from bot_agent import set_repo
+
+        update = _make_update(chat_id=9003)
+        ctx = _make_context(args=["owner/new-repo"])
+        bot_agent._stream_mode.add(9003)
+
+        captured_coros: list = []
+
+        def _capture(coro):
+            captured_coros.append(coro)
+            return MagicMock()
+
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.save_active_repo"),
+                patch("bot_agent.save_session_id"),
+                patch("bot_agent.set_active_branch"),
+                patch("bot_agent.get_model", return_value="opus"),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("asyncio.create_task", side_effect=_capture),
+            ):
+                mock_mgr.stop_stream = AsyncMock()
+                mock_mgr.new_session = MagicMock()
+                mock_mgr.ensure_clone = AsyncMock()
+                mock_mgr.start_stream = AsyncMock()
+                await set_repo(update, ctx)
+
+                # Drive the captured clone-notify coroutine
+                assert len(captured_coros) == 1
+                await captured_coros[0]
+
+            mock_mgr.start_stream.assert_awaited_once()
+            call_kwargs = mock_mgr.start_stream.call_args.kwargs
+            assert call_kwargs["chat_id"] == 9003
+            assert call_kwargs["repo"] == "owner/new-repo"
+            # Stream flag is re-added after successful restart
+            assert 9003 in bot_agent._stream_mode
+        finally:
+            bot_agent._stream_mode.discard(9003)

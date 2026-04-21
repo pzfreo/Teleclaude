@@ -334,3 +334,85 @@ class TestStreamMode:
             result = await mgr.feed(9009, "hello")
         assert result is True
         mock_followup.assert_awaited_once_with(9009, "hello")
+
+
+class _FakeStdin:
+    """Minimal StreamWriter stand-in that captures written bytes."""
+
+    def __init__(self):
+        self.written = b""
+        self._closing = False
+
+    def is_closing(self) -> bool:
+        return self._closing
+
+    def write(self, data: bytes) -> None:
+        self.written += data
+
+    async def drain(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self._closing = True
+
+
+class TestInterrupt:
+    """Tests for the interrupt() method — soft cancel without killing the proc."""
+
+    async def test_no_proc_returns_false(self, tmp_path):
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
+        result = await mgr.interrupt(1111)
+        assert result is False
+
+    async def test_stdin_closed_returns_false(self, tmp_path):
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
+        stdin = _FakeStdin()
+        stdin.close()
+        mgr._proc_stdins[1111] = stdin  # type: ignore[assignment]
+        result = await mgr.interrupt(1111)
+        assert result is False
+
+    async def test_writes_control_request_interrupt(self, tmp_path):
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
+        stdin = _FakeStdin()
+        proc = _FakeProc([])
+        mgr._proc_stdins[2222] = stdin  # type: ignore[assignment]
+        mgr._running_procs[2222] = proc  # type: ignore[assignment]
+
+        result = await mgr.interrupt(2222)
+        assert result is True
+        # Validate wire format — must be a control_request with subtype interrupt
+        line = stdin.written.decode().strip()
+        payload = json.loads(line)
+        assert payload["type"] == "control_request"
+        assert payload["request"]["subtype"] == "interrupt"
+        assert "request_id" in payload and payload["request_id"].startswith("req_")
+
+    async def test_does_not_kill_proc(self, tmp_path):
+        """interrupt() must NOT kill the process — that's abort()'s job."""
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
+        stdin = _FakeStdin()
+        proc = _FakeProc([])
+        mgr._proc_stdins[3333] = stdin  # type: ignore[assignment]
+        mgr._running_procs[3333] = proc  # type: ignore[assignment]
+
+        await mgr.interrupt(3333)
+        # Process stays in _running_procs — session preserved
+        assert 3333 in mgr._running_procs
+        assert 3333 in mgr._proc_stdins
+
+    async def test_broken_pipe_returns_false_and_clears_stdin(self, tmp_path):
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
+        proc = _FakeProc([])
+
+        class _BrokenStdin(_FakeStdin):
+            def write(self, data):
+                raise BrokenPipeError("dead")
+
+        stdin = _BrokenStdin()
+        mgr._proc_stdins[4444] = stdin  # type: ignore[assignment]
+        mgr._running_procs[4444] = proc  # type: ignore[assignment]
+
+        result = await mgr.interrupt(4444)
+        assert result is False
+        assert 4444 not in mgr._proc_stdins
