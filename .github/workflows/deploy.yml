@@ -54,6 +54,8 @@ jobs:
             --include='pyproject.toml' \
             --include='uv.lock' \
             --include='VERSION' \
+            --include='agent/' \
+            --include='agent/CLAUDE.md' \
             --exclude='*' \
             ./ root@${{ secrets.DROPLET_IP }}:/opt/teleclaude/
 
