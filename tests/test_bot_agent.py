@@ -982,7 +982,7 @@ class TestStreamTypingIndicator:
                 patch("bot_agent.is_authorized", return_value=True),
                 patch("bot_agent.audit_log"),
                 # Patch _dispatch_prompt so we don't need to wire up all of _run_cli
-                patch("bot_agent._dispatch_prompt", new_callable=AsyncMock) as mock_dispatch,
+                patch("bot_agent._dispatch_prompt", new_callable=AsyncMock),
             ):
                 await handle_message(update, ctx)
 
@@ -994,8 +994,6 @@ class TestStreamTypingIndicator:
             bot_agent._typing_tasks.pop(7002, None)
 
     async def test_typing_stopped_on_result_event(self):
-        import asyncio
-
         import bot_agent
         from bot_agent import _make_stream_event_handler, _start_stream_typing
 
@@ -1011,8 +1009,6 @@ class TestStreamTypingIndicator:
         assert bot_agent._typing_tasks.get(chat_id) is None
 
     async def test_typing_stopped_on_stream_end(self):
-        import asyncio
-
         import bot_agent
         from bot_agent import _make_stream_event_handler, _start_stream_typing
 
