@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "python-telegram-bot[job-queue]==21.6",
     "anthropic>=0.79.0",
-    "python-dotenv==1.0.1",
+    "python-dotenv>=1.2.2",
     "requests>=2.31.0",
     "ddgs>=7.0.0",
     "google-api-python-client>=2.100.0",
