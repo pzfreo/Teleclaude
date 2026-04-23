@@ -16,6 +16,7 @@ dependencies = [
     "openai>=1.0.0",
     "mcp>=1.0.0",
     "zeep>=4.2.0",
+    "markdown-it-py>=3.0",
 ]
 
 [project.optional-dependencies]

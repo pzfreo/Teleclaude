@@ -682,7 +682,7 @@ async def _stream_round(
     """
     from streaming import StreamingResponder
 
-    responder = StreamingResponder(bot, chat_id)
+    responder = StreamingResponder(bot, chat_id, parse_mode="HTML")
     first_text = True
 
     async with async_api_client.messages.stream(**kwargs) as stream:
@@ -1929,7 +1929,7 @@ async def _process_message(
                     # Non-streaming fallback
                     text_parts = [b.text for b in response.content if b.type == "text"]
                     reply = "\n".join(text_parts) if text_parts else "(no response)"
-                    await send_long_message(chat_id, reply, bot)
+                    await send_long_message(chat_id, reply, bot, parse_mode="HTML")
                 return
 
             # Tool use round
@@ -2065,7 +2065,7 @@ async def _run_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         update_monitor_result(monitor_id, current_result)
 
         if should_notify and alert_msg:
-            await send_long_message(chat_id, f"🔔 {summary}\n\n{alert_msg}", context.bot)
+            await send_long_message(chat_id, f"🔔 {summary}\n\n{alert_msg}", context.bot, parse_mode="HTML")
             audit_log("monitor_alert", chat_id=chat_id, detail=f"#{monitor_id}: {summary}")
 
     except Exception as e:
@@ -2458,7 +2458,7 @@ async def _run_pulse_action(bot, chat_id: int, triage_result: dict) -> None:
         if response.stop_reason != "tool_use":
             text_parts = [b.text for b in response.content if b.type == "text"]
             reply = "\n".join(text_parts) if text_parts else "(Pulse check completed with no output.)"
-            await send_long_message(chat_id, f"Pulse\n\n{reply}", bot)
+            await send_long_message(chat_id, f"Pulse\n\n{reply}", bot, parse_mode="HTML")
             # Store summary (last line or truncated reply)
             summary = reply.split("\n")[-1][:300] if reply else ""
             update_pulse_last_run(chat_id, summary)
@@ -2760,7 +2760,7 @@ async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
         if response.stop_reason != "tool_use":
             text_parts = [b.text for b in response.content if b.type == "text"]
             reply = "\n".join(text_parts) if text_parts else "(No response from scheduled prompt.)"
-            await send_long_message(chat_id, reply, bot)
+            await send_long_message(chat_id, reply, bot, parse_mode="HTML")
             return
 
         messages.append({"role": "assistant", "content": response.content})
