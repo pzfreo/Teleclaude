@@ -3,7 +3,9 @@
 import collections
 import functools
 import logging
+import re
 import time
+from html import escape
 
 from telegram.error import TelegramError
 
@@ -64,15 +66,160 @@ def require_auth(allowed_ids: set[int]):
     return decorator
 
 
+# ── Markdown → Telegram HTML ─────────────────────────────────────────
+
+
+def md_to_telegram_html(text: str) -> str:
+    """Convert Markdown to Telegram-compatible HTML.
+
+    Telegram supports: <b>, <i>, <s>, <u>, <code>, <pre>, <a href>.
+    Everything else is converted to the nearest equivalent or stripped.
+    """
+    from markdown_it import MarkdownIt
+
+    tokens = MarkdownIt().enable("table").enable("strikethrough").parse(text)
+    result = _md_render_block(tokens)
+    return re.sub(r"\n{3,}", "\n\n", result).strip()
+
+
+def _md_render_block(tokens: list) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        t = tok.type
+        if t == "inline":
+            out.append(_md_render_inline(tok.children or []))
+        elif t == "paragraph_close":
+            out.append("\n")
+        elif t == "heading_open":
+            i += 1
+            content = _md_render_inline(tokens[i].children or [])
+            i += 1  # heading_close
+            out.append(f"<b>{content}</b>\n")
+        elif t == "fence":
+            code = escape(tok.content.rstrip("\n"))
+            out.append(f"<pre><code>{code}</code></pre>\n")
+        elif t == "code_block":
+            out.append(f"<pre><code>{escape(tok.content.strip())}</code></pre>\n")
+        elif t == "list_item_open":
+            markup = (tok.info or "").strip()
+            prefix = f"{markup} " if markup else "• "
+            out.append(f"\n{prefix}")
+        elif t in ("bullet_list_close", "ordered_list_close"):
+            out.append("\n")
+        elif t == "hr":
+            out.append("\n──────────\n")
+        elif t == "table_open":
+            tbl: list = []
+            i += 1
+            depth = 1
+            while i < len(tokens) and depth > 0:
+                if tokens[i].type == "table_open":
+                    depth += 1
+                elif tokens[i].type == "table_close":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                tbl.append(tokens[i])
+                i += 1
+            out.append(_md_render_table(tbl))
+        i += 1
+    return "".join(out)
+
+
+def _md_render_inline(tokens: list) -> str:
+    out: list[str] = []
+    for tok in tokens:
+        t = tok.type
+        if t == "text":
+            out.append(escape(tok.content))
+        elif t in ("softbreak", "hardbreak"):
+            out.append("\n")
+        elif t == "code_inline":
+            out.append(f"<code>{escape(tok.content)}</code>")
+        elif t == "strong_open":
+            out.append("<b>")
+        elif t == "strong_close":
+            out.append("</b>")
+        elif t == "em_open":
+            out.append("<i>")
+        elif t == "em_close":
+            out.append("</i>")
+        elif t == "s_open":
+            out.append("<s>")
+        elif t == "s_close":
+            out.append("</s>")
+        elif t == "link_open":
+            href = dict(tok.attrs or {}).get("href", "")
+            out.append(f'<a href="{escape(href)}">')
+        elif t == "link_close":
+            out.append("</a>")
+        elif t == "image":
+            alt = "".join(escape(c.content) for c in (tok.children or []) if c.type == "text")
+            out.append(alt)
+        elif t == "html_inline":
+            pass  # skip raw HTML
+    return "".join(out)
+
+
+def _md_render_table(tokens: list) -> str:
+    """Render table tokens as an aligned-column <pre> block."""
+    rows: list[list[str]] = []
+    separator_after: set[int] = set()
+    current_row: list[str] | None = None
+    in_head = False
+
+    for tok in tokens:
+        t = tok.type
+        if t == "thead_open":
+            in_head = True
+        elif t == "thead_close":
+            in_head = False
+        elif t == "tr_open":
+            current_row = []
+        elif t == "tr_close":
+            if current_row is not None:
+                rows.append(current_row)
+                if in_head:
+                    separator_after.add(len(rows) - 1)
+                current_row = None
+        elif t == "inline" and current_row is not None:
+            cell = re.sub(r"<[^>]+>", "", _md_render_inline(tok.children or []))
+            current_row.append(cell)
+
+    if not rows:
+        return ""
+    col_count = max(len(r) for r in rows)
+    widths = [0] * col_count
+    for row in rows:
+        for j, cell in enumerate(row):
+            widths[j] = max(widths[j], len(cell))
+
+    lines: list[str] = []
+    for idx, row in enumerate(rows):
+        cells = [row[j].ljust(widths[j]) if j < len(row) else " " * widths[j] for j in range(col_count)]
+        lines.append("   ".join(cells).rstrip())
+        if idx in separator_after:
+            lines.append("─" * (sum(widths) + 3 * max(col_count - 1, 0)))
+
+    return f"<pre>{escape(chr(10).join(lines))}</pre>\n"
+
+
 # ── Telegram helpers ─────────────────────────────────────────────────
 
 MAX_TELEGRAM_LENGTH = 4096
 
 
-async def send_long_message(chat_id: int, text: str, bot) -> None:
-    """Send a message, splitting at line boundaries to respect Telegram's 4096-char limit."""
+async def send_long_message(chat_id: int, text: str, bot, *, parse_mode: str | None = None) -> None:
+    """Send a message, splitting at line boundaries to respect Telegram's 4096-char limit.
+
+    If parse_mode='HTML', text is converted from Markdown to Telegram HTML first.
+    """
     if not text:
         return
+    if parse_mode == "HTML":
+        text = md_to_telegram_html(text)
     chunks: list[str] = []
     current_parts: list[str] = []
     current_len = 0
@@ -92,7 +239,7 @@ async def send_long_message(chat_id: int, text: str, bot) -> None:
         chunks.append("".join(current_parts))
     for chunk in chunks:
         try:
-            await bot.send_message(chat_id=chat_id, text=chunk)
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode)
         except TelegramError as e:
             logger.warning("Failed to send message chunk to %d: %s", chat_id, e)
 

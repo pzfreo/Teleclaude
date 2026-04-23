@@ -622,7 +622,8 @@ def _make_stream_event_handler(chat_id: int, bot):
                         line = _format_tool_progress(block)
                         if line:
                             try:
-                                await send_long_message(chat_id, line, bot)
+                                pm = "HTML" if btype == "text" else None
+                                await send_long_message(chat_id, line, bot, parse_mode=pm)
                             except TelegramError:
                                 pass
             return
@@ -993,7 +994,8 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
         if block.get("_type") or block.get("type") == "text":
             line = _format_tool_progress(block)
             if line:
-                await send_long_message(chat_id, line, bot)
+                pm = "HTML" if block.get("type") == "text" else None
+                await send_long_message(chat_id, line, bot, parse_mode=pm)
             return
         tool_count += 1
         now = time.time()
@@ -1069,7 +1071,7 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
         return
 
     if result:
-        await send_long_message(chat_id, result, bot)
+        await send_long_message(chat_id, result, bot, parse_mode="HTML")
 
 
 # ── Startup ───────────────────────────────────────────────────────────

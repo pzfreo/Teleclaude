@@ -39,9 +39,10 @@ class StreamingResponder:
         await responder.finalize()
     """
 
-    def __init__(self, bot, chat_id: int):
+    def __init__(self, bot, chat_id: int, parse_mode: str | None = None):
         self._bot = bot
         self._chat_id = chat_id
+        self._parse_mode = parse_mode
         self._accumulated = ""
         self._committed_offset = 0  # chars committed to finalized (split) messages
         self._current_msg_id: int | None = None
@@ -74,6 +75,30 @@ class StreamingResponder:
 
         if self._dirty or not self._current_msg_id:
             await self._flush()
+
+        if self._parse_mode == "HTML" and self._current_msg_id and not self._failed:
+            await self._render_final_html()
+
+    async def _render_final_html(self) -> None:
+        """Re-edit the last message chunk as formatted HTML."""
+        from shared import md_to_telegram_html
+
+        last_chunk = self._accumulated[self._committed_offset :]
+        if not last_chunk.strip():
+            return
+        html_text = md_to_telegram_html(last_chunk)
+        try:
+            await self._bot.edit_message_text(
+                chat_id=self._chat_id,
+                message_id=self._current_msg_id,
+                text=html_text,
+                parse_mode="HTML",
+            )
+        except BadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                logger.warning("Failed HTML final render for message %d: %s", self._current_msg_id, e)
+        except TelegramError as e:
+            logger.warning("Failed HTML final render for message %d: %s", self._current_msg_id, e)
 
     async def _flush(self) -> None:
         """Push accumulated text to Telegram (send or edit)."""
