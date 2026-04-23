@@ -1039,3 +1039,105 @@ class TestStreamTypingIndicator:
         assert bot_agent._typing_tasks.get(chat_id) is None
         assert task.cancelled() or task.done()
         await asyncio.sleep(0)
+
+
+class TestFragmentBuffering:
+    """Telegram splits long pastes into consecutive MAX_TELEGRAM_LENGTH messages.
+    The bot should buffer full-length fragments and dispatch the assembled text.
+    """
+
+    def _make_update(self, chat_id: int, text: str):
+        update = MagicMock()
+        update.message = MagicMock()
+        update.message.text = text
+        update.message.caption = None
+        update.message.photo = None
+        update.message.sticker = None
+        update.message.document = None
+        update.message.voice = None
+        update.message.reply_text = MagicMock(return_value=None)
+        update.effective_user = MagicMock()
+        update.effective_user.id = 1
+        update.effective_chat = MagicMock()
+        update.effective_chat.id = chat_id
+        ctx = MagicMock()
+        ctx.bot = MagicMock()
+        return update, ctx
+
+    async def test_full_length_message_is_buffered(self):
+
+        import bot_agent
+        from bot_agent import handle_message
+
+        chat_id = 8001
+        text = "x" * 4096
+        update, ctx = self._make_update(chat_id, text)
+
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.audit_log"),
+                patch("bot_agent._dispatch_prompt", new_callable=MagicMock) as mock_dispatch,
+            ):
+                await handle_message(update, ctx)
+
+            # Should be buffered, not dispatched
+            assert bot_agent._frag_buffers.get(chat_id) == text
+            mock_dispatch.assert_not_called()
+        finally:
+            task = bot_agent._frag_tasks.pop(chat_id, None)
+            if task:
+                task.cancel()
+            bot_agent._frag_buffers.pop(chat_id, None)
+
+    async def test_short_message_flushes_buffer(self):
+        import bot_agent
+        from bot_agent import handle_message
+
+        chat_id = 8002
+        fragment = "x" * 4096
+        final = " rest of message"
+        update, ctx = self._make_update(chat_id, final)
+
+        bot_agent._frag_buffers[chat_id] = fragment
+        dispatched: list[str] = []
+
+        async def _capture(cid, prompt, u, c):
+            dispatched.append(prompt)
+
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.audit_log"),
+                patch("bot_agent._dispatch_prompt", side_effect=_capture),
+            ):
+                await handle_message(update, ctx)
+
+            assert len(dispatched) == 1
+            assert dispatched[0] == fragment + final
+            assert chat_id not in bot_agent._frag_buffers
+        finally:
+            bot_agent._frag_buffers.pop(chat_id, None)
+            t = bot_agent._frag_tasks.pop(chat_id, None)
+            if t:
+                t.cancel()
+
+    async def test_short_message_no_buffer_dispatches_directly(self):
+        from bot_agent import handle_message
+
+        chat_id = 8003
+        text = "hello"
+        update, ctx = self._make_update(chat_id, text)
+        dispatched: list[str] = []
+
+        async def _capture(cid, prompt, u, c):
+            dispatched.append(prompt)
+
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.audit_log"),
+            patch("bot_agent._dispatch_prompt", side_effect=_capture),
+        ):
+            await handle_message(update, ctx)
+
+        assert dispatched == ["hello"]

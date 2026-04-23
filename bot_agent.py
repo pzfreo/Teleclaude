@@ -131,6 +131,8 @@ _stream_mode: set[int] = set()  # chat IDs with /new-stream continuous mode
 _chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 _chat_generation: dict[int, int] = collections.defaultdict(int)
 _typing_tasks: dict[int, asyncio.Task] = {}
+_frag_buffers: dict[int, str] = {}  # chat_id -> buffered text from split pastes
+_frag_tasks: dict[int, asyncio.Task] = {}  # chat_id -> pending flush task
 
 _MIME_TO_EXT = {
     "image/jpeg": ".jpg",
@@ -923,6 +925,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text_preview = (text[:80] + "...") if len(text) > 80 else text
     audit_log("agent_message", chat_id=chat_id, user_id=user_id, detail=text_preview)
 
+    # Telegram splits pastes longer than MAX_TELEGRAM_LENGTH into consecutive full-length
+    # messages. Buffer text-only fragments and wait 1 s for a continuation before dispatching.
+    if len(text) == MAX_TELEGRAM_LENGTH and not attachment_paths:
+        _frag_buffers[chat_id] = _frag_buffers.get(chat_id, "") + text
+        if chat_id not in _frag_tasks:
+
+            async def _flush(cid=chat_id, u=update, ctx=context):
+                await asyncio.sleep(1.0)
+                buf = _frag_buffers.pop(cid, "")
+                _frag_tasks.pop(cid, None)
+                if buf:
+                    await _dispatch_prompt(cid, buf, u, ctx)
+
+            _frag_tasks[chat_id] = asyncio.create_task(_flush())
+        return  # don't process this fragment yet
+
+    # Final fragment or regular message — cancel any pending flush and prepend buffered text
+    if chat_id in _frag_buffers:
+        pending = _frag_tasks.pop(chat_id, None)
+        if pending:
+            pending.cancel()
+        prompt = _frag_buffers.pop(chat_id) + prompt
+
+    await _dispatch_prompt(chat_id, prompt, update, context)
+
+
+async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route an assembled prompt to stream mode or one-shot processing."""
     # Check for "-" prefix: send as follow-up to running process
     is_followup = prompt.startswith("-") and len(prompt) > 1
     if is_followup:
