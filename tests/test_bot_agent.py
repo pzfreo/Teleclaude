@@ -910,3 +910,132 @@ class TestRepoSwitchInStreamMode:
             assert 9003 in bot_agent._stream_mode
         finally:
             bot_agent._stream_mode.discard(9003)
+
+
+class TestStreamTypingIndicator:
+    """Typing indicator starts on feed and stops on result/stream_end."""
+
+    async def test_typing_starts_on_feed_success(self):
+        import asyncio
+
+        import bot_agent
+        from bot_agent import handle_message
+
+        update = MagicMock()
+        update.message = MagicMock()
+        update.message.text = "do something"
+        update.message.caption = None
+        update.message.photo = None
+        update.message.sticker = None
+        update.message.document = None
+        update.message.voice = None
+        update.effective_user = MagicMock()
+        update.effective_user.id = 1
+        update.effective_chat = MagicMock()
+        update.effective_chat.id = 7001
+        ctx = MagicMock()
+        ctx.bot = AsyncMock()
+
+        bot_agent._stream_mode.add(7001)
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.audit_log"),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr.stream_mode_active.return_value = True
+                mock_mgr.feed = AsyncMock(return_value=True)
+                await handle_message(update, ctx)
+
+            # Typing task should have been created and started
+            task = bot_agent._typing_tasks.get(7001)
+            assert task is not None
+            assert not task.done()
+            task.cancel()
+            await asyncio.sleep(0)
+        finally:
+            bot_agent._stream_mode.discard(7001)
+            bot_agent._typing_tasks.pop(7001, None)
+
+    async def test_typing_not_started_if_feed_fails(self):
+        import bot_agent
+        from bot_agent import handle_message
+
+        update = MagicMock()
+        update.message = MagicMock()
+        update.message.text = "do something"
+        update.message.caption = None
+        update.message.photo = None
+        update.message.sticker = None
+        update.message.document = None
+        update.message.voice = None
+        update.effective_user = MagicMock()
+        update.effective_user.id = 1
+        update.effective_chat = MagicMock()
+        update.effective_chat.id = 7002
+        ctx = MagicMock()
+        ctx.bot = AsyncMock()
+
+        bot_agent._stream_mode.add(7002)
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.audit_log"),
+                patch("bot_agent.send_long_message", new_callable=AsyncMock),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.get_active_branch", return_value=None),
+                patch("bot_agent.get_model", return_value="opus"),
+                patch("bot_agent.load_session_id", return_value=None),
+                patch("bot_agent._chat_locks"),
+            ):
+                mock_mgr.stream_mode_active.return_value = True
+                mock_mgr.feed = AsyncMock(return_value=False)
+                mock_mgr.stop_stream = AsyncMock()
+                # Don't let it fall through to _run_cli fully
+                mock_mgr.run = AsyncMock(return_value="done")
+                mock_mgr.get_session_id.return_value = None
+                await handle_message(update, ctx)
+
+            assert bot_agent._typing_tasks.get(7002) is None
+        finally:
+            bot_agent._stream_mode.discard(7002)
+            bot_agent._typing_tasks.pop(7002, None)
+
+    async def test_typing_stopped_on_result_event(self):
+        import asyncio
+
+        import bot_agent
+        from bot_agent import _make_stream_event_handler, _start_stream_typing
+
+        bot = AsyncMock()
+        chat_id = 7003
+        _start_stream_typing(chat_id, bot)
+        task = bot_agent._typing_tasks.get(chat_id)
+        assert task is not None and not task.done()
+
+        on_event = _make_stream_event_handler(chat_id, bot)
+        await on_event({"type": "result", "cost_usd": 0.01, "num_turns": 1})
+
+        assert bot_agent._typing_tasks.get(chat_id) is None
+        assert task.cancelled() or task.done()
+        await asyncio.sleep(0)
+
+    async def test_typing_stopped_on_stream_end(self):
+        import asyncio
+
+        import bot_agent
+        from bot_agent import _make_stream_event_handler, _start_stream_typing
+
+        bot = AsyncMock()
+        chat_id = 7004
+        _start_stream_typing(chat_id, bot)
+        task = bot_agent._typing_tasks.get(chat_id)
+        assert task is not None and not task.done()
+
+        on_event = _make_stream_event_handler(chat_id, bot)
+        await on_event({"_type": "stream_end", "reason": "eof"})
+
+        assert bot_agent._typing_tasks.get(chat_id) is None
+        assert task.cancelled() or task.done()
+        await asyncio.sleep(0)
