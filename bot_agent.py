@@ -237,7 +237,11 @@ def _format_tool_progress(block: dict) -> str | None:
         return f"Editing {_short_path(path)}" if path else None
     if name == "Bash":
         cmd = inp.get("command", "")
-        return f"$ {cmd}" if cmd else None
+        if not cmd:
+            return None
+        first_line = cmd.split("\n", 1)[0]
+        suffix = "…" if "\n" in cmd else ""
+        return f"$ {first_line}{suffix}"
     if name == "Glob":
         pattern = inp.get("pattern", "")
         return f"Finding {pattern}" if pattern else None
