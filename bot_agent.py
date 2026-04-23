@@ -130,6 +130,7 @@ _plan_mode: set[int] = set()  # chat IDs with plan mode enabled
 _stream_mode: set[int] = set()  # chat IDs with /new-stream continuous mode
 _chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 _chat_generation: dict[int, int] = collections.defaultdict(int)
+_typing_tasks: dict[int, asyncio.Task] = {}
 
 _MIME_TO_EXT = {
     "image/jpeg": ".jpg",
@@ -266,6 +267,30 @@ async def keep_typing(chat, stop_event: asyncio.Event, bot):
             break
         except TimeoutError:
             continue
+
+
+def _start_stream_typing(chat_id: int, bot) -> None:
+    """Start a background typing indicator for stream mode turns."""
+    task = _typing_tasks.get(chat_id)
+    if task and not task.done():
+        return
+
+    async def _loop() -> None:
+        try:
+            while True:
+                await bot.send_chat_action(chat_id=chat_id, action="typing")
+                await asyncio.sleep(TYPING_INTERVAL)
+        except (asyncio.CancelledError, TelegramError, Exception):
+            pass
+
+    _typing_tasks[chat_id] = asyncio.create_task(_loop())
+
+
+def _stop_stream_typing(chat_id: int) -> None:
+    """Cancel the stream-mode typing indicator for this chat."""
+    task = _typing_tasks.pop(chat_id, None)
+    if task and not task.done():
+        task.cancel()
 
 
 def _save_attachment(chat_id: int, data: bytes, mime: str, label: str = "") -> str:
@@ -483,6 +508,7 @@ async def cancel_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     sent = await claude_code_mgr.interrupt(chat_id)
     if sent:
+        _stop_stream_typing(chat_id)
         await update.message.reply_text("Interrupt sent. Session preserved — send a new message to continue.")
     else:
         await update.message.reply_text(
@@ -497,6 +523,7 @@ async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _chat_generation[chat_id] += 1  # invalidate all queued coroutines
     was_streaming = chat_id in _stream_mode
     _stream_mode.discard(chat_id)
+    _stop_stream_typing(chat_id)
     was_running = await claude_code_mgr.abort(chat_id)
     if was_streaming:
         await update.message.reply_text("Stream stopped.")
@@ -601,6 +628,7 @@ def _make_stream_event_handler(chat_id: int, bot):
             return
 
         if event_type == "result":
+            _stop_stream_typing(chat_id)
             stats = {k: event[k] for k in ("cost_usd", "num_turns", "usage") if k in event}
             if stats:
                 line = _format_tool_progress({"_type": "stats", **stats})
@@ -624,6 +652,7 @@ def _make_stream_event_handler(chat_id: int, bot):
 
         # Synthetic stream-end signal emitted by ClaudeCodeManager._stream_forever
         if event.get("_type") == "stream_end":
+            _stop_stream_typing(chat_id)
             _stream_mode.discard(chat_id)
             try:
                 await send_long_message(chat_id, "Stream ended — send a message to start a new one.", bot)
@@ -915,6 +944,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             sent = await claude_code_mgr.feed(chat_id, prompt)
             if sent:
+                _start_stream_typing(chat_id, context.bot)
                 return
             _stream_mode.discard(chat_id)
             await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
