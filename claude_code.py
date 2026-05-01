@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import shutil
 import time
 import uuid
@@ -109,6 +110,30 @@ async def get_claude_cli_version() -> str | None:
         logger.warning("Failed to get Claude CLI version: %s", e)
 
     return None
+
+
+def _resolve_mcp_config(mcp_config_path: Path) -> str:
+    """Load .mcp.json and work around Claude Code ignoring the cwd field.
+
+    Claude Code CLI ignores the 'cwd' field in server configs passed via
+    --mcp-config, running the server process in the CLI's own working directory
+    instead. We work around this by wrapping the command with bash -c 'cd {cwd} && ...'
+    so the server starts in the correct directory regardless.
+    """
+    with open(mcp_config_path) as f:
+        config = json.load(f)
+
+    for server_config in config.get("mcpServers", {}).values():
+        cwd = server_config.pop("cwd", None)
+        if not cwd:
+            continue
+        cmd = server_config["command"]
+        args = server_config.get("args", [])
+        arg_str = " ".join(shlex.quote(str(a)) for a in args)
+        server_config["command"] = "bash"
+        server_config["args"] = ["-c", f"cd {shlex.quote(cwd)} && {shlex.quote(cmd)} {arg_str}"]
+
+    return json.dumps(config)
 
 
 class ClaudeCodeManager:
@@ -499,7 +524,8 @@ class ClaudeCodeManager:
 
         mcp_config = repo_dir / ".mcp.json"
         if mcp_config.is_file():
-            cmd.extend(["--mcp-config", str(mcp_config)])
+            resolved = _resolve_mcp_config(mcp_config)
+            cmd.extend(["--mcp-config", resolved])
             logger.info("Claude Code: loading MCP config from %s", mcp_config)
 
         session_id = self._sessions.get(chat_id)
