@@ -497,6 +497,11 @@ class ClaudeCodeManager:
         if permission_mode:
             cmd.extend(["--permission-mode", permission_mode])
 
+        mcp_config = repo_dir / ".mcp.json"
+        if mcp_config.is_file():
+            cmd.extend(["--mcp-config", str(mcp_config)])
+            logger.info("Claude Code: loading MCP config from %s", mcp_config)
+
         session_id = self._sessions.get(chat_id)
         if session_id:
             cmd.extend(["--resume", session_id])
