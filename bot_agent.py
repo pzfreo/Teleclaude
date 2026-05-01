@@ -332,7 +332,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         f"Teleclaude Agent — Claude Code on Telegram.{repo_line}\n\n"
-        "Every message goes straight to Claude Code CLI.\n\n"
+        "Every message goes straight to Claude Code CLI via continuous stream mode.\n\n"
         "Commands:\n"
         "/repo owner/name - Set the active GitHub repo\n"
         "/repo - Show current repo\n"
@@ -345,7 +345,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/cancel - Soft interrupt (Esc equivalent — keeps process + session)\n"
         "/stop - Stop current work (kills CC process, keeps session)\n"
         "/new - Start a fresh CLI session (auto-updates Claude CLI)\n"
-        "/newstream - Experimental: continuous stream session (scheduled events post to chat)\n"
+        "/newstream - Reset and restart stream session\n"
         "/update - Update Claude CLI to latest version\n"
         "/model - Show or switch model (opus/sonnet/haiku)\n"
         "/logs [min] - Download recent logs\n"
@@ -662,7 +662,7 @@ def _make_stream_event_handler(chat_id: int, bot):
             _stop_stream_typing(chat_id)
             _stream_mode.discard(chat_id)
             try:
-                await send_long_message(chat_id, "Stream ended — send a message to start a new one.", bot)
+                await send_long_message(chat_id, "Stream ended — send a message to continue.", bot)
             except TelegramError:
                 pass
 
@@ -970,6 +970,25 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
         # Not actively processing — strip the dash and process as normal message
         prompt = followup_text
 
+    # Auto-start stream mode if not already active (stream is the default)
+    if chat_id not in _stream_mode:
+        repo = get_active_repo(chat_id)
+        if repo:
+            on_event = _make_stream_event_handler(chat_id, context.bot)
+            try:
+                await claude_code_mgr.start_stream(
+                    chat_id=chat_id,
+                    repo=repo,
+                    on_event=on_event,
+                    branch=get_active_branch(chat_id),
+                    model=get_model(chat_id),
+                    permission_mode="plan" if chat_id in _plan_mode else None,
+                )
+                _stream_mode.add(chat_id)
+            except Exception as e:
+                logger.error("Auto-start stream failed for chat %d: %s", chat_id, e, exc_info=True)
+                # Fall through to one-shot on failure
+
     # Stream mode: pipe straight to CC via stdin; the continuous reader posts responses
     if chat_id in _stream_mode:
         if not claude_code_mgr.stream_mode_active(chat_id):
@@ -1118,7 +1137,7 @@ async def notify_startup(app: Application) -> None:
     await app.bot.set_my_commands(
         [
             ("new", "Start a new conversation"),
-            ("newstream", "Start a continuous stream session (experimental)"),
+            ("newstream", "Reset and restart stream session"),
             ("repo", "Set active GitHub repo"),
             ("branch", "Set active branch"),
             ("model", "Show or change AI model"),

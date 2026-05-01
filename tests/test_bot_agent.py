@@ -37,7 +37,7 @@ class TestFormatProgress:
 
         long_cmd = "a" * 100 + "\nsecond line"
         result = _format_tool_progress({"type": "tool_use", "name": "Bash", "input": {"command": long_cmd}})
-        assert result == f"$ {long_cmd}"
+        assert result == "$ " + "a" * 100 + "…"
 
     def test_glob_tool(self):
         from bot_agent import _format_tool_progress
@@ -345,6 +345,7 @@ class TestAgentHandleMessage:
         ctx = _make_context()
         with (
             patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value=None),
             patch("bot_agent._run_cli", new_callable=AsyncMock) as mock_run,
             patch("bot_agent.audit_log"),
         ):
@@ -369,6 +370,7 @@ class TestAgentHandleMessage:
         ctx = _make_context()
         with (
             patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value=None),
             patch("bot_agent._run_cli", new_callable=AsyncMock) as mock_run,
             patch("bot_agent.audit_log"),
         ):
