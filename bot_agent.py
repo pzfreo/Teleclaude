@@ -1136,14 +1136,14 @@ WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "0"))  # 0 = disabled
 async def notify_startup(app: Application) -> None:
     await app.bot.set_my_commands(
         [
-            ("new", "Start a new conversation"),
-            ("newstream", "Reset and restart stream session"),
+            ("cancel", "Soft interrupt (keeps session)"),
             ("repo", "Set active GitHub repo"),
-            ("branch", "Set active branch"),
+            ("newstream", "Reset and restart stream session"),
             ("model", "Show or change AI model"),
             ("plan", "Toggle plan mode / plan a task"),
+            ("new", "Start a new conversation"),
+            ("branch", "Set active branch"),
             ("work", "Exit plan mode"),
-            ("cancel", "Soft interrupt (keeps session)"),
             ("stop", "Stop current work (kills CC process)"),
             ("logs", "View recent bot logs"),
             ("version", "Show bot version"),

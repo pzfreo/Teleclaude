@@ -30,6 +30,13 @@ services:
             /opt/teleclaude-agent/CLAUDE.md \
             /home/teleclaude/.claude/CLAUDE.md
         fi
+        # Register build123d-mcp globally (user scope). Remove first so this is
+        # idempotent across restarts. uvx --refresh fetches the latest PyPI
+        # release on each session start, providing automatic updates.
+        runuser -u teleclaude -- sh -c '
+          claude mcp remove build123d-mcp 2>/dev/null
+          claude mcp add -s user build123d-mcp -- uvx --refresh build123d-mcp
+        '
         exec runuser -u teleclaude -- python bot_agent.py
     volumes:
       - teleclaude-agent-data:/app/data
