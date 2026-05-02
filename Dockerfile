@@ -65,6 +65,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-editable
 
+# Install Python linting tools as isolated uv tools, available to all users
+RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install black \
+    && UV_TOOL_BIN_DIR=/usr/local/bin uv tool install ruff \
+    && UV_TOOL_BIN_DIR=/usr/local/bin uv tool install mypy
+
 # Copy application code
 COPY *.py VERSION ./
 

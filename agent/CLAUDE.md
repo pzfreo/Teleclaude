@@ -73,3 +73,21 @@ Personal coding guidelines for Paul Fremantle (pzfreo). Merge with project-speci
 - If the same class of bug appears twice, stop and reconsider the approach.
 - Never mark tests as xfail/skip without explicit approval.
 - When the user says a problem is solved or to stop, stop immediately.
+
+## 9. Sending Files to the User
+
+The Telegram bot detects `[SEND: path]` markers in your responses and delivers the file directly to the user's phone.
+
+- Use it when you generate output the user should receive: reports, exports, images, archives, diffs, etc.
+- Place the marker on its own line at the end of your response.
+- Paths can be relative to the workspace root, absolute within the workspace, or under `/tmp/`.
+- You can include multiple markers for multiple files.
+
+Example:
+```
+I've exported the data to CSV.
+
+[SEND: output/report.csv]
+```
+
+Don't use it for source files the user didn't ask to download, or for files that are just intermediate build artefacts.

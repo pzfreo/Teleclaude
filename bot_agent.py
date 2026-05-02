@@ -1,8 +1,8 @@
 """Teleclaude Agent — every message pipes straight to Claude Code CLI."""
 
-from pathlib import Path as _Path
+from pathlib import Path
 
-VERSION = (_Path(__file__).parent / "VERSION").read_text().strip()
+VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 
 import asyncio
 import collections
@@ -10,15 +10,17 @@ import datetime
 import io
 import logging
 import os
+import re
 import shutil
 import sys
 import time
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -141,6 +143,15 @@ _MIME_TO_EXT = {
     "image/webp": ".webp",
     "application/pdf": ".pdf",
 }
+
+IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
+SKIP_DIRS = frozenset(
+    {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build", ".cache", ".tox"}
+)
+MAX_FILE_BYTES = 50 * 1024 * 1024  # Telegram bot file size limit
+SEND_MARKER_RE = re.compile(r"\[SEND:\s*([^\]]+)\]", re.IGNORECASE)
+
+_files_cache: dict[int, list[Path]] = {}  # chat_id -> file list for inline keyboard
 
 
 def is_authorized(user_id: int) -> bool:
@@ -319,6 +330,76 @@ async def _download_telegram_file(file_obj, bot) -> bytes:
     return await download_telegram_file(file_obj, bot)
 
 
+def _list_workspace_files(workspace: Path, limit: int = 10) -> list[Path]:
+    files = []
+    try:
+        for f in workspace.rglob("*"):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(workspace)
+            if any(p.startswith(".") or p in SKIP_DIRS for p in rel.parts[:-1]):
+                continue
+            if rel.parts[-1].startswith("."):
+                continue
+            files.append(f)
+    except PermissionError:
+        pass
+    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return files[:limit]
+
+
+async def _send_file_to_user(chat_id: int, path: Path, bot) -> bool:
+    if not path.exists():
+        await bot.send_message(chat_id=chat_id, text=f"File not found: {path.name}")
+        return False
+    size = path.stat().st_size
+    if size > MAX_FILE_BYTES:
+        await bot.send_message(chat_id=chat_id, text=f"{path.name} is too large to send ({size // 1024 // 1024}MB).")
+        return False
+    try:
+        with open(path, "rb") as fh:
+            if path.suffix.lower() in IMAGE_EXTENSIONS:
+                await bot.send_photo(chat_id=chat_id, photo=fh, caption=path.name)
+            else:
+                await bot.send_document(chat_id=chat_id, document=fh, filename=path.name)
+        return True
+    except Exception as e:
+        logger.error("Failed to send file %s: %s", path, e)
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"Failed to send {path.name}: {e}")
+        except TelegramError:
+            pass
+        return False
+
+
+async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot) -> str:
+    """Strip [SEND: path] markers from text and send each referenced file."""
+    markers = SEND_MARKER_RE.findall(text)
+    if not markers:
+        return text
+    workspace = claude_code_mgr.workspace_path(repo) if repo else None
+    workspace_str = str(workspace.resolve()) if workspace else None
+    shared_str = str((claude_code_mgr.workspace_root / ".shared" / str(chat_id)).resolve())
+    tmp_str = str(Path("/tmp").resolve())
+    for raw in markers:
+        raw = raw.strip()
+        p = Path(raw)
+        if not p.is_absolute() and workspace:
+            p = (workspace / raw).resolve()
+        else:
+            p = p.resolve()
+        safe = (
+            (workspace_str and str(p).startswith(workspace_str))
+            or str(p).startswith(shared_str)
+            or str(p).startswith(tmp_str)
+        )
+        if safe:
+            await _send_file_to_user(chat_id, p, bot)
+        else:
+            logger.warning("Blocked file send outside workspace: %s", p)
+    return SEND_MARKER_RE.sub("", text).strip()
+
+
 # ── Commands ──────────────────────────────────────────────────────────
 
 
@@ -337,6 +418,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/repo owner/name - Set the active GitHub repo\n"
         "/repo - Show current repo\n"
         "/branch name - Set active branch\n"
+        "/files - Browse and download workspace files\n"
         "/plan - Toggle plan mode (read-only)\n"
         "/plan <task> - Plan a specific task\n"
         "/work - Exit plan mode\n"
@@ -362,30 +444,29 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not context.args:
         repo = get_active_repo(chat_id)
-        lines = []
+        header_lines = []
         if repo:
             branch = get_active_branch(chat_id)
-            lines.append(f"Active repo: {repo}" + (f" ({branch})" if branch else ""))
-            lines.append("")
+            header_lines.append("Active repo: " + repo + (f" ({branch})" if branch else ""))
 
         if gh_client:
             try:
                 loop = asyncio.get_running_loop()
                 repos = await loop.run_in_executor(None, gh_client.list_user_repos, 5)
-                lines.append("Recent repos:")
-                for i, r in enumerate(repos, 1):
-                    desc = f" — {r['description']}" if r["description"] else ""
-                    marker = " *" if r["full_name"] == repo else ""
-                    lines.append(f"  {i}. {r['full_name']}{desc}{marker}")
-                lines.append("\n/repo <number> or /repo owner/name")
+                buttons = []
+                for r in repos:
+                    label = r["full_name"] + (" ✓" if r["full_name"] == repo else "")
+                    buttons.append([InlineKeyboardButton(label, callback_data=f"repo:{r['full_name']}")])
+                markup = InlineKeyboardMarkup(buttons)
+                header = "\n".join(header_lines) + ("\n\n" if header_lines else "") + "Tap a repo to switch:"
+                await update.message.reply_text(header, reply_markup=markup)
             except Exception as e:
                 logger.warning("Failed to list repos: %s", e)
-                if not repo:
-                    lines.append("No repo set. Use: /repo owner/name")
-        elif not repo:
-            lines.append("No repo set. Use: /repo owner/name")
-
-        await update.message.reply_text("\n".join(lines))
+                msg = "\n".join(header_lines) or "No repo set. Use: /repo owner/name"
+                await update.message.reply_text(msg)
+        else:
+            msg = "\n".join(header_lines) or "No repo set. Use: /repo owner/name"
+            await update.message.reply_text(msg)
         return
 
     arg = context.args[0]
@@ -628,8 +709,11 @@ def _make_stream_event_handler(chat_id: int, bot):
                         line = _format_tool_progress(block)
                         if line:
                             try:
-                                pm = "HTML" if btype == "text" else None
-                                await send_long_message(chat_id, line, bot, parse_mode=pm)
+                                if btype == "text":
+                                    line = await _parse_and_send_markers(chat_id, line, active_repos.get(chat_id), bot)
+                                if line:
+                                    pm = "HTML" if btype == "text" else None
+                                    await send_long_message(chat_id, line, bot, parse_mode=pm)
                             except TelegramError:
                                 pass
             return
@@ -726,13 +810,17 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if resolved is None:
             resolved = await claude_code_mgr.probe_resolved_model(model)
         if resolved and resolved != model:
-            line = f"Current model: {model} (resolved: {resolved})"
+            status = f"Current: {model} (resolved: {resolved})"
         elif resolved:
-            line = f"Current model: {resolved}"
+            status = f"Current: {resolved}"
         else:
-            line = f"Current model: {model} (unable to resolve version)"
-        shortcuts = ", ".join(AVAILABLE_MODELS.keys())
-        await update.message.reply_text(f"{line}\nSwitch with: /model <name>\nShortcuts: {shortcuts}")
+            status = f"Current: {model}"
+        buttons = [
+            [InlineKeyboardButton(name + (" ✓" if name == model else ""), callback_data=f"model:{name}")]
+            for name in AVAILABLE_MODELS
+        ]
+        markup = InlineKeyboardMarkup(buttons)
+        await update.message.reply_text(f"{status}\n\nTap to switch:", reply_markup=markup)
         return
 
     choice = context.args[0].lower().strip()
@@ -767,6 +855,111 @@ async def send_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     buf = io.BytesIO(content.encode("utf-8"))
     buf.name = f"agent_logs_{minutes}min.txt"
     await update.message.reply_document(document=buf, caption=f"Last {minutes} min — {len(lines)} lines")
+
+
+async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    repo = get_active_repo(chat_id)
+    if not repo:
+        await update.message.reply_text("No repo set. Use /repo owner/name first.")
+        return
+    workspace = claude_code_mgr.workspace_path(repo)
+    if not workspace.exists():
+        await update.message.reply_text("Workspace not cloned yet. Set a repo first.")
+        return
+    files = _list_workspace_files(workspace)
+    if not files:
+        await update.message.reply_text("No files found in workspace.")
+        return
+    _files_cache[chat_id] = files
+    buttons = []
+    for i, f in enumerate(files):
+        rel = f.relative_to(workspace)
+        size = f.stat().st_size
+        size_str = f"{size / 1024:.1f}KB" if size >= 1024 else f"{size}B"
+        buttons.append([InlineKeyboardButton(f"{rel}  ({size_str})", callback_data=f"dl:{i}")])
+    markup = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text("Recent files — tap to download:", reply_markup=markup)
+
+
+async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle all inline keyboard callbacks: dl:, repo:, model:"""
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    if not is_authorized(query.from_user.id):
+        await query.answer("Not authorized.")
+        return
+    await query.answer()
+    data = query.data or ""
+    chat_id = query.message.chat_id
+
+    if data.startswith("dl:"):
+        try:
+            idx = int(data[3:])
+        except ValueError:
+            return
+        files = _files_cache.get(chat_id, [])
+        if idx >= len(files):
+            await query.edit_message_text("File list expired. Use /files again.")
+            return
+        await _send_file_to_user(chat_id, files[idx], context.bot)
+
+    elif data.startswith("repo:"):
+        repo = data[5:]
+        if "/" not in repo:
+            return
+        was_streaming = chat_id in _stream_mode
+        if was_streaming:
+            _stream_mode.discard(chat_id)
+            await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
+        active_repos[chat_id] = repo
+        save_active_repo(chat_id, repo)
+        set_active_branch(chat_id, None)
+        claude_code_mgr.new_session(chat_id)
+        save_session_id(chat_id, None)
+        await query.edit_message_text(f"Switching to {repo}…")
+
+        async def _clone_and_reply():
+            try:
+                await claude_code_mgr.ensure_clone(repo)
+                await context.bot.send_message(chat_id=chat_id, text=f"Workspace ready: {repo}")
+            except Exception as e:
+                logger.error("Clone failed: %s", e)
+                await context.bot.send_message(chat_id=chat_id, text=f"Clone failed: {e}")
+                return
+            if was_streaming:
+                on_event = _make_stream_event_handler(chat_id, context.bot)
+                try:
+                    await claude_code_mgr.start_stream(
+                        chat_id=chat_id,
+                        repo=repo,
+                        on_event=on_event,
+                        branch=None,
+                        model=get_model(chat_id),
+                        permission_mode="plan" if chat_id in _plan_mode else None,
+                    )
+                    _stream_mode.add(chat_id)
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=f"Stream restarted on `{repo}`.", parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    logger.error("Stream restart failed: %s", e)
+                    await context.bot.send_message(chat_id=chat_id, text=f"Stream restart failed: {e}")
+
+        asyncio.create_task(_clone_and_reply())
+
+    elif data.startswith("model:"):
+        name = data[6:]
+        if name not in AVAILABLE_MODELS:
+            return
+        model_id = AVAILABLE_MODELS[name]
+        chat_models[chat_id] = model_id
+        save_model(chat_id, model_id)
+        claude_code_mgr.clear_last_model(chat_id)
+        await query.edit_message_text(f"Model switched to: {model_id}")
 
 
 async def show_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1102,6 +1295,9 @@ async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTy
 
     text_was_streamed = claude_code_mgr.was_text_streamed(chat_id)
 
+    if result and not result.startswith("("):
+        result = await _parse_and_send_markers(chat_id, result, repo, bot)
+
     if not result and not text_was_streamed:
         result = "(no output)"
 
@@ -1138,6 +1334,7 @@ async def notify_startup(app: Application) -> None:
         [
             ("cancel", "Soft interrupt (keeps session)"),
             ("repo", "Set active GitHub repo"),
+            ("files", "Browse and download workspace files"),
             ("newstream", "Reset and restart stream session"),
             ("model", "Show or change AI model"),
             ("plan", "Toggle plan mode / plan a task"),
@@ -1196,11 +1393,13 @@ def main() -> None:
     app.add_handler(CommandHandler("update", update_cli))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("logs", send_logs))
+    app.add_handler(CommandHandler("files", list_files))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(CommandHandler("work", work_command))
     app.add_handler(CommandHandler("btw", btw_command))
     app.add_handler(CommandHandler([str(i) for i in range(1, 6)], repo_shortcut))
+    app.add_handler(CallbackQueryHandler(inline_callback))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(
         MessageHandler(
