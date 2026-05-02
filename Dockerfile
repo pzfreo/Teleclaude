@@ -45,8 +45,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* \
     && chmod -R a+rx /opt/playwright-browsers
 
-# Install uv
+# Install uv (uvx is a symlink to the same binary)
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN ln -s /usr/local/bin/uv /usr/local/bin/uvx
 
 # Create non-root user (claude CLI refuses --dangerously-skip-permissions as root)
 # Give them a proper home for pip/npm caches and local installs.
