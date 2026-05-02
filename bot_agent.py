@@ -145,7 +145,9 @@ _MIME_TO_EXT = {
 }
 
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
-SKIP_DIRS = frozenset({".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build", ".cache", ".tox"})
+SKIP_DIRS = frozenset(
+    {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build", ".cache", ".tox"}
+)
 MAX_FILE_BYTES = 50 * 1024 * 1024  # Telegram bot file size limit
 SEND_MARKER_RE = re.compile(r"\[SEND:\s*([^\]]+)\]", re.IGNORECASE)
 
@@ -940,7 +942,9 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         permission_mode="plan" if chat_id in _plan_mode else None,
                     )
                     _stream_mode.add(chat_id)
-                    await context.bot.send_message(chat_id=chat_id, text=f"Stream restarted on `{repo}`.", parse_mode="Markdown")
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=f"Stream restarted on `{repo}`.", parse_mode="Markdown"
+                    )
                 except Exception as e:
                     logger.error("Stream restart failed: %s", e)
                     await context.bot.send_message(chat_id=chat_id, text=f"Stream restart failed: {e}")
