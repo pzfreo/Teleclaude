@@ -149,7 +149,7 @@ SKIP_DIRS = frozenset(
     {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build", ".cache", ".tox"}
 )
 MAX_FILE_BYTES = 50 * 1024 * 1024  # Telegram bot file size limit
-SEND_MARKER_RE = re.compile(r"\[SEND:\s*([^\]]+)\]", re.IGNORECASE)
+SEND_MARKER_RE = re.compile(r"^\[SEND:\s*([^\]]+)\]", re.IGNORECASE | re.MULTILINE)
 
 _files_cache: dict[int, list[Path]] = {}  # chat_id -> file list for inline keyboard
 
@@ -330,7 +330,7 @@ async def _download_telegram_file(file_obj, bot) -> bytes:
     return await download_telegram_file(file_obj, bot)
 
 
-def _list_workspace_files(workspace: Path, limit: int = 10) -> list[Path]:
+def _list_workspace_files(workspace: Path, limit: int = 5) -> list[Path]:
     files = []
     try:
         for f in workspace.rglob("*"):
