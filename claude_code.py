@@ -544,7 +544,13 @@ class ClaudeCodeManager:
                 "- Do NOT ask the user to run CLI commands or use terminal features.\n"
                 "- When presenting plans, include the full plan text in your response so the user can read it.\n"
                 "- Keep responses concise for mobile reading.\n"
-                "- If you need user input, ask a clear question in your response text.",
+                "- If you need user input, ask a clear question in your response text.\n"
+                "\n"
+                "Image and file delivery:\n"
+                "- The Telegram bot detects `[SEND: path]` markers in your responses and delivers the file directly to the user's phone.\n"
+                "- When an MCP tool returns an image or generates a file, save it to disk (e.g. /tmp/) and use [SEND: path] to deliver it — do NOT pass image data back through the API as vision content.\n"
+                "- Place [SEND: path] markers on their own line at the end of your response.\n"
+                "- You can include multiple markers for multiple files.",
             ]
         )
 
