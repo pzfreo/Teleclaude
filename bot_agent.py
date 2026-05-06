@@ -69,6 +69,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "opus")
+CLAUDE_SESSION_KEY = os.getenv("CLAUDE_SESSION_KEY", "")
+CLAUDE_ORG_ID = os.getenv("CLAUDE_ORG_ID", "")
 
 # Use Claude Code CLI aliases — the CLI resolves these to the latest version
 # per family, so new model releases don't require a bot redeploy.
@@ -511,6 +513,9 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await claude_code_mgr.ensure_clone(repo)
             await update.message.reply_text(f"Workspace ready: {repo}")
+            usage = await _fetch_usage_text()
+            if usage:
+                await update.message.reply_text(usage)
         except Exception as e:
             logger.error("Clone failed: %s", e)
             await update.message.reply_text(f"Clone failed: {e}")
@@ -690,6 +695,10 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if version:
                 await update.message.reply_text(f"Claude CLI version: {version}")
 
+    usage = await _fetch_usage_text()
+    if usage:
+        await update.message.reply_text(usage)
+
 
 def _make_stream_event_handler(chat_id: int, bot):
     """Build an on_event callback that renders CC stream-json events into Telegram."""
@@ -797,6 +806,9 @@ async def new_stream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "/new to end.",
         parse_mode="Markdown",
     )
+    usage = await _fetch_usage_text()
+    if usage:
+        await update.message.reply_text(usage)
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -960,6 +972,86 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         save_model(chat_id, model_id)
         claude_code_mgr.clear_last_model(chat_id)
         await query.edit_message_text(f"Model switched to: {model_id}")
+
+
+async def _fetch_usage_text() -> str:
+    """Return a one-line usage summary, or empty string if unavailable."""
+    if not CLAUDE_SESSION_KEY or not CLAUDE_ORG_ID:
+        return ""
+    import aiohttp
+
+    url = f"https://claude.ai/api/organizations/{CLAUDE_ORG_ID}/usage"
+    headers = {
+        "accept": "*/*",
+        "anthropic-client-platform": "web_claude_ai",
+        "anthropic-client-version": "1.0.0",
+        "content-type": "application/json",
+        "cookie": f"sessionKey={CLAUDE_SESSION_KEY}",
+    }
+    try:
+        async with aiohttp.ClientSession() as session, session.get(url, headers=headers) as resp:
+            if not resp.ok:
+                return ""
+            data = await resp.json()
+    except Exception:
+        return ""
+
+    labels = {"five_hour": "Sess", "seven_day": "Wk", "seven_day_sonnet": "Wk(S)"}
+    parts = []
+    for key, label in labels.items():
+        if key in data and data[key] is not None:
+            pct = round(data[key].get("utilization", 0))
+            parts.append(f"{label}: {pct}%")
+    return "Usage — " + " | ".join(parts) if parts else ""
+
+
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /usage — show Claude plan usage limits."""
+    if not is_authorized(update.effective_user.id):
+        return
+    if not CLAUDE_SESSION_KEY or not CLAUDE_ORG_ID:
+        await update.message.reply_text(
+            "Claude usage not configured. Set CLAUDE_SESSION_KEY and CLAUDE_ORG_ID in .env.agent"
+        )
+        return
+    import aiohttp
+
+    url = f"https://claude.ai/api/organizations/{CLAUDE_ORG_ID}/usage"
+    headers = {
+        "accept": "*/*",
+        "anthropic-client-platform": "web_claude_ai",
+        "anthropic-client-version": "1.0.0",
+        "content-type": "application/json",
+        "cookie": f"sessionKey={CLAUDE_SESSION_KEY}",
+    }
+    try:
+        async with aiohttp.ClientSession() as session, session.get(url, headers=headers) as resp:
+            if resp.status == 401:
+                await update.message.reply_text("Session expired. Update CLAUDE_SESSION_KEY in .env.agent")
+                return
+            resp.raise_for_status()
+            data = await resp.json()
+    except Exception as e:
+        logger.error("Failed to fetch Claude usage: %s", e)
+        await update.message.reply_text(f"Error fetching usage: {e}")
+        return
+
+    lines = []
+    labels = {
+        "five_hour": "Session",
+        "seven_day": "Weekly (all)",
+        "seven_day_sonnet": "Weekly (Sonnet)",
+    }
+    for key, label in labels.items():
+        if key in data and data[key] is not None:
+            pct = round(data[key].get("utilization", 0))
+            resets_at = data[key].get("resets_at", "")
+            reset_str = f" — resets {resets_at[:10]}" if resets_at else ""
+            lines.append(f"{label}: {pct}%{reset_str}")
+    if lines:
+        await update.message.reply_text("Claude usage:\n" + "\n".join(lines))
+    else:
+        await update.message.reply_text("No usage data returned.")
 
 
 async def show_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1394,6 +1486,7 @@ def main() -> None:
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("logs", send_logs))
     app.add_handler(CommandHandler("files", list_files))
+    app.add_handler(CommandHandler("usage", usage_command))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(CommandHandler("work", work_command))
