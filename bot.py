@@ -1260,23 +1260,32 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Handle /usage — show Claude plan usage limits."""
     if not is_authorized(update.effective_user.id):
         return
-    if not CLAUDE_SESSION_KEY or not CLAUDE_ORG_ID:
-        await update.message.reply_text("Claude usage not configured. Set CLAUDE_SESSION_KEY and CLAUDE_ORG_ID in .env")
+    from persistence import load_claude_credentials
+
+    file_key, file_org = load_claude_credentials()
+    session_key = file_key or CLAUDE_SESSION_KEY
+    org_id = file_org or CLAUDE_ORG_ID
+    if not session_key or not org_id:
+        await update.message.reply_text(
+            "Claude usage not configured. Use the browser extension Sync button, or set CLAUDE_SESSION_KEY and CLAUDE_ORG_ID in .env"
+        )
         return
     import aiohttp
 
-    url = f"https://claude.ai/api/organizations/{CLAUDE_ORG_ID}/usage"
+    url = f"https://claude.ai/api/organizations/{org_id}/usage"
     headers = {
         "accept": "*/*",
         "anthropic-client-platform": "web_claude_ai",
         "anthropic-client-version": "1.0.0",
         "content-type": "application/json",
-        "cookie": f"sessionKey={CLAUDE_SESSION_KEY}",
+        "cookie": f"sessionKey={session_key}",
     }
     try:
         async with aiohttp.ClientSession() as session, session.get(url, headers=headers) as resp:
             if resp.status == 401:
-                await update.message.reply_text("Session expired. Update CLAUDE_SESSION_KEY in .env")
+                await update.message.reply_text(
+                    "Session expired. Use the browser extension Sync button to push fresh credentials."
+                )
                 return
             resp.raise_for_status()
             data = await resp.json()

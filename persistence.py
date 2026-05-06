@@ -9,6 +9,34 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).parent / "data" / "teleclaude.db"
+CREDENTIALS_FILE = Path(__file__).parent / "data" / "claude_credentials.json"
+
+
+def load_claude_credentials() -> tuple[str, str]:
+    """Return (session_key, org_id) from the credentials file, or ("", "") if absent."""
+    try:
+        if CREDENTIALS_FILE.exists():
+            data = json.loads(CREDENTIALS_FILE.read_text())
+            return data.get("session_key", ""), data.get("org_id", "")
+    except Exception:
+        pass
+    return "", ""
+
+
+def save_claude_credentials(session_key: str, org_id: str) -> None:
+    """Persist credentials to disk so both bots and restarts pick them up."""
+    import datetime
+
+    CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CREDENTIALS_FILE.write_text(
+        json.dumps(
+            {
+                "session_key": session_key,
+                "org_id": org_id,
+                "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            }
+        )
+    )
 
 
 def _connect() -> sqlite3.Connection:

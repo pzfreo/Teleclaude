@@ -71,6 +71,8 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "opus")
 CLAUDE_SESSION_KEY = os.getenv("CLAUDE_SESSION_KEY", "")
 CLAUDE_ORG_ID = os.getenv("CLAUDE_ORG_ID", "")
+CREDENTIALS_SYNC_TOKEN = os.getenv("CREDENTIALS_SYNC_TOKEN", "")
+CREDENTIALS_PORT = int(os.getenv("CREDENTIALS_PORT", "0"))
 
 # Use Claude Code CLI aliases — the CLI resolves these to the latest version
 # per family, so new model releases don't require a bot redeploy.
@@ -974,19 +976,28 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(f"Model switched to: {model_id}")
 
 
+def _get_usage_credentials() -> tuple[str, str]:
+    """Return (session_key, org_id): file-synced credentials take priority over env vars."""
+    from persistence import load_claude_credentials
+
+    file_key, file_org = load_claude_credentials()
+    return (file_key or CLAUDE_SESSION_KEY, file_org or CLAUDE_ORG_ID)
+
+
 async def _fetch_usage_text() -> str:
     """Return a one-line usage summary, or empty string if unavailable."""
-    if not CLAUDE_SESSION_KEY or not CLAUDE_ORG_ID:
+    session_key, org_id = _get_usage_credentials()
+    if not session_key or not org_id:
         return ""
     import aiohttp
 
-    url = f"https://claude.ai/api/organizations/{CLAUDE_ORG_ID}/usage"
+    url = f"https://claude.ai/api/organizations/{org_id}/usage"
     headers = {
         "accept": "*/*",
         "anthropic-client-platform": "web_claude_ai",
         "anthropic-client-version": "1.0.0",
         "content-type": "application/json",
-        "cookie": f"sessionKey={CLAUDE_SESSION_KEY}",
+        "cookie": f"sessionKey={session_key}",
     }
     try:
         async with aiohttp.ClientSession() as session, session.get(url, headers=headers) as resp:
@@ -1009,25 +1020,31 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Handle /usage — show Claude plan usage limits."""
     if not is_authorized(update.effective_user.id):
         return
-    if not CLAUDE_SESSION_KEY or not CLAUDE_ORG_ID:
-        await update.message.reply_text(
-            "Claude usage not configured. Set CLAUDE_SESSION_KEY and CLAUDE_ORG_ID in .env.agent"
-        )
+    session_key, org_id = _get_usage_credentials()
+    if not session_key or not org_id:
+        msg = "Claude usage not configured."
+        if CREDENTIALS_SYNC_TOKEN and CREDENTIALS_PORT:
+            msg += " Use the browser extension Sync button to push credentials."
+        else:
+            msg += " Set CLAUDE_SESSION_KEY and CLAUDE_ORG_ID in .env.agent"
+        await update.message.reply_text(msg)
         return
     import aiohttp
 
-    url = f"https://claude.ai/api/organizations/{CLAUDE_ORG_ID}/usage"
+    url = f"https://claude.ai/api/organizations/{org_id}/usage"
     headers = {
         "accept": "*/*",
         "anthropic-client-platform": "web_claude_ai",
         "anthropic-client-version": "1.0.0",
         "content-type": "application/json",
-        "cookie": f"sessionKey={CLAUDE_SESSION_KEY}",
+        "cookie": f"sessionKey={session_key}",
     }
     try:
         async with aiohttp.ClientSession() as session, session.get(url, headers=headers) as resp:
             if resp.status == 401:
-                await update.message.reply_text("Session expired. Update CLAUDE_SESSION_KEY in .env.agent")
+                await update.message.reply_text(
+                    "Session expired. Use the browser extension Sync button to push fresh credentials."
+                )
                 return
             resp.raise_for_status()
             data = await resp.json()
@@ -1455,6 +1472,22 @@ async def notify_startup(app: Application) -> None:
             msg += f"\nWebhooks: port {WEBHOOK_PORT}"
         except Exception as e:
             logger.error("Failed to start webhook server: %s", e)
+
+    # Start credentials sync server if configured
+    if CREDENTIALS_PORT and CREDENTIALS_SYNC_TOKEN:
+        try:
+            from persistence import save_claude_credentials
+            from webhooks import start_credentials_server
+
+            def _on_credentials_update(session_key: str, org_id: str) -> None:
+                save_claude_credentials(session_key, org_id)
+                logger.info("Credentials updated via sync endpoint")
+
+            runner = await start_credentials_server(CREDENTIALS_SYNC_TOKEN, _on_credentials_update, CREDENTIALS_PORT)
+            app.bot_data["credentials_runner"] = runner
+            msg += f"\nCredentials sync: port {CREDENTIALS_PORT}"
+        except Exception as e:
+            logger.error("Failed to start credentials sync server: %s", e)
 
     for user_id in ALLOWED_USER_IDS:
         try:
