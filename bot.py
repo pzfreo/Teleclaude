@@ -1691,7 +1691,11 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
                         content_blocks.append(
                             {
                                 "type": "image",
-                                "source": {"type": "base64", "media_type": actual_mime, "data": base64.b64encode(data).decode()},
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": actual_mime,
+                                    "data": base64.b64encode(data).decode(),
+                                },
                             }
                         )
                     else:
