@@ -1598,6 +1598,19 @@ _IMAGE_MIME_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 _SUPPORTED_DOC_MIMES = _IMAGE_MIME_TYPES | {"application/pdf"}
 
 
+def _detect_image_mime(data: bytes) -> str | None:
+    """Detect image MIME type from magic bytes. Returns None if not a supported format."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 async def _download_telegram_file(file_obj, bot, max_size: int = MAX_FILE_SIZE) -> bytes:
     """Download a Telegram file and return its bytes.
 
@@ -1650,13 +1663,16 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
     if msg.sticker and not msg.sticker.is_animated and not msg.sticker.is_video:
         try:
             data = await _download_telegram_file(msg.sticker, bot)
-            media_type = "image/webp"
-            content_blocks.append(
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(data).decode()},
-                }
-            )
+            media_type = _detect_image_mime(data)
+            if media_type:
+                content_blocks.append(
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": base64.b64encode(data).decode()},
+                    }
+                )
+            else:
+                logger.warning("Sticker has unrecognized format, skipping image block")
             if not text:
                 text = f"[Sticker: {msg.sticker.emoji or 'unknown'}]"
         except Exception as e:
@@ -1670,12 +1686,17 @@ async def _build_user_content(update: Update, bot) -> list[dict] | str | None:
             if mime in _SUPPORTED_DOC_MIMES:
                 data = await _download_telegram_file(msg.document, bot)
                 if mime in _IMAGE_MIME_TYPES:
-                    content_blocks.append(
-                        {
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": mime, "data": base64.b64encode(data).decode()},
-                        }
-                    )
+                    actual_mime = _detect_image_mime(data)
+                    if actual_mime:
+                        content_blocks.append(
+                            {
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": actual_mime, "data": base64.b64encode(data).decode()},
+                            }
+                        )
+                    else:
+                        logger.warning("Document %s has unrecognized image format (claimed %s), skipping", fname, mime)
+                        text += f"\n[Attached image: {fname} — format not supported]"
                 elif mime == "application/pdf":
                     content_blocks.append(
                         {
