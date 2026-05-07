@@ -369,6 +369,7 @@ class TestRunScheduledPrompt:
         with (
             patch("bot._call_anthropic", new_callable=AsyncMock, return_value=mock_response),
             patch("bot.get_active_repo", return_value=None),
+            patch("bot.get_model", return_value="claude-sonnet-4-6"),
         ):
             await run_scheduled_prompt(mock_bot, 1001, "Give me a briefing")
 
