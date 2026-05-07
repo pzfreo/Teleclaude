@@ -1893,9 +1893,13 @@ async def _process_message(
     """
     bot = context.bot
     history = get_conversation(chat_id)
-    history_len_before = len(history)
     history.append({"role": "user", "content": user_content})
     trim_history(chat_id)
+    # Set AFTER trim_history so it accounts for any messages it removed from the front.
+    # trim_history modifies history in-place; the user message is always at history[-1].
+    # On rollback, del history[history_len_before:] removes the user message and any
+    # assistant/tool messages appended during tool rounds.
+    history_len_before = len(history) - 1
 
     repo = get_active_repo(chat_id)
     tools = _build_tool_list(interactive=True)
@@ -2057,7 +2061,7 @@ async def _process_message(
     except anthropic.APIError as e:
         logger.error("Anthropic API error: %s", e)
         # Roll back all messages added during this request
-        conversations[chat_id] = history[:history_len_before]
+        del history[history_len_before:]
         save_state(chat_id)
         stop_typing.set()
         await typing_task
@@ -2066,7 +2070,7 @@ async def _process_message(
     except Exception as e:
         logger.error("Unexpected error: %s", e, exc_info=True)
         # Roll back all messages added during this request
-        conversations[chat_id] = history[:history_len_before]
+        del history[history_len_before:]
         save_state(chat_id)
         stop_typing.set()
         await typing_task
