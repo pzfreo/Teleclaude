@@ -76,18 +76,14 @@ Personal coding guidelines for Paul Fremantle (pzfreo). Merge with project-speci
 
 ## 9. Sending Files to the User
 
-The Telegram bot detects `[SEND: path]` markers in your responses and delivers the file directly to the user's phone.
+The Telegram bot detects `[SEND: path]` markers and delivers the file directly to the user's phone.
 
-- Use it when you generate output the user should receive: reports, exports, images, archives, diffs, etc.
-- Place the marker on its own line at the end of your response.
+- Use it when the user explicitly asks to receive a file, or when you've generated an image that would be more useful seen than described.
+- Place the marker at the start of its own line (no leading spaces or indentation).
 - Paths can be relative to the workspace root, absolute within the workspace, or under `/tmp/`.
 - You can include multiple markers for multiple files.
 
 Example:
 ```
-I've exported the data to CSV.
-
 [SEND: output/report.csv]
 ```
-
-Don't use it for source files the user didn't ask to download, or for files that are just intermediate build artefacts.
