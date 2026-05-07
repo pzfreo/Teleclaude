@@ -2535,7 +2535,7 @@ async def _run_pulse_action(bot, chat_id: int, triage_result: dict) -> None:
 
     for _ in range(8):
         response = await _call_anthropic(
-            model=DEFAULT_MODEL,
+            model=get_model(chat_id),
             max_tokens=2048,
             system=system,
             messages=messages,
@@ -2837,7 +2837,7 @@ async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
     loop = asyncio.get_running_loop()
     for _ in range(10):
         response = await _call_anthropic(
-            model=DEFAULT_MODEL,
+            model=get_model(chat_id),
             max_tokens=2048,
             system=system,
             messages=messages,
@@ -3240,8 +3240,13 @@ def main() -> None:
     global AVAILABLE_MODELS, BACKGROUND_MODEL, DEFAULT_MODEL
     AVAILABLE_MODELS = _resolve_latest_models(AVAILABLE_MODELS)
     BACKGROUND_MODEL = AVAILABLE_MODELS["haiku"]
+    # Resolve DEFAULT_MODEL: no env var → use latest sonnet; bare alias (e.g. "claude-sonnet",
+    # "sonnet") → map through AVAILABLE_MODELS so stale env vars always get a valid versioned ID.
+    aliases = {**AVAILABLE_MODELS, **{f"claude-{k}": v for k, v in AVAILABLE_MODELS.items()}}
     if not os.getenv("CLAUDE_MODEL"):
         DEFAULT_MODEL = AVAILABLE_MODELS["sonnet"]
+    else:
+        DEFAULT_MODEL = aliases.get(DEFAULT_MODEL, DEFAULT_MODEL)
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
