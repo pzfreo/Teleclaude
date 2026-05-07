@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+from collections.abc import Callable
 
 from aiohttp import web
 
@@ -140,7 +141,7 @@ def create_webhook_app(bot, notify_chat_ids: set[int]) -> web.Application:
     return app
 
 
-async def start_credentials_server(sync_token: str, on_update: object, port: int) -> web.AppRunner:
+async def start_credentials_server(sync_token: str, on_update: Callable[[str, str], None], port: int) -> web.AppRunner:
     """Start a minimal HTTP server that accepts credential sync POSTs from the browser extension.
 
     on_update(session_key, org_id) is called when valid credentials arrive.
