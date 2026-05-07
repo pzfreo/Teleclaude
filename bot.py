@@ -99,6 +99,8 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_SESSION_KEY = os.getenv("CLAUDE_SESSION_KEY", "")
+CLAUDE_ORG_ID = os.getenv("CLAUDE_ORG_ID", "")
 
 AVAILABLE_MODELS = {
     "opus": "claude-opus-4-6",
@@ -1252,6 +1254,62 @@ async def send_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     buf = io.BytesIO(content.encode("utf-8"))
     buf.name = f"teleclaude_logs_{minutes}min.txt"
     await update.message.reply_document(document=buf, caption=f"Last {minutes} min — {len(lines)} lines")
+
+
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /usage — show Claude plan usage limits."""
+    if not is_authorized(update.effective_user.id):
+        return
+    from persistence import load_claude_credentials
+
+    file_key, file_org = load_claude_credentials()
+    session_key = file_key or CLAUDE_SESSION_KEY
+    org_id = file_org or CLAUDE_ORG_ID
+    if not session_key or not org_id:
+        await update.message.reply_text(
+            "Claude usage not configured. Use the browser extension Sync button, or set CLAUDE_SESSION_KEY and CLAUDE_ORG_ID in .env"
+        )
+        return
+    import aiohttp
+
+    url = f"https://claude.ai/api/organizations/{org_id}/usage"
+    headers = {
+        "accept": "*/*",
+        "anthropic-client-platform": "web_claude_ai",
+        "anthropic-client-version": "1.0.0",
+        "content-type": "application/json",
+        "cookie": f"sessionKey={session_key}",
+    }
+    try:
+        async with aiohttp.ClientSession() as session, session.get(url, headers=headers) as resp:
+            if resp.status == 401:
+                await update.message.reply_text(
+                    "Session expired. Use the browser extension Sync button to push fresh credentials."
+                )
+                return
+            resp.raise_for_status()
+            data = await resp.json()
+    except Exception as e:
+        logger.error("Failed to fetch Claude usage: %s", e)
+        await update.message.reply_text(f"Error fetching usage: {e}")
+        return
+
+    lines = []
+    labels = {
+        "five_hour": "Session",
+        "seven_day": "Weekly (all)",
+        "seven_day_sonnet": "Weekly (Sonnet)",
+    }
+    for key, label in labels.items():
+        if key in data and data[key] is not None:
+            pct = round(data[key].get("utilization", 0))
+            resets_at = data[key].get("resets_at", "")
+            reset_str = f" — resets {resets_at[:10]}" if resets_at else ""
+            lines.append(f"{label}: {pct}%{reset_str}")
+    if lines:
+        await update.message.reply_text("Claude usage:\n" + "\n".join(lines))
+    else:
+        await update.message.reply_text("No usage data returned.")
 
 
 async def show_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3172,6 +3230,7 @@ def main() -> None:
     app.add_handler(CommandHandler("monitors", monitors_command))
     app.add_handler(CommandHandler("pulse", pulse_command))
     app.add_handler(CommandHandler("logs", send_logs))
+    app.add_handler(CommandHandler("usage", usage_command))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CallbackQueryHandler(_ask_user_callback, pattern=r"^ask_user:"))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))

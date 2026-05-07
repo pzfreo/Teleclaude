@@ -10,6 +10,8 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env.agent
+    ports:
+      - "8081:8081"
     user: root
     command:
       - /bin/bash
