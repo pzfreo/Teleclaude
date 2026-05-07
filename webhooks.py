@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+from collections.abc import Callable
 
 from aiohttp import web
 
@@ -138,6 +139,43 @@ def create_webhook_app(bot, notify_chat_ids: set[int]) -> web.Application:
     app.router.add_post("/webhook/github", handle_webhook)
     app.router.add_get("/health", health)
     return app
+
+
+async def start_credentials_server(sync_token: str, on_update: Callable[[str, str], None], port: int) -> web.AppRunner:
+    """Start a minimal HTTP server that accepts credential sync POSTs from the browser extension.
+
+    on_update(session_key, org_id) is called when valid credentials arrive.
+    """
+
+    async def handle_sync(request: web.Request) -> web.Response:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {sync_token}":
+            logger.warning("Credentials sync: unauthorized attempt from %s", request.remote)
+            return web.Response(status=401, text="Unauthorized")
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(status=400, text="Invalid JSON")
+        session_key = data.get("session_key", "")
+        org_id = data.get("org_id", "")
+        if not session_key or not org_id:
+            return web.Response(status=400, text="Missing session_key or org_id")
+        on_update(session_key, org_id)
+        logger.info("Credentials synced from extension")
+        return web.Response(text="ok")
+
+    async def health(request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_post("/sync-credentials", handle_sync)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("Credentials sync server started on port %d", port)
+    return runner
 
 
 async def start_webhook_server(bot, notify_chat_ids: set[int], port: int = 8080) -> web.AppRunner:
