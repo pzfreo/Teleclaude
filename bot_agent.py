@@ -5,7 +5,6 @@ from pathlib import Path
 VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 
 import asyncio
-import collections
 import datetime
 import io
 import logging
@@ -34,12 +33,10 @@ from persistence import (
     init_db,
     load_active_branch,
     load_active_repo,
-    load_conversation,
     load_model,
     load_session_id,
     save_active_branch,
     save_active_repo,
-    save_conversation,
     save_model,
     save_session_id,
 )
@@ -134,8 +131,6 @@ active_branches: dict[int, str] = {}
 chat_models: dict[int, str] = {}
 _plan_mode: set[int] = set()  # chat IDs with plan mode enabled
 _stream_mode: set[int] = set()  # chat IDs with /new-stream continuous mode
-_chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
-_chat_generation: dict[int, int] = collections.defaultdict(int)
 _typing_tasks: dict[int, asyncio.Task] = {}
 _frag_buffers: dict[int, str] = {}  # chat_id -> buffered text from split pastes
 _frag_tasks: dict[int, asyncio.Task] = {}  # chat_id -> pending flush task
@@ -274,20 +269,6 @@ def _short_path(path: str) -> str:
     """Shorten a file path to last 2-3 components."""
     parts = path.replace("\\", "/").split("/")
     return "/".join(parts[-3:]) if len(parts) > 3 else path
-
-
-async def keep_typing(chat, stop_event: asyncio.Event, bot):
-    """Keep typing indicator alive until stop_event is set."""
-    while not stop_event.is_set():
-        try:
-            await chat.send_action("typing")
-        except TelegramError:
-            pass
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=TYPING_INTERVAL)
-            break
-        except TimeoutError:
-            continue
 
 
 def _start_stream_typing(chat_id: int, bot) -> None:
@@ -614,7 +595,6 @@ async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
-    _chat_generation[chat_id] += 1  # invalidate all queued coroutines
     was_streaming = chat_id in _stream_mode
     _stream_mode.discard(chat_id)
     _stop_stream_typing(chat_id)
@@ -1092,23 +1072,13 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Plan mode ON. Claude will plan but not implement.\nSend /work to switch back.")
         return
 
-    # One-shot: plan a specific task
+    # Send the framed planning prompt through the normal stream path
     prompt = (
         "Think carefully and create a plan for this task. Present the full plan in your response so I can review it. "
         "Do NOT start implementing until I approve.\n\n"
         f"Task: {task}"
     )
-    lock = _chat_locks[chat_id]
-    gen = _chat_generation[chat_id]
-    if lock.locked():
-        try:
-            await update.message.reply_text("Queued — finishing current request first.")
-        except TelegramError:
-            pass
-    async with lock:
-        if _chat_generation[chat_id] != gen:
-            return  # /stop was called while we were queued
-        await _run_cli(chat_id, prompt, update, context)
+    await _dispatch_prompt(chat_id, prompt, update, context)
 
 
 async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1140,20 +1110,15 @@ async def btw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     framed = f"BTW (side question — answer briefly, don't change your current task): {question}"
 
-    if claude_code_mgr.is_processing(chat_id):
+    if claude_code_mgr.stream_mode_active(chat_id):
         sent = await claude_code_mgr.send_followup(chat_id, framed)
         if sent:
             await update.message.reply_text("Side question sent.")
             return
-        await update.message.reply_text("Couldn't reach the running process — running as a new task.")
 
-    # Not actively processing — run as a one-shot
-    lock = _chat_locks[chat_id]
-    gen = _chat_generation[chat_id]
-    async with lock:
-        if _chat_generation[chat_id] != gen:
-            return
-        await _run_cli(chat_id, question, update, context)
+    # No active stream (or feed failed) — fall back to a normal message and notify.
+    await update.message.reply_text("No active session — sending as a normal message.")
+    await _dispatch_prompt(chat_id, question, update, context)
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1265,179 +1230,82 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _dispatch_prompt(chat_id, prompt, update, context)
 
 
+async def _start_stream_for_chat(chat_id: int, repo: str, bot) -> str | None:
+    """Start a stream for this chat. Returns None on success, or an error string."""
+    on_event = _make_stream_event_handler(chat_id, bot)
+    try:
+        await claude_code_mgr.start_stream(
+            chat_id=chat_id,
+            repo=repo,
+            on_event=on_event,
+            branch=get_active_branch(chat_id),
+            model=get_model(chat_id),
+            permission_mode="plan" if chat_id in _plan_mode else None,
+        )
+    except Exception as e:
+        logger.error("Stream start failed for chat %d: %s", chat_id, e, exc_info=True)
+        _stream_mode.discard(chat_id)
+        return f"Failed to start Claude Code: {e}"
+    _stream_mode.add(chat_id)
+    return None
+
+
 async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route an assembled prompt to stream mode or one-shot processing."""
-    # Check for "-" prefix: send as follow-up to running process
+    """Route an assembled prompt to the running CC stream, starting one if needed."""
+    # "-" prefix: send as follow-up to running process
     is_followup = prompt.startswith("-") and len(prompt) > 1
     if is_followup:
         followup_text = prompt[1:].lstrip()
-        if claude_code_mgr.is_processing(chat_id) or claude_code_mgr.stream_mode_active(chat_id):
+        if claude_code_mgr.stream_mode_active(chat_id):
             sent = await claude_code_mgr.send_followup(chat_id, followup_text)
             if sent:
                 await update.message.reply_text("Sent to Claude.")
                 return
-            # Followup failed (pipe broken etc.) — fall through to process normally
-        # Not actively processing — strip the dash and process as normal message
+        # No active stream (or feed failed) — strip the dash and dispatch normally
         prompt = followup_text
 
-    # Auto-start stream mode if not already active (stream is the default)
-    if chat_id not in _stream_mode:
-        repo = get_active_repo(chat_id)
-        if repo:
-            on_event = _make_stream_event_handler(chat_id, context.bot)
-            try:
-                await claude_code_mgr.start_stream(
-                    chat_id=chat_id,
-                    repo=repo,
-                    on_event=on_event,
-                    branch=get_active_branch(chat_id),
-                    model=get_model(chat_id),
-                    permission_mode="plan" if chat_id in _plan_mode else None,
-                )
-                _stream_mode.add(chat_id)
-            except Exception as e:
-                logger.error("Auto-start stream failed for chat %d: %s", chat_id, e, exc_info=True)
-                # Fall through to one-shot on failure
-
-    # Stream mode: pipe straight to CC via stdin; the continuous reader posts responses
-    if chat_id in _stream_mode:
-        if not claude_code_mgr.stream_mode_active(chat_id):
-            # Reader task died (process crashed etc.) — drop out of stream mode
-            _stream_mode.discard(chat_id)
-            await update.message.reply_text("Stream is no longer active. Falling back to one-shot.")
-        else:
-            sent = await claude_code_mgr.feed(chat_id, prompt)
-            if sent:
-                _start_stream_typing(chat_id, context.bot)
-                return
-            _stream_mode.discard(chat_id)
-            await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
-            await update.message.reply_text("Stream died mid-send. Falling back to one-shot.")
-
-    lock = _chat_locks[chat_id]
-    gen = _chat_generation[chat_id]
-    if lock.locked():
-        try:
-            await update.message.reply_text("Queued — finishing current request first.")
-        except TelegramError:
-            pass
-    async with lock:
-        if _chat_generation[chat_id] != gen:
-            return  # /stop was called while we were queued
-        await _run_cli(chat_id, prompt, update, context)
-
-
-async def _run_cli(chat_id: int, prompt: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run the prompt through Claude Code CLI and send the result."""
-    bot = context.bot
     repo = get_active_repo(chat_id)
-
     if not repo:
         await update.message.reply_text("No repo set. Use /repo owner/name first.")
         return
 
-    model = get_model(chat_id)
-    branch = get_active_branch(chat_id)
-
-    # Restore session ID from DB if not already in memory
+    # Restore session ID from DB if we don't have one in memory yet,
+    # so the auto-started stream resumes via --resume.
     if claude_code_mgr.get_session_id(chat_id) is None:
         saved_session = load_session_id(chat_id)
         if saved_session:
             claude_code_mgr._sessions[chat_id] = saved_session
             logger.info("Restored session %s for chat %d", saved_session, chat_id)
 
-    # Progress: send a Telegram message for each tool invocation
-    tool_count = 0
-    last_progress_time = 0.0
-    MIN_PROGRESS_GAP = 2.0  # don't spam faster than every 2s
-
-    async def on_progress(block: dict):
-        nonlocal tool_count, last_progress_time
-        # Stats, system events, and reasoning text bypass the counter and throttle
-        if block.get("_type") or block.get("type") == "text":
-            line = _format_tool_progress(block)
-            if line:
-                pm = "HTML" if block.get("type") == "text" else None
-                await send_long_message(chat_id, line, bot, parse_mode=pm)
+    # Auto-start stream if not running. Reader task may have died, in which
+    # case stream_mode_active() returns False even when chat_id is in _stream_mode.
+    if chat_id not in _stream_mode or not claude_code_mgr.stream_mode_active(chat_id):
+        _stream_mode.discard(chat_id)
+        err = await _start_stream_for_chat(chat_id, repo, context.bot)
+        if err:
+            await update.message.reply_text(err)
             return
-        tool_count += 1
-        now = time.time()
-        # Throttle: skip if too soon after last message
-        if now - last_progress_time < MIN_PROGRESS_GAP:
+
+    sent = await claude_code_mgr.feed(chat_id, prompt)
+    if not sent:
+        # Stream pipe broken mid-send. Tear down and restart once, then retry.
+        await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
+        _stream_mode.discard(chat_id)
+        err = await _start_stream_for_chat(chat_id, repo, context.bot)
+        if err:
+            await update.message.reply_text(f"Stream restart failed: {err}")
             return
-        line = _format_tool_progress(block)
-        if not line:
+        sent = await claude_code_mgr.feed(chat_id, prompt)
+        if not sent:
+            await update.message.reply_text("Stream died and could not be revived. Try /newstream.")
             return
-        last_progress_time = now
-        await send_long_message(chat_id, f"[{tool_count}] {line}", bot)
 
-    async def on_timeout(elapsed_seconds: int) -> bool:
-        """Called when CLI timeout fires. Notifies user and continues."""
-        from claude_code import _get_cli_timeout
+    # Persist session ID once the stream is feeding so it survives restarts.
+    current_session = claude_code_mgr.get_session_id(chat_id)
+    if current_session:
+        save_session_id(chat_id, current_session)
 
-        minutes = elapsed_seconds // 60
-        next_minutes = _get_cli_timeout() // 60
-        msg = f"Still running after {minutes} min. Continuing for another {next_minutes} min — send /stop to abort."
-        try:
-            await bot.send_message(chat_id=chat_id, text=msg)
-        except TelegramError:
-            pass
-        return True  # always continue; user can /stop
-
-    # Typing indicator
-    stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(keep_typing(update.effective_chat, stop_typing, bot))
-
-    try:
-        result = await claude_code_mgr.run(
-            chat_id=chat_id,
-            repo=repo,
-            prompt=prompt,
-            branch=branch,
-            model=model,
-            on_progress=on_progress,
-            on_timeout=on_timeout,
-            permission_mode="plan" if chat_id in _plan_mode else None,
-        )
-    except Exception as e:
-        logger.error("Claude Code run failed: %s", e, exc_info=True)
-        result = f"Claude Code error: {e}"
-    finally:
-        stop_typing.set()
-        await typing_task
-        # Persist session ID immediately so it survives restarts/crashes
-        current_session = claude_code_mgr.get_session_id(chat_id)
-        if current_session:
-            save_session_id(chat_id, current_session)
-
-    text_was_streamed = claude_code_mgr.was_text_streamed(chat_id)
-
-    if result and not result.startswith("("):
-        result = await _parse_and_send_markers(chat_id, result, repo, bot)
-
-    if not result and not text_was_streamed:
-        result = "(no output)"
-
-    # Save to conversation history for persistence
-    save_conversation(
-        chat_id,
-        [
-            *load_conversation(chat_id),
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": result},
-        ],
-    )
-
-    # Don't send redundant message if aborted — /stop or /new already replied
-    if result in ("(stopped)", "(aborted)"):
-        return
-
-    # Skip sending if text was already shown via progress callbacks
-    if text_was_streamed:
-        return
-
-    if result:
-        await send_long_message(chat_id, result, bot, parse_mode="HTML")
+    _start_stream_typing(chat_id, context.bot)
 
 
 # ── Startup ───────────────────────────────────────────────────────────

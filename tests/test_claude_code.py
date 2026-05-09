@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from claude_code import ClaudeCodeManager, _get_cli_timeout
+from claude_code import ClaudeCodeManager
 
 
 class TestClaudeCodeManager:
@@ -127,30 +127,6 @@ class TestPathTraversal:
         mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
         path = mgr.workspace_path("org/repo-with-dashes")
         assert path == tmp_path / "org" / "repo-with-dashes"
-
-
-class TestCliTimeout:
-    """Test _get_cli_timeout() configuration."""
-
-    def test_default_value(self):
-        with patch.dict("os.environ", {}, clear=False):
-            # Remove CLAUDE_CLI_TIMEOUT if present
-            import os
-
-            os.environ.pop("CLAUDE_CLI_TIMEOUT", None)
-            assert _get_cli_timeout() == 600
-
-    def test_custom_value(self):
-        with patch.dict("os.environ", {"CLAUDE_CLI_TIMEOUT": "1200"}):
-            assert _get_cli_timeout() == 1200
-
-    def test_minimum_clamped(self):
-        with patch.dict("os.environ", {"CLAUDE_CLI_TIMEOUT": "10"}):
-            assert _get_cli_timeout() == 60  # clamped to minimum
-
-    def test_invalid_string_falls_back(self):
-        with patch.dict("os.environ", {"CLAUDE_CLI_TIMEOUT": "not-a-number"}):
-            assert _get_cli_timeout() == 600
 
 
 class _FakeStdout:

@@ -152,162 +152,6 @@ class TestSaveAttachment:
 from helpers import make_context as _make_context
 from helpers import make_update as _make_update
 
-# ── _run_cli tests ────────────────────────────────────────────────────
-
-
-class TestRunCli:
-    """Test the _run_cli function that wraps Claude Code CLI calls."""
-
-    async def test_no_repo_sends_error(self):
-        from bot_agent import _run_cli
-
-        update = _make_update(chat_id=3333)
-        ctx = _make_context()
-        with patch("bot_agent.get_active_repo", return_value=None):
-            await _run_cli(3333, "hello", update, ctx)
-        update.message.reply_text.assert_called_once()
-        assert "No repo" in update.message.reply_text.call_args[0][0]
-
-    async def test_successful_run(self):
-        from bot_agent import _run_cli
-
-        update = _make_update(chat_id=3332)
-        ctx = _make_context()
-        with (
-            patch("bot_agent.get_active_repo", return_value="owner/repo"),
-            patch("bot_agent.get_model", return_value="claude-test"),
-            patch("bot_agent.get_active_branch", return_value=None),
-            patch("bot_agent.claude_code_mgr") as mock_mgr,
-            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
-            patch("bot_agent.save_conversation"),
-            patch("bot_agent.load_conversation", return_value=[]),
-            patch("bot_agent.save_session_id"),
-            patch("bot_agent.load_session_id", return_value=None),
-        ):
-            mock_mgr.run = AsyncMock(return_value="CLI output here")
-            mock_mgr.was_text_streamed.return_value = False
-            await _run_cli(3332, "do something", update, ctx)
-        mock_send.assert_called_once()
-        assert "CLI output here" in mock_send.call_args[0][1]
-
-    async def test_empty_result_shows_no_output(self):
-        from bot_agent import _run_cli
-
-        update = _make_update(chat_id=3331)
-        ctx = _make_context()
-        with (
-            patch("bot_agent.get_active_repo", return_value="owner/repo"),
-            patch("bot_agent.get_model", return_value="claude-test"),
-            patch("bot_agent.get_active_branch", return_value=None),
-            patch("bot_agent.claude_code_mgr") as mock_mgr,
-            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
-            patch("bot_agent.save_conversation"),
-            patch("bot_agent.load_conversation", return_value=[]),
-            patch("bot_agent.save_session_id"),
-            patch("bot_agent.load_session_id", return_value=None),
-        ):
-            mock_mgr.run = AsyncMock(return_value="")
-            mock_mgr.was_text_streamed.return_value = False
-            await _run_cli(3331, "do something", update, ctx)
-        sent = mock_send.call_args[0][1]
-        assert "no output" in sent.lower()
-
-    async def test_streamed_text_not_double_sent(self):
-        from bot_agent import _run_cli
-
-        update = _make_update(chat_id=3335)
-        ctx = _make_context()
-        with (
-            patch("bot_agent.get_active_repo", return_value="owner/repo"),
-            patch("bot_agent.get_model", return_value="claude-test"),
-            patch("bot_agent.get_active_branch", return_value=None),
-            patch("bot_agent.claude_code_mgr") as mock_mgr,
-            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
-            patch("bot_agent.save_conversation") as mock_save,
-            patch("bot_agent.load_conversation", return_value=[]),
-            patch("bot_agent.save_session_id"),
-            patch("bot_agent.load_session_id", return_value=None),
-        ):
-            mock_mgr.run = AsyncMock(return_value="Already streamed text")
-            mock_mgr.was_text_streamed.return_value = True
-            await _run_cli(3335, "do something", update, ctx)
-        mock_send.assert_not_called()
-        mock_save.assert_called_once()
-        saved_history = mock_save.call_args[0][1]
-        assert saved_history[-1]["content"] == "Already streamed text"
-
-    async def test_cli_error_caught(self):
-        from bot_agent import _run_cli
-
-        update = _make_update(chat_id=3330)
-        ctx = _make_context()
-        with (
-            patch("bot_agent.get_active_repo", return_value="owner/repo"),
-            patch("bot_agent.get_model", return_value="claude-test"),
-            patch("bot_agent.get_active_branch", return_value=None),
-            patch("bot_agent.claude_code_mgr") as mock_mgr,
-            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
-            patch("bot_agent.save_conversation"),
-            patch("bot_agent.load_conversation", return_value=[]),
-            patch("bot_agent.save_session_id"),
-            patch("bot_agent.load_session_id", return_value=None),
-        ):
-            mock_mgr.run = AsyncMock(side_effect=RuntimeError("CLI crashed"))
-            mock_mgr.was_text_streamed.return_value = False
-            await _run_cli(3330, "do something", update, ctx)
-        sent = mock_send.call_args[0][1]
-        assert "error" in sent.lower()
-
-    async def test_saves_conversation_after_run(self):
-        from bot_agent import _run_cli
-
-        update = _make_update(chat_id=3329)
-        ctx = _make_context()
-        with (
-            patch("bot_agent.get_active_repo", return_value="owner/repo"),
-            patch("bot_agent.get_model", return_value="claude-test"),
-            patch("bot_agent.get_active_branch", return_value="main"),
-            patch("bot_agent.claude_code_mgr") as mock_mgr,
-            patch("bot_agent.send_long_message", new_callable=AsyncMock),
-            patch("bot_agent.save_conversation") as mock_save,
-            patch("bot_agent.load_conversation", return_value=[]),
-            patch("bot_agent.save_session_id"),
-            patch("bot_agent.load_session_id", return_value=None),
-        ):
-            mock_mgr.run = AsyncMock(return_value="result")
-            mock_mgr.was_text_streamed.return_value = False
-            await _run_cli(3329, "prompt", update, ctx)
-        mock_save.assert_called_once()
-        saved_msgs = mock_save.call_args[0][1]
-        assert saved_msgs[-2]["role"] == "user"
-        assert saved_msgs[-1]["role"] == "assistant"
-
-    async def test_restores_session_from_db(self):
-        """Session ID should be restored from DB when not in memory."""
-        from bot_agent import _run_cli
-
-        update = _make_update(chat_id=3328)
-        ctx = _make_context()
-        with (
-            patch("bot_agent.get_active_repo", return_value="owner/repo"),
-            patch("bot_agent.get_model", return_value="claude-test"),
-            patch("bot_agent.get_active_branch", return_value=None),
-            patch("bot_agent.claude_code_mgr") as mock_mgr,
-            patch("bot_agent.send_long_message", new_callable=AsyncMock),
-            patch("bot_agent.save_conversation"),
-            patch("bot_agent.load_conversation", return_value=[]),
-            patch("bot_agent.save_session_id"),
-            patch("bot_agent.load_session_id", return_value="saved-session-xyz"),
-        ):
-            mock_mgr.get_session_id.return_value = None
-            mock_mgr._sessions = {}
-            mock_mgr.run = AsyncMock(return_value="result")
-            mock_mgr.was_text_streamed.return_value = False
-            await _run_cli(3328, "prompt", update, ctx)
-        # Session should have been restored into _sessions
-        assert mock_mgr._sessions.get(3328) == "saved-session-xyz"
-
-
 # ── handle_message tests ──────────────────────────────────────────────
 
 
@@ -333,10 +177,10 @@ class TestAgentHandleMessage:
         ctx = _make_context()
         with (
             patch("bot_agent.is_authorized", return_value=True),
-            patch("bot_agent._run_cli", new_callable=AsyncMock) as mock_run,
+            patch("bot_agent._dispatch_prompt", new_callable=AsyncMock) as mock_dispatch,
         ):
             await handle_message(update, ctx)
-        mock_run.assert_not_called()
+        mock_dispatch.assert_not_called()
 
     async def test_text_message_processed(self):
         from bot_agent import handle_message
@@ -346,11 +190,11 @@ class TestAgentHandleMessage:
         with (
             patch("bot_agent.is_authorized", return_value=True),
             patch("bot_agent.get_active_repo", return_value=None),
-            patch("bot_agent._run_cli", new_callable=AsyncMock) as mock_run,
+            patch("bot_agent._dispatch_prompt", new_callable=AsyncMock) as mock_dispatch,
             patch("bot_agent.audit_log"),
         ):
             await handle_message(update, ctx)
-        mock_run.assert_called_once()
+        mock_dispatch.assert_called_once()
 
     async def test_no_message_noop(self):
         from bot_agent import handle_message
@@ -371,13 +215,13 @@ class TestAgentHandleMessage:
         with (
             patch("bot_agent.is_authorized", return_value=True),
             patch("bot_agent.get_active_repo", return_value=None),
-            patch("bot_agent._run_cli", new_callable=AsyncMock) as mock_run,
+            patch("bot_agent._dispatch_prompt", new_callable=AsyncMock) as mock_dispatch,
             patch("bot_agent.audit_log"),
         ):
             await handle_message(update, ctx)
-        # Voice adds text about unsupported, then _run_cli is called
-        mock_run.assert_called_once()
-        prompt = mock_run.call_args[0][1]
+        # Voice adds text about unsupported, then dispatch is called
+        mock_dispatch.assert_called_once()
+        prompt = mock_dispatch.call_args[0][1]
         assert "not supported" in prompt.lower()
 
 
@@ -472,7 +316,7 @@ class TestPlanWorkMode:
         # Clean up
         bot_agent._plan_mode.discard(5001)
 
-    async def test_plan_with_task_runs_cli(self):
+    async def test_plan_with_task_dispatches_framed_prompt(self):
         from bot_agent import plan_command
 
         update = _make_update(chat_id=5002)
@@ -480,12 +324,13 @@ class TestPlanWorkMode:
         ctx = _make_context()
         with (
             patch("bot_agent.is_authorized", return_value=True),
-            patch("bot_agent._run_cli", new_callable=AsyncMock) as mock_run,
+            patch("bot_agent._dispatch_prompt", new_callable=AsyncMock) as mock_dispatch,
         ):
             await plan_command(update, ctx)
-        mock_run.assert_called_once()
-        prompt = mock_run.call_args[0][1]
+        mock_dispatch.assert_called_once()
+        prompt = mock_dispatch.call_args[0][1]
         assert "implement auth" in prompt
+        assert "plan" in prompt.lower()
 
     async def test_work_disables_plan_mode(self):
         import bot_agent
@@ -511,23 +356,6 @@ class TestPlanWorkMode:
             await work_command(update, ctx)
         text = update.message.reply_text.call_args[0][0]
         assert "already" in text.lower()
-
-
-# ── keep_typing tests ─────────────────────────────────────────────────
-
-
-class TestAgentKeepTyping:
-    async def test_stops_on_event(self):
-        import asyncio
-
-        from bot_agent import keep_typing
-
-        chat = AsyncMock()
-        bot = AsyncMock()
-        stop = asyncio.Event()
-        stop.set()
-        await keep_typing(chat, stop, bot)
-        # Should complete quickly
 
 
 # ── Stream mode (/newstream) tests ────────────────────────────────────
@@ -611,20 +439,21 @@ class TestNewStream:
             with (
                 patch("bot_agent.is_authorized", return_value=True),
                 patch("bot_agent.audit_log"),
-                patch("bot_agent._run_cli", new_callable=AsyncMock) as mock_run_cli,
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.load_session_id", return_value=None),
+                patch("bot_agent.save_session_id"),
                 patch("bot_agent.claude_code_mgr") as mock_mgr,
             ):
-                mock_mgr.is_processing = MagicMock(return_value=False)
                 mock_mgr.stream_mode_active = MagicMock(return_value=True)
+                mock_mgr.get_session_id = MagicMock(return_value="sess-1")
                 mock_mgr.feed = AsyncMock(return_value=True)
                 await handle_message(update, ctx)
             mock_mgr.feed.assert_awaited_once_with(6004, "hello claude")
-            mock_run_cli.assert_not_called()
         finally:
             bot_agent._stream_mode.discard(6004)
 
-    async def test_handle_message_stream_inactive_falls_back(self):
-        """If _stream_mode flag is set but reader task died, drop flag and run one-shot."""
+    async def test_handle_message_stream_inactive_restarts(self):
+        """If stream flag is set but reader task died, drop flag, restart, and feed."""
         import bot_agent
         from bot_agent import handle_message
 
@@ -635,16 +464,22 @@ class TestNewStream:
             with (
                 patch("bot_agent.is_authorized", return_value=True),
                 patch("bot_agent.audit_log"),
-                patch("bot_agent._run_cli", new_callable=AsyncMock) as mock_run_cli,
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.get_active_branch", return_value=None),
+                patch("bot_agent.get_model", return_value="opus"),
+                patch("bot_agent.load_session_id", return_value=None),
+                patch("bot_agent.save_session_id"),
                 patch("bot_agent.claude_code_mgr") as mock_mgr,
             ):
-                mock_mgr.is_processing = MagicMock(return_value=False)
                 mock_mgr.stream_mode_active = MagicMock(return_value=False)
-                mock_mgr.feed = AsyncMock()
+                mock_mgr.get_session_id = MagicMock(return_value="sess-1")
+                mock_mgr.start_stream = AsyncMock()
+                mock_mgr.feed = AsyncMock(return_value=True)
                 await handle_message(update, ctx)
-            assert 6005 not in bot_agent._stream_mode
-            mock_mgr.feed.assert_not_called()
-            mock_run_cli.assert_called_once()
+            # Stream was restarted and message fed
+            mock_mgr.start_stream.assert_awaited_once()
+            mock_mgr.feed.assert_awaited_once_with(6005, "hi")
+            assert 6005 in bot_agent._stream_mode
         finally:
             bot_agent._stream_mode.discard(6005)
 
@@ -943,9 +778,13 @@ class TestStreamTypingIndicator:
             with (
                 patch("bot_agent.is_authorized", return_value=True),
                 patch("bot_agent.audit_log"),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.load_session_id", return_value=None),
+                patch("bot_agent.save_session_id"),
                 patch("bot_agent.claude_code_mgr") as mock_mgr,
             ):
                 mock_mgr.stream_mode_active.return_value = True
+                mock_mgr.get_session_id = MagicMock(return_value="sess-1")
                 mock_mgr.feed = AsyncMock(return_value=True)
                 await handle_message(update, ctx)
 
@@ -983,7 +822,7 @@ class TestStreamTypingIndicator:
             with (
                 patch("bot_agent.is_authorized", return_value=True),
                 patch("bot_agent.audit_log"),
-                # Patch _dispatch_prompt so we don't need to wire up all of _run_cli
+                # Patch _dispatch_prompt so we don't need to wire up the full stream path
                 patch("bot_agent._dispatch_prompt", new_callable=AsyncMock),
             ):
                 await handle_message(update, ctx)
