@@ -35,20 +35,31 @@ class TestClaudeCodeManager:
 
     def test_session_management(self, tmp_path):
         mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
-        assert mgr.get_session_id(1001) is None
-        mgr._sessions[1001] = "session-abc"
-        assert mgr.get_session_id(1001) == "session-abc"
+        assert mgr.get_session_id(1001, "owner/repo") is None
+        mgr._sessions[(1001, "owner/repo")] = "session-abc"
+        assert mgr.get_session_id(1001, "owner/repo") == "session-abc"
 
     def test_new_session_clears(self, tmp_path):
         mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
-        mgr._sessions[1001] = "session-abc"
-        mgr.new_session(1001)
-        assert mgr.get_session_id(1001) is None
+        mgr._sessions[(1001, "owner/repo")] = "session-abc"
+        mgr.new_session(1001, "owner/repo")
+        assert mgr.get_session_id(1001, "owner/repo") is None
 
     def test_new_session_noop_if_no_session(self, tmp_path):
         mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
-        mgr.new_session(9999)  # should not raise
-        assert mgr.get_session_id(9999) is None
+        mgr.new_session(9999, "owner/repo")  # should not raise
+        assert mgr.get_session_id(9999, "owner/repo") is None
+
+    def test_sessions_isolated_per_repo(self, tmp_path):
+        """Same chat, different repos → independent sessions; clearing one preserves the other."""
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
+        mgr._sessions[(1001, "owner/repo-a")] = "sess-a"
+        mgr._sessions[(1001, "owner/repo-b")] = "sess-b"
+        assert mgr.get_session_id(1001, "owner/repo-a") == "sess-a"
+        assert mgr.get_session_id(1001, "owner/repo-b") == "sess-b"
+        mgr.new_session(1001, "owner/repo-a")
+        assert mgr.get_session_id(1001, "owner/repo-a") is None
+        assert mgr.get_session_id(1001, "owner/repo-b") == "sess-b"
 
     def test_default_workspace_root(self):
         mgr = ClaudeCodeManager("fake-token")
@@ -168,6 +179,8 @@ class TestStreamMode:
         scheduled wakeups) must still flow to on_event. This is the core reason
         stream mode exists."""
         mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
+        # _stream_forever pulls the repo from _proc_repos to key the session id
+        mgr._proc_repos[1001] = "owner/repo"
         events = [
             {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}},
             {"type": "result", "session_id": "sess-42", "result": "done"},
@@ -189,8 +202,8 @@ class TestStreamMode:
         assert "result" in types
         assert types.count("assistant") == 2  # one before result, one after
         assert "stream_end" in types
-        # session id was captured from result event
-        assert mgr.get_session_id(1001) == "sess-42"
+        # session id was captured from result event, keyed by (chat_id, repo)
+        assert mgr.get_session_id(1001, "owner/repo") == "sess-42"
 
     async def test_stream_forever_captures_model_from_init(self, tmp_path):
         mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
