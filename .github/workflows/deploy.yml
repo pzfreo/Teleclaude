@@ -62,4 +62,4 @@ jobs:
       - name: Build and restart
         run: |
           ssh -i ~/.ssh/deploy_key root@${{ secrets.DROPLET_IP }} \
-            'cd /opt/teleclaude && docker compose up -d --build && docker compose ps'
+            'cd /opt/teleclaude && docker system prune -af && docker compose up -d --build && docker compose ps'
