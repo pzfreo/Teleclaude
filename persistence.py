@@ -119,6 +119,12 @@ def init_db() -> None:
             enabled INTEGER NOT NULL DEFAULT 1
         );
         CREATE INDEX IF NOT EXISTS idx_pulse_goals_chat_id ON pulse_goals(chat_id);
+        CREATE TABLE IF NOT EXISTS repo_sessions (
+            chat_id INTEGER NOT NULL,
+            repo TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            PRIMARY KEY (chat_id, repo)
+        );
         """)
     # Migrations for existing databases
     _migrate(conn)
@@ -150,6 +156,22 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE active_repos ADD COLUMN session_id TEXT")
         conn.commit()
         logger.info("Migrated active_repos: added session_id column")
+
+    # Migrate any existing per-chat session_id values into repo_sessions, keyed
+    # by the chat's current repo. After this runs, active_repos.session_id is
+    # effectively legacy/unused — repo_sessions is the source of truth.
+    cursor = conn.execute(
+        "SELECT chat_id, repo, session_id FROM active_repos " "WHERE session_id IS NOT NULL AND session_id != ''"
+    )
+    legacy_rows = cursor.fetchall()
+    if legacy_rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO repo_sessions (chat_id, repo, session_id) VALUES (?, ?, ?)",
+            legacy_rows,
+        )
+        conn.execute("UPDATE active_repos SET session_id = NULL")
+        conn.commit()
+        logger.info("Migrated %d session id(s) from active_repos to repo_sessions", len(legacy_rows))
 
 
 def load_conversation(chat_id: int) -> list[dict]:
@@ -219,18 +241,33 @@ def save_active_branch(chat_id: int, branch: str | None) -> None:
     conn.close()
 
 
-def load_session_id(chat_id: int) -> str | None:
-    """Load persisted CLI session ID for a chat."""
+def load_session_id(chat_id: int, repo: str) -> str | None:
+    """Load the persisted CLI session ID for a chat working on a specific repo."""
     conn = _connect()
-    row = conn.execute("SELECT session_id FROM active_repos WHERE chat_id = ?", (chat_id,)).fetchone()
+    row = conn.execute(
+        "SELECT session_id FROM repo_sessions WHERE chat_id = ? AND repo = ?",
+        (chat_id, repo),
+    ).fetchone()
     conn.close()
     return row[0] if row and row[0] else None
 
 
-def save_session_id(chat_id: int, session_id: str | None) -> None:
-    """Persist CLI session ID for a chat (requires active_repos row to exist)."""
+def save_session_id(chat_id: int, repo: str, session_id: str | None) -> None:
+    """Persist (or clear) the CLI session ID for a (chat, repo) pair.
+
+    Pass session_id=None to forget the session for this pair.
+    """
     conn = _connect()
-    conn.execute("UPDATE active_repos SET session_id = ? WHERE chat_id = ?", (session_id, chat_id))
+    if session_id:
+        conn.execute(
+            "INSERT OR REPLACE INTO repo_sessions (chat_id, repo, session_id) VALUES (?, ?, ?)",
+            (chat_id, repo, session_id),
+        )
+    else:
+        conn.execute(
+            "DELETE FROM repo_sessions WHERE chat_id = ? AND repo = ?",
+            (chat_id, repo),
+        )
     conn.commit()
     conn.close()
 

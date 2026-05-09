@@ -242,31 +242,6 @@ class TestAgentCommands:
         text = update.message.reply_text.call_args[0][0]
         assert "Agent" in text
 
-    async def test_new_conversation_clears_session(self):
-        from bot_agent import new_conversation
-
-        update = _make_update(chat_id=3320)
-        ctx = _make_context()
-        with (
-            patch("bot_agent.is_authorized", return_value=True),
-            patch("bot_agent.clear_conversation"),
-            patch("bot_agent.save_active_branch"),
-            patch("bot_agent.get_active_repo", return_value=None),
-            patch("bot_agent.get_active_branch", return_value=None),
-            patch("bot_agent.get_model", return_value="opus"),
-            patch("bot_agent.claude_code_mgr") as mock_mgr,
-            patch("bot_agent.save_session_id") as mock_save_session,
-            patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
-        ):
-            mock_mgr.new_session = MagicMock()
-            mock_mgr.abort = AsyncMock(return_value=False)
-            await new_conversation(update, ctx)
-        mock_mgr.new_session.assert_called_once_with(3320)
-        mock_mgr.abort.assert_called_once_with(3320)
-        mock_save_session.assert_called_once_with(3320, None)
-        first_reply = update.message.reply_text.call_args_list[0][0][0]
-        assert "cleared" in first_reply.lower()
-
     async def test_show_model_no_args(self):
         from bot_agent import show_model
 
@@ -388,7 +363,8 @@ class TestNewStream:
             patch("bot_agent.get_active_repo", return_value="owner/repo"),
             patch("bot_agent.get_active_branch", return_value=None),
             patch("bot_agent.get_model", return_value="opus"),
-            patch("bot_agent.save_session_id"),
+            patch("bot_agent.save_session_id") as mock_save_session,
+            patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
             patch("bot_agent.claude_code_mgr") as mock_mgr,
         ):
             mock_mgr.stop_stream = AsyncMock()
@@ -399,8 +375,12 @@ class TestNewStream:
             await new_stream(update, ctx)
         assert 6002 in bot_agent._stream_mode
         mock_mgr.start_stream.assert_awaited_once()
-        reply = update.message.reply_text.call_args[0][0]
-        assert "Stream mode ON" in reply
+        # /newstream clears only THIS repo's session
+        mock_mgr.new_session.assert_called_once_with(6002, "owner/repo")
+        mock_save_session.assert_called_once_with(6002, "owner/repo", None)
+        replies = [c[0][0] for c in update.message.reply_text.call_args_list]
+        assert any("Stream mode ON" in r for r in replies)
+        assert any("fresh session" in r.lower() for r in replies)
         bot_agent._stream_mode.discard(6002)  # cleanup
 
     async def test_new_stream_failure_does_not_set_flag(self):
@@ -415,6 +395,7 @@ class TestNewStream:
             patch("bot_agent.get_active_branch", return_value=None),
             patch("bot_agent.get_model", return_value="opus"),
             patch("bot_agent.save_session_id"),
+            patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
             patch("bot_agent.claude_code_mgr") as mock_mgr,
         ):
             mock_mgr.stop_stream = AsyncMock()
@@ -426,7 +407,7 @@ class TestNewStream:
         assert 6003 not in bot_agent._stream_mode
         # Error reply sent
         replies = [c[0][0] for c in update.message.reply_text.call_args_list]
-        assert any("Failed to start stream" in r for r in replies)
+        assert any("Failed to start" in r for r in replies)
 
     async def test_handle_message_in_stream_mode_feeds_stdin(self):
         import bot_agent
@@ -440,8 +421,8 @@ class TestNewStream:
                 patch("bot_agent.is_authorized", return_value=True),
                 patch("bot_agent.audit_log"),
                 patch("bot_agent.get_active_repo", return_value="owner/repo"),
-                patch("bot_agent.load_session_id", return_value=None),
-                patch("bot_agent.save_session_id"),
+                patch("bot_agent.load_session_id", return_value=None) as mock_load,
+                patch("bot_agent.save_session_id") as mock_save,
                 patch("bot_agent.claude_code_mgr") as mock_mgr,
             ):
                 mock_mgr.stream_mode_active = MagicMock(return_value=True)
@@ -449,6 +430,12 @@ class TestNewStream:
                 mock_mgr.feed = AsyncMock(return_value=True)
                 await handle_message(update, ctx)
             mock_mgr.feed.assert_awaited_once_with(6004, "hello claude")
+            # Session lookups must be repo-scoped
+            mock_mgr.get_session_id.assert_called_with(6004, "owner/repo")
+            # load_session_id is only called when in-memory session is None;
+            # here get_session_id returns "sess-1" so it's skipped
+            mock_load.assert_not_called()
+            mock_save.assert_called_with(6004, "owner/repo", "sess-1")
         finally:
             bot_agent._stream_mode.discard(6004)
 
@@ -483,6 +470,34 @@ class TestNewStream:
         finally:
             bot_agent._stream_mode.discard(6005)
 
+    async def test_handle_message_restores_session_from_db_for_repo(self):
+        """If the in-memory session is missing, load_session_id is called with (chat, repo)
+        and the result is written into _sessions[(chat, repo)]."""
+        import bot_agent
+        from bot_agent import handle_message
+
+        update = _make_update(chat_id=6010, text="hi")
+        ctx = _make_context()
+        bot_agent._stream_mode.add(6010)
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.audit_log"),
+                patch("bot_agent.get_active_repo", return_value="owner/my-repo"),
+                patch("bot_agent.load_session_id", return_value="db-session-xyz") as mock_load,
+                patch("bot_agent.save_session_id"),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr._sessions = {}
+                mock_mgr.stream_mode_active = MagicMock(return_value=True)
+                mock_mgr.get_session_id = MagicMock(return_value=None)
+                mock_mgr.feed = AsyncMock(return_value=True)
+                await handle_message(update, ctx)
+            mock_load.assert_called_once_with(6010, "owner/my-repo")
+            assert mock_mgr._sessions[(6010, "owner/my-repo")] == "db-session-xyz"
+        finally:
+            bot_agent._stream_mode.discard(6010)
+
     async def test_stop_work_clears_stream_mode_flag(self):
         import bot_agent
         from bot_agent import stop_work
@@ -502,34 +517,6 @@ class TestNewStream:
             assert "Stream stopped" in text
         finally:
             bot_agent._stream_mode.discard(6006)
-
-    async def test_new_conversation_tears_down_stream(self):
-        import bot_agent
-        from bot_agent import new_conversation
-
-        update = _make_update(chat_id=6007)
-        ctx = _make_context()
-        bot_agent._stream_mode.add(6007)
-        try:
-            with (
-                patch("bot_agent.is_authorized", return_value=True),
-                patch("bot_agent.clear_conversation"),
-                patch("bot_agent.save_active_branch"),
-                patch("bot_agent.get_active_repo", return_value=None),
-                patch("bot_agent.get_active_branch", return_value=None),
-                patch("bot_agent.get_model", return_value="opus"),
-                patch("bot_agent.save_session_id"),
-                patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
-                patch("bot_agent.claude_code_mgr") as mock_mgr,
-            ):
-                mock_mgr.new_session = MagicMock()
-                mock_mgr.abort = AsyncMock(return_value=False)
-                mock_mgr.stop_stream = AsyncMock()
-                await new_conversation(update, ctx)
-            assert 6007 not in bot_agent._stream_mode
-            mock_mgr.stop_stream.assert_awaited_once_with(6007, kill_proc=True)
-        finally:
-            bot_agent._stream_mode.discard(6007)
 
 
 class TestStreamEventHandler:
@@ -585,6 +572,120 @@ class TestStreamEventHandler:
             handler = _make_stream_event_handler(7004, bot)
             await handler({"type": "system", "subtype": "init", "model": "claude-opus-4-7"})
         mock_send.assert_not_called()
+
+
+class TestRestartCommand:
+    """Tests for /restart — kill CC, npm update, relaunch with --resume."""
+
+    async def test_restart_no_repo_errors(self):
+        from bot_agent import restart_command
+
+        update = _make_update(chat_id=8101)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value=None),
+        ):
+            await restart_command(update, ctx)
+        text = update.message.reply_text.call_args[0][0]
+        assert "No repo" in text
+
+    async def test_restart_resumes_existing_session(self):
+        import bot_agent
+        from bot_agent import restart_command
+
+        update = _make_update(chat_id=8102)
+        ctx = _make_context()
+        bot_agent._stream_mode.add(8102)
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.get_active_branch", return_value=None),
+                patch("bot_agent.get_model", return_value="opus"),
+                patch("bot_agent.load_session_id", return_value=None),
+                patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                # Existing in-memory session
+                mock_mgr.get_session_id = MagicMock(return_value="resume-me-1234")
+                mock_mgr.stop_stream = AsyncMock()
+                mock_mgr.abort = AsyncMock(return_value=False)
+                mock_mgr.new_session = MagicMock()
+                mock_mgr.start_stream = AsyncMock()
+                await restart_command(update, ctx)
+
+            # Session must NOT be cleared by /restart
+            mock_mgr.new_session.assert_not_called()
+            # Stream is relaunched
+            mock_mgr.start_stream.assert_awaited_once()
+            # User sees the resume confirmation
+            replies = [c[0][0] for c in update.message.reply_text.call_args_list]
+            assert any("Resumed session" in r for r in replies)
+            assert any("resume-" in r for r in replies)
+            assert 8102 in bot_agent._stream_mode
+        finally:
+            bot_agent._stream_mode.discard(8102)
+
+    async def test_restart_loads_session_from_db_when_in_memory_missing(self):
+        import bot_agent
+        from bot_agent import restart_command
+
+        update = _make_update(chat_id=8103)
+        ctx = _make_context()
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.get_active_branch", return_value=None),
+                patch("bot_agent.get_model", return_value="opus"),
+                patch("bot_agent.load_session_id", return_value="db-session-99"),
+                patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr._sessions = {}
+                mock_mgr.get_session_id = MagicMock(return_value=None)
+                mock_mgr.stop_stream = AsyncMock()
+                mock_mgr.abort = AsyncMock(return_value=False)
+                mock_mgr.new_session = MagicMock()
+                mock_mgr.start_stream = AsyncMock()
+                await restart_command(update, ctx)
+
+            # DB session was hoisted into the manager's in-memory store
+            assert mock_mgr._sessions[(8103, "owner/repo")] == "db-session-99"
+            mock_mgr.new_session.assert_not_called()
+        finally:
+            bot_agent._stream_mode.discard(8103)
+
+    async def test_restart_no_session_starts_fresh(self):
+        import bot_agent
+        from bot_agent import restart_command
+
+        update = _make_update(chat_id=8104)
+        ctx = _make_context()
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.get_active_branch", return_value=None),
+                patch("bot_agent.get_model", return_value="opus"),
+                patch("bot_agent.load_session_id", return_value=None),
+                patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr._sessions = {}
+                mock_mgr.get_session_id = MagicMock(return_value=None)
+                mock_mgr.stop_stream = AsyncMock()
+                mock_mgr.abort = AsyncMock(return_value=False)
+                mock_mgr.new_session = MagicMock()
+                mock_mgr.start_stream = AsyncMock()
+                await restart_command(update, ctx)
+
+            replies = [c[0][0] for c in update.message.reply_text.call_args_list]
+            assert any("No prior session" in r for r in replies)
+            mock_mgr.start_stream.assert_awaited_once()
+        finally:
+            bot_agent._stream_mode.discard(8104)
 
 
 class TestCancelCommand:
@@ -655,7 +756,7 @@ class TestCancelCommand:
 class TestRepoSwitchInStreamMode:
     """Tests for /repo switching while /newstream is active."""
 
-    async def test_repo_switch_tears_down_stream(self):
+    async def test_repo_switch_tears_down_stream_but_preserves_session(self):
         import bot_agent
         from bot_agent import set_repo
 
@@ -666,7 +767,7 @@ class TestRepoSwitchInStreamMode:
             with (
                 patch("bot_agent.is_authorized", return_value=True),
                 patch("bot_agent.save_active_repo"),
-                patch("bot_agent.save_session_id"),
+                patch("bot_agent.save_session_id") as mock_save_session,
                 patch("bot_agent.set_active_branch"),
                 patch("bot_agent.get_model", return_value="opus"),
                 patch("bot_agent.claude_code_mgr") as mock_mgr,
@@ -674,12 +775,14 @@ class TestRepoSwitchInStreamMode:
             ):
                 mock_mgr.stop_stream = AsyncMock()
                 mock_mgr.new_session = MagicMock()
-                # capture the clone-notify coroutine so we can drive it
                 mock_create_task.side_effect = lambda coro: coro.close() or MagicMock()
                 await set_repo(update, ctx)
             # Stream was torn down immediately (before clone starts)
             mock_mgr.stop_stream.assert_awaited_once_with(9001, kill_proc=True)
             assert 9001 not in bot_agent._stream_mode
+            # /repo must NOT clear sessions — we want per-repo memory across switches
+            mock_mgr.new_session.assert_not_called()
+            mock_save_session.assert_not_called()
         finally:
             bot_agent._stream_mode.discard(9001)
 
@@ -693,7 +796,7 @@ class TestRepoSwitchInStreamMode:
         with (
             patch("bot_agent.is_authorized", return_value=True),
             patch("bot_agent.save_active_repo"),
-            patch("bot_agent.save_session_id"),
+            patch("bot_agent.save_session_id") as mock_save_session,
             patch("bot_agent.set_active_branch"),
             patch("bot_agent.claude_code_mgr") as mock_mgr,
             patch("asyncio.create_task") as mock_create_task,
@@ -703,6 +806,9 @@ class TestRepoSwitchInStreamMode:
             mock_create_task.side_effect = lambda coro: coro.close() or MagicMock()
             await set_repo(update, ctx)
         mock_mgr.stop_stream.assert_not_called()
+        # No session clearing on repo switch
+        mock_mgr.new_session.assert_not_called()
+        mock_save_session.assert_not_called()
 
     async def test_repo_switch_restarts_stream_after_clone(self):
         """After a successful clone in stream-mode switch, stream is relaunched."""

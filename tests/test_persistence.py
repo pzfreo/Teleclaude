@@ -95,35 +95,66 @@ class TestActiveBranch:
 class TestSessionId:
     def test_save_and_load(self, tmp_db):
         with patch("persistence.DB_PATH", tmp_db):
-            from persistence import load_session_id, save_active_repo, save_session_id
+            from persistence import load_session_id, save_session_id
 
-            save_active_repo(1001, "owner/repo")  # session_id requires repo row
-            save_session_id(1001, "session-abc-123")
-            assert load_session_id(1001) == "session-abc-123"
+            save_session_id(1001, "owner/repo", "session-abc-123")
+            assert load_session_id(1001, "owner/repo") == "session-abc-123"
 
-    def test_load_none_when_no_repo(self, tmp_db):
+    def test_load_none_when_no_session(self, tmp_db):
         with patch("persistence.DB_PATH", tmp_db):
             from persistence import load_session_id
 
-            assert load_session_id(9999) is None
+            assert load_session_id(9999, "owner/repo") is None
 
     def test_clear_session(self, tmp_db):
         with patch("persistence.DB_PATH", tmp_db):
-            from persistence import load_session_id, save_active_repo, save_session_id
+            from persistence import load_session_id, save_session_id
 
-            save_active_repo(1001, "owner/repo")
-            save_session_id(1001, "session-abc-123")
-            save_session_id(1001, None)
-            assert load_session_id(1001) is None
+            save_session_id(1001, "owner/repo", "session-abc-123")
+            save_session_id(1001, "owner/repo", None)
+            assert load_session_id(1001, "owner/repo") is None
 
     def test_overwrite(self, tmp_db):
         with patch("persistence.DB_PATH", tmp_db):
-            from persistence import load_session_id, save_active_repo, save_session_id
+            from persistence import load_session_id, save_session_id
 
-            save_active_repo(1001, "owner/repo")
-            save_session_id(1001, "old-session")
-            save_session_id(1001, "new-session")
-            assert load_session_id(1001) == "new-session"
+            save_session_id(1001, "owner/repo", "old-session")
+            save_session_id(1001, "owner/repo", "new-session")
+            assert load_session_id(1001, "owner/repo") == "new-session"
+
+    def test_per_repo_isolation(self, tmp_db):
+        """Sessions for different repos in the same chat must not collide."""
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import load_session_id, save_session_id
+
+            save_session_id(1001, "owner/repo-a", "session-a")
+            save_session_id(1001, "owner/repo-b", "session-b")
+            assert load_session_id(1001, "owner/repo-a") == "session-a"
+            assert load_session_id(1001, "owner/repo-b") == "session-b"
+            # Clearing one repo doesn't touch the other
+            save_session_id(1001, "owner/repo-a", None)
+            assert load_session_id(1001, "owner/repo-a") is None
+            assert load_session_id(1001, "owner/repo-b") == "session-b"
+
+    def test_legacy_session_id_migrated(self, tmp_db):
+        """Existing session ids on active_repos should be lifted into repo_sessions."""
+        import sqlite3
+
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import init_db, load_session_id, save_active_repo
+
+            # First init the db, then write a legacy-style session_id directly,
+            # then re-run init_db which triggers the one-time migration.
+            init_db()
+            save_active_repo(2002, "owner/legacy-repo")
+            with sqlite3.connect(tmp_db) as conn:
+                conn.execute(
+                    "UPDATE active_repos SET session_id = ? WHERE chat_id = ?",
+                    ("legacy-session-xyz", 2002),
+                )
+                conn.commit()
+            init_db()  # re-run to fire the migration step
+            assert load_session_id(2002, "owner/legacy-repo") == "legacy-session-xyz"
 
 
 class TestTodos:

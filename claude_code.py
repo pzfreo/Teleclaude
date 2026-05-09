@@ -133,7 +133,7 @@ class ClaudeCodeManager:
         self.github_token = github_token
         self.workspace_root = Path(workspace_root or os.getenv("CLAUDE_CODE_WORKSPACE") or "workspaces")
         self.cli_path = cli_path or os.getenv("CLAUDE_CLI_PATH") or shutil.which("claude")
-        self._sessions: dict[int, str] = {}  # chat_id → session_id
+        self._sessions: dict[tuple[int, str], str] = {}  # (chat_id, repo) → session_id
         self._running_procs: dict[int, asyncio.subprocess.Process] = {}  # chat_id → active proc
         self._proc_stdins: dict[int, asyncio.StreamWriter] = {}  # chat_id → stdin writer
         self._proc_repos: dict[int, str] = {}  # chat_id → repo the process was launched for
@@ -237,14 +237,16 @@ class ClaudeCodeManager:
 
     # ── Session management ───────────────────────────────────────────
 
-    def get_session_id(self, chat_id: int) -> str | None:
-        """Return existing session ID for a chat, or None."""
-        return self._sessions.get(chat_id)
+    def get_session_id(self, chat_id: int, repo: str) -> str | None:
+        """Return existing session ID for this (chat, repo) pair, or None."""
+        return self._sessions.get((chat_id, repo))
 
-    def new_session(self, chat_id: int) -> None:
-        """Clear the session so the next message starts fresh."""
-        self._sessions.pop(chat_id, None)
-        self._proc_repos.pop(chat_id, None)
+    def new_session(self, chat_id: int, repo: str) -> None:
+        """Clear the session for this (chat, repo) pair so the next message starts fresh.
+
+        Sessions for other repos in the same chat are preserved.
+        """
+        self._sessions.pop((chat_id, repo), None)
         # _last_models intentionally preserved: the alias hasn't changed, so the
         # CLI will resolve to the same id on the next turn. Cleared in
         # clear_last_model() when the user switches model via /model.
@@ -482,13 +484,14 @@ class ClaudeCodeManager:
             cmd.extend(["--mcp-config", resolved])
             logger.info("Claude Code: loading MCP config from %s", mcp_config)
 
-        session_id = self._sessions.get(chat_id)
+        session_key = (chat_id, repo)
+        session_id = self._sessions.get(session_key)
         if session_id:
             cmd.extend(["--resume", session_id])
         else:
             new_id = str(uuid.uuid4())
             cmd.extend(["--session-id", new_id])
-            self._sessions[chat_id] = new_id
+            self._sessions[session_key] = new_id
 
         cmd.extend(
             [
@@ -610,7 +613,9 @@ class ClaudeCodeManager:
                 if event_type == "result":
                     sid = event.get("session_id")
                     if isinstance(sid, str) and sid:
-                        self._sessions[chat_id] = sid
+                        repo = self._proc_repos.get(chat_id)
+                        if repo:
+                            self._sessions[(chat_id, repo)] = sid
                 elif event_type == "system" and event.get("subtype") == "init":
                     model_id = event.get("model")
                     if isinstance(model_id, str) and model_id:

@@ -29,7 +29,6 @@ from telegram.ext import (
 from claude_code import ClaudeCodeManager, get_claude_cli_version, update_claude_cli
 from persistence import (
     audit_log,
-    clear_conversation,
     init_db,
     load_active_branch,
     load_active_repo,
@@ -130,7 +129,7 @@ active_repos: dict[int, str] = {}
 active_branches: dict[int, str] = {}
 chat_models: dict[int, str] = {}
 _plan_mode: set[int] = set()  # chat IDs with plan mode enabled
-_stream_mode: set[int] = set()  # chat IDs with /new-stream continuous mode
+_stream_mode: set[int] = set()  # chat IDs with /newstream continuous mode
 _typing_tasks: dict[int, asyncio.Task] = {}
 _frag_buffers: dict[int, str] = {}  # chat_id -> buffered text from split pastes
 _frag_tasks: dict[int, asyncio.Task] = {}  # chat_id -> pending flush task
@@ -411,8 +410,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- <message> - Send extra info while Claude is working\n"
         "/cancel - Soft interrupt (Esc equivalent — keeps process + session)\n"
         "/stop - Stop current work (kills CC process, keeps session)\n"
-        "/new - Start a fresh CLI session (auto-updates Claude CLI)\n"
-        "/newstream - Reset and restart stream session\n"
+        "/newstream - Wipe this repo's session and restart fresh (updates CLI)\n"
+        "/restart - Restart CC and resume this repo's last session (updates CLI)\n"
         "/update - Update Claude CLI to latest version\n"
         "/model - Show or switch model (opus/sonnet/haiku)\n"
         "/logs [min] - Download recent logs\n"
@@ -477,8 +476,10 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     # If stream mode is active, tear it down before switching repos — the
-    # running CC process has cwd pointing at the old repo and a session tied
-    # to it. We'll relaunch against the new repo after the clone finishes.
+    # running CC process has cwd pointing at the old repo. We'll relaunch
+    # against the new repo after the clone finishes. Sessions are per-(chat,
+    # repo), so the old repo's session is left in place untouched and will
+    # resume next time you switch back.
     was_streaming = chat_id in _stream_mode
     if was_streaming:
         _stream_mode.discard(chat_id)
@@ -487,8 +488,6 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     active_repos[chat_id] = repo
     save_active_repo(chat_id, repo)
     set_active_branch(chat_id, None)
-    claude_code_mgr.new_session(chat_id)
-    save_session_id(chat_id, None)
     msg = f"Active repo set to: {repo}\nCloning workspace..."
     await update.message.reply_text(msg)
 
@@ -624,62 +623,18 @@ async def update_cli(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"{status}Info: {msg}")
 
 
-async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
-        return
-    chat_id = update.effective_chat.id
-
-    # Capture repo/branch before clearing
-    repo = get_active_repo(chat_id)
-    branch = get_active_branch(chat_id)
-
-    # Tear down stream mode if active (cancels reader and kills proc)
-    was_streaming = chat_id in _stream_mode
-    if was_streaming:
-        _stream_mode.discard(chat_id)
-        await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
-
-    # Kill any running CLI process immediately (in case it wasn't a stream)
-    was_running = await claude_code_mgr.abort(chat_id)
-
-    clear_conversation(chat_id)
-    set_active_branch(chat_id, None)
-    claude_code_mgr.new_session(chat_id)
-    save_session_id(chat_id, None)
-
-    parts = ["Session cleared."]
-    if was_streaming:
-        parts.append("Stream mode ended.")
-    if was_running:
-        parts.append("Stopped running task.")
-    if repo:
-        label = f"`{repo}`"
-        if branch:
-            label += f" on `{branch}`"
-        parts.append(f"Repo: {label}")
-    else:
-        parts.append("No repo set.")
-    parts.append(f"Model: `{get_model(chat_id)}`")
-
-    # Check for Claude CLI updates
-    await update.message.reply_text(" ".join(parts) + "\n\nChecking for Claude CLI updates...", parse_mode="Markdown")
-
+async def _report_cli_update_status(update: Update) -> None:
+    """Run npm update for the Claude CLI and post a one-line status to the chat."""
     success, msg = await update_claude_cli()
     if success:
         await update.message.reply_text(f"✅ Claude CLI {msg}")
+    elif "permission" not in msg.lower():
+        await update.message.reply_text(f"Info: {msg}")
     else:
-        # Don't show error if it's just permissions (likely already latest)
-        if "permission" not in msg.lower():
-            await update.message.reply_text(f"Info: {msg}")
-        else:
-            # Just show current version
-            version = await get_claude_cli_version()
-            if version:
-                await update.message.reply_text(f"Claude CLI version: {version}")
-
-    usage = await _fetch_usage_text()
-    if usage:
-        await update.message.reply_text(usage)
+        # Permission error usually just means we're already on the latest version.
+        version = await get_claude_cli_version()
+        if version:
+            await update.message.reply_text(f"Claude CLI version: {version}")
 
 
 def _make_stream_event_handler(chat_id: int, bot):
@@ -745,7 +700,7 @@ def _make_stream_event_handler(chat_id: int, bot):
 
 
 async def new_stream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Start continuous stream mode — CC runs and posts events to chat as they arrive."""
+    """Wipe this repo's session, update Claude CLI, and relaunch a fresh stream."""
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
@@ -755,39 +710,79 @@ async def new_stream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("No repo set. Use /repo owner/name first.")
         return
 
-    # Tear down any existing stream or running one-shot; start fresh session
+    # Tear down any existing stream / process for this chat.
     _stream_mode.discard(chat_id)
     await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
     await claude_code_mgr.abort(chat_id)
-    claude_code_mgr.new_session(chat_id)
-    save_session_id(chat_id, None)
 
-    on_event = _make_stream_event_handler(chat_id, context.bot)
-    model = get_model(chat_id)
+    # Clear ONLY this repo's session. Other repos in this chat keep their memory.
+    claude_code_mgr.new_session(chat_id, repo)
+    save_session_id(chat_id, repo, None)
+
+    await update.message.reply_text("Updating Claude CLI…")
+    await _report_cli_update_status(update)
+
     branch = get_active_branch(chat_id)
-
-    try:
-        await claude_code_mgr.start_stream(
-            chat_id=chat_id,
-            repo=repo,
-            on_event=on_event,
-            branch=branch,
-            model=model,
-            permission_mode="plan" if chat_id in _plan_mode else None,
-        )
-    except Exception as e:
-        logger.error("Failed to start stream: %s", e, exc_info=True)
-        await update.message.reply_text(f"Failed to start stream: {e}")
+    err = await _start_stream_for_chat(chat_id, repo, context.bot)
+    if err:
+        await update.message.reply_text(err)
         return
 
-    _stream_mode.add(chat_id)
     label = f"`{repo}`" + (f" on `{branch}`" if branch else "")
     await update.message.reply_text(
-        f"Stream mode ON — {label}\n"
-        "Messages feed into CC continuously. Scheduled events post here as they fire.\n"
-        "/new to end.",
+        f"Stream mode ON — fresh session — {label}\n"
+        "Messages feed into CC continuously. Scheduled events post here as they fire.",
         parse_mode="Markdown",
     )
+    usage = await _fetch_usage_text()
+    if usage:
+        await update.message.reply_text(usage)
+
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kill CC, update the CLI, and relaunch the stream resuming this repo's session."""
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+
+    repo = get_active_repo(chat_id)
+    if not repo:
+        await update.message.reply_text("No repo set. Use /repo owner/name first.")
+        return
+
+    # Pull the session ID from memory or DB so the relaunched proc resumes it.
+    session_id = claude_code_mgr.get_session_id(chat_id, repo)
+    if session_id is None:
+        saved = load_session_id(chat_id, repo)
+        if saved:
+            claude_code_mgr._sessions[(chat_id, repo)] = saved
+            session_id = saved
+
+    # Tear down stream + proc, but DON'T clear the session — we want to resume.
+    _stream_mode.discard(chat_id)
+    await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
+    await claude_code_mgr.abort(chat_id)
+
+    await update.message.reply_text("Updating Claude CLI…")
+    await _report_cli_update_status(update)
+
+    err = await _start_stream_for_chat(chat_id, repo, context.bot)
+    if err:
+        await update.message.reply_text(err)
+        return
+
+    branch = get_active_branch(chat_id)
+    label = f"`{repo}`" + (f" on `{branch}`" if branch else "")
+    if session_id:
+        await update.message.reply_text(
+            f"Resumed session `{session_id[:8]}…` on {label}",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"No prior session for {label} — started fresh.",
+            parse_mode="Markdown",
+        )
     usage = await _fetch_usage_text()
     if usage:
         await update.message.reply_text(usage)
@@ -912,8 +907,8 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         active_repos[chat_id] = repo
         save_active_repo(chat_id, repo)
         set_active_branch(chat_id, None)
-        claude_code_mgr.new_session(chat_id)
-        save_session_id(chat_id, None)
+        # Sessions are per-(chat, repo); switching does NOT clear the new
+        # repo's stored session, so memory resumes when stream auto-starts.
         await query.edit_message_text(f"Switching to {repo}…")
 
         async def _clone_and_reply():
@@ -1191,7 +1186,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cli_cmd = text[1:]  # strip one slash → e.g. //usage becomes /usage
         sent = await claude_code_mgr.send_followup(chat_id, cli_cmd)
         if not sent:
-            await update.message.reply_text(f"No active session. Start one with /new, then retry {text}")
+            await update.message.reply_text(f"No active session. Start one with /newstream, then retry {text}")
         return
 
     # Build prompt with attachment paths
@@ -1269,13 +1264,13 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
         await update.message.reply_text("No repo set. Use /repo owner/name first.")
         return
 
-    # Restore session ID from DB if we don't have one in memory yet,
-    # so the auto-started stream resumes via --resume.
-    if claude_code_mgr.get_session_id(chat_id) is None:
-        saved_session = load_session_id(chat_id)
+    # Restore session ID for this (chat, repo) from DB if we don't have one
+    # in memory yet, so the auto-started stream resumes via --resume.
+    if claude_code_mgr.get_session_id(chat_id, repo) is None:
+        saved_session = load_session_id(chat_id, repo)
         if saved_session:
-            claude_code_mgr._sessions[chat_id] = saved_session
-            logger.info("Restored session %s for chat %d", saved_session, chat_id)
+            claude_code_mgr._sessions[(chat_id, repo)] = saved_session
+            logger.info("Restored session %s for chat %d on %s", saved_session, chat_id, repo)
 
     # Auto-start stream if not running. Reader task may have died, in which
     # case stream_mode_active() returns False even when chat_id is in _stream_mode.
@@ -1301,9 +1296,9 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
             return
 
     # Persist session ID once the stream is feeding so it survives restarts.
-    current_session = claude_code_mgr.get_session_id(chat_id)
+    current_session = claude_code_mgr.get_session_id(chat_id, repo)
     if current_session:
-        save_session_id(chat_id, current_session)
+        save_session_id(chat_id, repo, current_session)
 
     _start_stream_typing(chat_id, context.bot)
 
@@ -1320,10 +1315,10 @@ async def notify_startup(app: Application) -> None:
             ("cancel", "Soft interrupt (keeps session)"),
             ("repo", "Set active GitHub repo"),
             ("files", "Browse and download workspace files"),
-            ("newstream", "Reset and restart stream session"),
+            ("newstream", "Wipe this repo's session and restart fresh"),
+            ("restart", "Update Claude CLI and resume this repo's session"),
             ("model", "Show or change AI model"),
             ("plan", "Toggle plan mode / plan a task"),
-            ("new", "Start a new conversation"),
             ("branch", "Set active branch"),
             ("work", "Exit plan mode"),
             ("stop", "Stop current work (kills CC process)"),
@@ -1389,8 +1384,8 @@ def main() -> None:
     app.add_handler(CommandHandler("branch", set_branch))
     app.add_handler(CommandHandler("stop", stop_work))
     app.add_handler(CommandHandler("cancel", cancel_work))
-    app.add_handler(CommandHandler("new", new_conversation))
     app.add_handler(CommandHandler("newstream", new_stream))
+    app.add_handler(CommandHandler("restart", restart_command))
     app.add_handler(CommandHandler("update", update_cli))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("logs", send_logs))
