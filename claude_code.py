@@ -6,7 +6,6 @@ import logging
 import os
 import shlex
 import shutil
-import time
 import uuid
 from pathlib import Path
 
@@ -14,15 +13,6 @@ logger = logging.getLogger(__name__)
 
 GIT_TIMEOUT = 120  # 2 minutes for git operations
 NPM_UPDATE_TIMEOUT = 180  # 3 minutes for npm update
-
-
-def _get_cli_timeout() -> int:
-    """Get CLI timeout in seconds from CLAUDE_CLI_TIMEOUT env var (default 600, min 60)."""
-    raw = os.getenv("CLAUDE_CLI_TIMEOUT", "600")
-    try:
-        return max(60, int(raw))
-    except ValueError:
-        return 600
 
 
 async def update_claude_cli() -> tuple[bool, str]:
@@ -147,9 +137,7 @@ class ClaudeCodeManager:
         self._running_procs: dict[int, asyncio.subprocess.Process] = {}  # chat_id → active proc
         self._proc_stdins: dict[int, asyncio.StreamWriter] = {}  # chat_id → stdin writer
         self._proc_repos: dict[int, str] = {}  # chat_id → repo the process was launched for
-        self._is_processing: dict[int, bool] = {}  # chat_id → True while awaiting a result
         self._stdin_locks: dict[int, asyncio.Lock] = {}  # chat_id → lock for stdin writes
-        self._text_was_streamed: dict[int, bool] = {}  # chat_id → True if last turn streamed text
         self._last_models: dict[int, str] = {}  # chat_id → resolved model id from most recent CLI init
         self._stream_tasks: dict[int, asyncio.Task] = {}  # chat_id → continuous reader task (stream mode)
         self._control_request_counter: dict[int, int] = {}  # chat_id → monotonic request counter
@@ -273,21 +261,12 @@ class ClaudeCodeManager:
             except (asyncio.CancelledError, Exception):
                 pass
         await self._kill_proc(chat_id)
-        self._is_processing.pop(chat_id, None)
         return had_proc
 
     def has_running_proc(self, chat_id: int) -> bool:
         """Check if a CLI subprocess is currently running for a chat."""
         proc = self._running_procs.get(chat_id)
         return proc is not None and proc.returncode is None
-
-    def is_processing(self, chat_id: int) -> bool:
-        """Check if a CLI turn is actively being processed (mid-turn, not idle between turns)."""
-        return self._is_processing.get(chat_id, False)
-
-    def was_text_streamed(self, chat_id: int) -> bool:
-        """Check if the last completed turn streamed text via progress callbacks."""
-        return self._text_was_streamed.get(chat_id, False)
 
     def get_last_model(self, chat_id: int) -> str | None:
         """Return the resolved model id from the most recent CLI init event, if any."""
@@ -448,31 +427,6 @@ class ClaudeCodeManager:
 
     # ── CLI invocation ───────────────────────────────────────────────
 
-    @staticmethod
-    async def _drain_stdout(proc: asyncio.subprocess.Process, timeout: float = 0.1) -> int:
-        """Read and discard any pending events from stdout.
-
-        Called before sending a new prompt to ensure no stale events from a
-        previous turn (or process init) leak into the next _read_stream call.
-        Returns the number of events drained.
-        """
-        drained = 0
-        assert proc.stdout is not None
-        while True:
-            try:
-                raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
-                if not raw_line:
-                    break  # EOF
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if line:
-                    drained += 1
-                    logger.warning("Drained stale stdout event: %.300s", line)
-            except TimeoutError:
-                break
-        if drained:
-            logger.warning("Drained %d stale event(s) from stdout before new prompt", drained)
-        return drained
-
     async def _kill_proc(self, chat_id: int) -> None:
         """Kill an existing CLI process for a chat and clean up."""
         self._proc_stdins.pop(chat_id, None)
@@ -572,225 +526,6 @@ class ClaudeCodeManager:
         self._proc_repos[chat_id] = repo
         return proc
 
-    async def run(
-        self,
-        chat_id: int,
-        repo: str,
-        prompt: str,
-        branch: str | None = None,
-        model: str | None = None,
-        on_progress=None,
-        on_timeout=None,
-        permission_mode: str | None = None,
-    ) -> str:
-        """Run a prompt through Claude Code CLI and return the result.
-
-        Reuses an existing CLI process when possible (same repo, process alive).
-        The process stays alive between turns for fast follow-ups via stdin.
-
-        Args:
-            chat_id: Telegram chat ID (for session tracking)
-            repo: GitHub repo in owner/name format
-            prompt: The user's message
-            branch: Optional branch to work on
-            model: Claude model ID
-            on_progress: async callback(block: dict) for progress updates
-            on_timeout: async callback(elapsed_seconds: int) -> bool; return True to continue
-            permission_mode: CLI permission mode override (e.g. "plan")
-
-        Returns:
-            The final text result from Claude Code
-        """
-        repo_dir = self.workspace_path(repo)
-        if not (repo_dir / ".git").is_dir():
-            await self.ensure_clone(repo)
-
-        if branch:
-            try:
-                await self.checkout_branch(repo, branch)
-            except RuntimeError as e:
-                logger.warning("Branch checkout failed: %s", e)
-
-        await self.pull_latest(repo)
-
-        proc = await self._ensure_proc(chat_id, repo, model, permission_mode)
-
-        # Drain any stale events left in stdout from previous turn or process init
-        await self._drain_stdout(proc)
-
-        # Send prompt via stdin
-        msg = json.dumps({"type": "user", "message": {"role": "user", "content": prompt}})
-        assert proc.stdin is not None, "stdin pipe not available"
-        proc.stdin.write((msg + "\n").encode("utf-8"))
-        await proc.stdin.drain()
-
-        self._is_processing[chat_id] = True
-        self._text_was_streamed[chat_id] = False
-        result_text = ""
-        returned_session_id = None
-        cli_timeout = _get_cli_timeout()
-
-        try:
-            start_time = time.monotonic()
-            stream_task = asyncio.create_task(self._read_stream(proc, on_progress, chat_id))
-
-            while True:
-                try:
-                    result_text, returned_session_id, text_streamed = await asyncio.wait_for(
-                        asyncio.shield(stream_task), timeout=cli_timeout
-                    )
-                    self._text_was_streamed[chat_id] = text_streamed
-                    break
-                except TimeoutError:
-                    if stream_task.done():
-                        result_text, returned_session_id, text_streamed = stream_task.result()
-                        self._text_was_streamed[chat_id] = text_streamed
-                        break
-
-                    elapsed = int(time.monotonic() - start_time)
-
-                    should_continue = False
-                    if on_timeout:
-                        try:
-                            should_continue = await on_timeout(elapsed)
-                        except Exception as exc:
-                            logger.warning("Timeout callback failed: %s", exc)
-
-                    if should_continue:
-                        logger.info("CLI timeout extended for chat %d (elapsed %ds)", chat_id, elapsed)
-                        continue
-
-                    logger.warning("Claude Code CLI timed out after %ds for chat %d", elapsed, chat_id)
-                    await self._kill_proc(chat_id)
-                    result_text = f"(Claude Code timed out after {elapsed // 60} minutes)"
-                    break
-
-        except asyncio.CancelledError:
-            await self._kill_proc(chat_id)
-            return "(aborted)"
-        except Exception as e:
-            logger.error("Claude Code stream error: %s", e, exc_info=True)
-            await self._kill_proc(chat_id)
-            result_text = f"(Claude Code error: {e})"
-        finally:
-            self._is_processing[chat_id] = False
-
-        if returned_session_id:
-            self._sessions[chat_id] = returned_session_id
-
-        return result_text
-
-    async def _read_stream(self, proc, on_progress, chat_id: int) -> tuple[str, str | None, bool]:
-        """Read stream-json output until the result event (one turn).
-
-        The process stays alive after this returns — it's waiting for the next
-        stdin message. We break out of the read loop on the result event rather
-        than waiting for stdout EOF / process exit.
-
-        Returns (result_text, session_id, text_was_streamed).
-        """
-        result_text = ""
-        session_id = None
-        last_assistant_text = ""
-        text_was_streamed = False
-        pending_system_events: list[dict] = []
-        result_stats: dict = {}
-        got_result = False
-
-        async for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            event_type = event.get("type")
-
-            logger.debug("Stream event: type=%s", event_type)
-
-            if event_type == "assistant":
-                message = event.get("message", {})
-                content = message.get("content", [])
-                if isinstance(content, list):
-                    texts = []
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        if block.get("type") == "text":
-                            texts.append(block.get("text", ""))
-                            if on_progress:
-                                try:
-                                    await on_progress(block)
-                                    text_was_streamed = True
-                                except Exception:
-                                    pass
-                        elif block.get("type") == "tool_use":
-                            if on_progress:
-                                try:
-                                    await on_progress(block)
-                                except Exception:
-                                    pass
-                    if texts:
-                        last_assistant_text = "\n".join(t for t in texts if t)
-
-            elif event_type == "result":
-                result_text = event.get("result", "")
-                session_id = event.get("session_id")
-                for key in ("cost_usd", "num_turns", "usage"):
-                    if key in event:
-                        result_stats[key] = event[key]
-                got_result = True
-                break  # Turn complete — process stays alive for next turn
-
-            elif event_type == "system":
-                subtype = event.get("subtype", "")
-                if subtype == "init":
-                    model_id = event.get("model")
-                    if isinstance(model_id, str) and model_id:
-                        self._last_models[chat_id] = model_id
-                if subtype:
-                    pending_system_events.append({"_type": "system_event", "subtype": subtype})
-
-        # Drain any trailing events the CLI emits after the result
-        if got_result:
-            await self._drain_stdout(proc, timeout=0.15)
-
-        # If stdout closed without a result event, the process died — clean up stdin
-        if not got_result:
-            # Find and clean up the stdin reference for the dead process
-            for cid, p in list(self._running_procs.items()):
-                if p is proc:
-                    self._proc_stdins.pop(cid, None)
-                    break
-            await proc.wait()
-            if proc.returncode != 0 and not result_text:
-                if proc.returncode == -9:
-                    result_text = "(stopped)"
-                else:
-                    stderr = await proc.stderr.read()
-                    err_msg = stderr.decode("utf-8", errors="replace").strip()
-                    result_text = f"(Claude Code exited with code {proc.returncode}: {err_msg})"
-
-        if last_assistant_text and len(last_assistant_text) > len(result_text):
-            result_text = last_assistant_text
-
-        if on_progress:
-            for sys_event in pending_system_events:
-                try:
-                    await on_progress(sys_event)
-                except Exception:
-                    pass
-            if result_stats:
-                try:
-                    await on_progress({"_type": "stats", **result_stats})
-                except Exception:
-                    pass
-
-        return result_text, session_id, text_was_streamed
-
     # ── Stream mode (continuous) ─────────────────────────────────────
 
     def stream_mode_active(self, chat_id: int) -> bool:
@@ -842,7 +577,6 @@ class ClaudeCodeManager:
                 pass
         if kill_proc:
             await self._kill_proc(chat_id)
-        self._is_processing.pop(chat_id, None)
 
     async def feed(self, chat_id: int, text: str) -> bool:
         """Send a user message via stdin while in stream mode.
