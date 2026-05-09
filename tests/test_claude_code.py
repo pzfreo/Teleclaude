@@ -65,6 +65,24 @@ class TestClaudeCodeManager:
         mgr = ClaudeCodeManager("fake-token")
         assert mgr.workspace_root == Path("workspaces")
 
+    def test_session_resumable_true_when_jsonl_present(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
+        repo_dir = tmp_path / "ws" / "owner" / "repo"
+        repo_dir.mkdir(parents=True)
+        sid = "abc-123"
+        jsonl_dir = tmp_path / ".claude" / "projects" / str(repo_dir).replace("/", "-")
+        jsonl_dir.mkdir(parents=True)
+        (jsonl_dir / f"{sid}.jsonl").write_text("")
+        assert mgr._session_resumable(sid, repo_dir) is True
+
+    def test_session_resumable_false_when_jsonl_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
+        repo_dir = tmp_path / "ws" / "owner" / "repo"
+        repo_dir.mkdir(parents=True)
+        assert mgr._session_resumable("missing-id", repo_dir) is False
+
 
 class TestTokenNotInCloneUrl:
     """TODO #1: Verify GitHub token is never embedded in git clone URLs."""
@@ -205,6 +223,33 @@ class TestStreamMode:
         # session id was captured from result event, keyed by (chat_id, repo)
         assert mgr.get_session_id(1001, "owner/repo") == "sess-42"
 
+    async def test_stream_forever_ignores_error_result_session_id(self, tmp_path):
+        """When --resume hits a missing session, the CLI emits a result with
+        is_error=true plus a fresh phantom session id. Capturing that id poisons
+        the stored session and loops the failure on every relaunch.
+        """
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
+        mgr._proc_repos[1001] = "owner/repo"
+        mgr._sessions[(1001, "owner/repo")] = "original-sess"
+        events = [
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "session_id": "phantom-sess",
+                "is_error": True,
+                "num_turns": 0,
+            },
+        ]
+        lines = [(json.dumps(e) + "\n").encode() for e in events]
+        proc = _FakeProc(lines)
+
+        async def on_event(event):
+            pass
+
+        await mgr._stream_forever(proc, 1001, on_event)
+        # Stored session is unchanged — the phantom id was rejected
+        assert mgr.get_session_id(1001, "owner/repo") == "original-sess"
+
     async def test_stream_forever_captures_model_from_init(self, tmp_path):
         mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))
         events = [
@@ -279,6 +324,83 @@ class TestStreamMode:
             await task
         # No stream_end — cancellation path must not dispatch synthetic event
         assert not any(e.get("_type") == "stream_end" for e in received)
+
+    async def test_ensure_proc_drops_stale_session_id(self, tmp_path, monkeypatch):
+        """If the stored session id has no jsonl on disk, drop it and launch
+        with a fresh --session-id rather than --resume the missing one."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/bin/claude")
+        repo = "owner/repo"
+        repo_dir = mgr.workspace_path(repo)
+        repo_dir.mkdir(parents=True)
+        # Stale session id — no jsonl exists for it on disk
+        mgr._sessions[(1001, repo)] = "stale-sess"
+
+        captured: dict[str, list[str]] = {}
+
+        class _FakeStdin:
+            def is_closing(self) -> bool:
+                return False
+
+        class _FakeProcLaunched:
+            def __init__(self) -> None:
+                self.stdin = _FakeStdin()
+                self.stdout = None
+                self.stderr = None
+                self.returncode = None
+
+        async def fake_create(*args, **_kwargs):
+            captured["cmd"] = list(args)
+            return _FakeProcLaunched()
+
+        with patch("asyncio.create_subprocess_exec", new=fake_create):
+            await mgr._ensure_proc(1001, repo, model=None, permission_mode=None)
+
+        cmd = captured["cmd"]
+        assert "--resume" not in cmd
+        assert "--session-id" in cmd
+        new_id = cmd[cmd.index("--session-id") + 1]
+        assert new_id != "stale-sess"
+        # The replacement id is now the stored one
+        assert mgr.get_session_id(1001, repo) == new_id
+
+    async def test_ensure_proc_resumes_when_session_jsonl_exists(self, tmp_path, monkeypatch):
+        """A stored session id WITH a jsonl on disk should still be resumed."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/bin/claude")
+        repo = "owner/repo"
+        repo_dir = mgr.workspace_path(repo)
+        repo_dir.mkdir(parents=True)
+        sid = "live-sess"
+        jsonl_dir = tmp_path / ".claude" / "projects" / str(repo_dir).replace("/", "-")
+        jsonl_dir.mkdir(parents=True)
+        (jsonl_dir / f"{sid}.jsonl").write_text("")
+        mgr._sessions[(1001, repo)] = sid
+
+        captured: dict[str, list[str]] = {}
+
+        class _FakeStdin:
+            def is_closing(self) -> bool:
+                return False
+
+        class _FakeProcLaunched:
+            def __init__(self) -> None:
+                self.stdin = _FakeStdin()
+                self.stdout = None
+                self.stderr = None
+                self.returncode = None
+
+        async def fake_create(*args, **_kwargs):
+            captured["cmd"] = list(args)
+            return _FakeProcLaunched()
+
+        with patch("asyncio.create_subprocess_exec", new=fake_create):
+            await mgr._ensure_proc(1001, repo, model=None, permission_mode=None)
+
+        cmd = captured["cmd"]
+        assert "--resume" in cmd
+        assert cmd[cmd.index("--resume") + 1] == sid
+        assert "--session-id" not in cmd
 
     async def test_start_stream_activates_and_stop_deactivates(self, tmp_path):
         mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path))

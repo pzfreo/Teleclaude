@@ -140,6 +140,7 @@ class ClaudeCodeManager:
         self._stdin_locks: dict[int, asyncio.Lock] = {}  # chat_id → lock for stdin writes
         self._last_models: dict[int, str] = {}  # chat_id → resolved model id from most recent CLI init
         self._stream_tasks: dict[int, asyncio.Task] = {}  # chat_id → continuous reader task (stream mode)
+        self._stderr_tasks: dict[int, asyncio.Task] = {}  # chat_id → background stderr-to-log task
         self._control_request_counter: dict[int, int] = {}  # chat_id → monotonic request counter
 
     @property
@@ -240,6 +241,26 @@ class ClaudeCodeManager:
     def get_session_id(self, chat_id: int, repo: str) -> str | None:
         """Return existing session ID for this (chat, repo) pair, or None."""
         return self._sessions.get((chat_id, repo))
+
+    @staticmethod
+    def _session_jsonl_path(session_id: str, repo_dir: Path) -> Path:
+        """Path where the CLI stores a session's transcript.
+
+        The CLI encodes the cwd by replacing path separators with hyphens,
+        e.g. /app/workspaces/pzfreo/Teleclaude → -app-workspaces-pzfreo-Teleclaude.
+        """
+        encoded = str(repo_dir).replace(os.sep, "-")
+        return Path.home() / ".claude" / "projects" / encoded / f"{session_id}.jsonl"
+
+    def _session_resumable(self, session_id: str, repo_dir: Path) -> bool:
+        """True if the CLI's transcript file for this session still exists.
+
+        Stored session ids can outlive their on-disk transcripts (manual /clear,
+        pruning, deletion). Resuming a missing session causes the CLI to exit
+        immediately with an `error_during_execution` result, which previously
+        looped because the error result emits a fresh phantom session id.
+        """
+        return self._session_jsonl_path(session_id, repo_dir).is_file()
 
     def new_session(self, chat_id: int, repo: str) -> None:
         """Clear the session for this (chat, repo) pair so the next message starts fresh.
@@ -434,9 +455,35 @@ class ClaudeCodeManager:
         self._proc_stdins.pop(chat_id, None)
         proc = self._running_procs.pop(chat_id, None)
         self._proc_repos.pop(chat_id, None)
+        stderr_task = self._stderr_tasks.pop(chat_id, None)
+        if stderr_task and not stderr_task.done():
+            stderr_task.cancel()
+            try:
+                await stderr_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if proc and proc.returncode is None:
             proc.kill()
             await proc.wait()
+
+    async def _drain_stderr(self, proc: asyncio.subprocess.Process, chat_id: int) -> None:
+        """Stream the CLI's stderr to the bot logger.
+
+        Without a consumer, the stderr pipe can fill and block the CLI, and
+        useful diagnostics ("No conversation found with session ID: …") get
+        silently dropped — which is exactly how stale-resume bugs hid.
+        """
+        if proc.stderr is None:
+            return
+        try:
+            async for raw_line in proc.stderr:
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    logger.warning("claude[%d] stderr: %s", chat_id, line)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("Stderr reader for chat %d ended: %s", chat_id, e)
 
     async def _ensure_proc(
         self,
@@ -486,6 +533,15 @@ class ClaudeCodeManager:
 
         session_key = (chat_id, repo)
         session_id = self._sessions.get(session_key)
+        if session_id and not self._session_resumable(session_id, repo_dir):
+            logger.info(
+                "Stored session %s for chat %d on %s missing on disk; starting fresh",
+                session_id,
+                chat_id,
+                repo,
+            )
+            self._sessions.pop(session_key, None)
+            session_id = None
         if session_id:
             cmd.extend(["--resume", session_id])
         else:
@@ -527,6 +583,7 @@ class ClaudeCodeManager:
         assert proc.stdin is not None, "stdin pipe not available"
         self._proc_stdins[chat_id] = proc.stdin
         self._proc_repos[chat_id] = repo
+        self._stderr_tasks[chat_id] = asyncio.create_task(self._drain_stderr(proc, chat_id))
         return proc
 
     # ── Stream mode (continuous) ─────────────────────────────────────
@@ -611,8 +668,11 @@ class ClaudeCodeManager:
 
                 # Update manager-internal state from events
                 if event_type == "result":
+                    # Error results (e.g. resume of missing session) carry a
+                    # fresh phantom session id we must NOT capture — doing so
+                    # poisons the stored session and loops the failure.
                     sid = event.get("session_id")
-                    if isinstance(sid, str) and sid:
+                    if isinstance(sid, str) and sid and not event.get("is_error"):
                         repo = self._proc_repos.get(chat_id)
                         if repo:
                             self._sessions[(chat_id, repo)] = sid
