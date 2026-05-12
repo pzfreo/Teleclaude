@@ -8,6 +8,7 @@ dependencies = [
     "anthropic>=0.79.0",
     "python-dotenv>=1.2.2",
     "requests>=2.31.0",
+    "urllib3>=2.7.0",
     "ddgs>=7.0.0",
     "google-api-python-client>=2.100.0",
     "google-auth>=2.23.0",
