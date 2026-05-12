@@ -1085,6 +1085,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _find_repo_candidates(name: str, limit: int = 5) -> list[str]:
+    """Resolve a bare repo name to up to `limit` 'owner/name' candidates from GitHub.
+
+    Case-insensitive substring match over the user's most-recently-pushed repos.
+    """
+    if not gh_client:
+        return []
+    needle = name.lower()
+    try:
+        repos = gh_client.list_user_repos(100)
+    except Exception as e:
+        logger.warning("list_user_repos failed during search: %s", e)
+        return []
+    matches: list[str] = []
+    for r in repos:
+        full = r["full_name"]
+        if needle in full.lower():
+            matches.append(full)
+            if len(matches) >= limit:
+                break
+    return matches
+
+
 async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
@@ -1140,8 +1163,21 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         repo = arg
         if "/" not in repo or len(repo.split("/")) != 2:
-            await update.message.reply_text("Format: /repo owner/name (e.g. /repo pzfreo/Teleclaude)")
-            return
+            loop = asyncio.get_running_loop()
+            matches = await loop.run_in_executor(None, _find_repo_candidates, arg)
+            if not matches:
+                await update.message.reply_text(f"No repo found matching '{arg}'. Use: /repo owner/name")
+                return
+            if len(matches) == 1:
+                repo = matches[0]
+                await update.message.reply_text(f"Matched: {repo}")
+            else:
+                buttons = [[InlineKeyboardButton(m, callback_data=f"repo:{m}")] for m in matches]
+                await update.message.reply_text(
+                    f"Multiple matches for '{arg}'. Tap one:",
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
+                return
 
     if not gh_client:
         await update.message.reply_text("GitHub not configured. Set GITHUB_TOKEN in environment.")
@@ -1155,6 +1191,35 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Active repo set to: {repo} (default branch: {default_branch})")
     except Exception as e:
         await update.message.reply_text(f"Can't access {repo}: {e}")
+
+
+async def _repo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard taps from the /repo candidate list."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    if not update.effective_user or not is_authorized(update.effective_user.id):
+        try:
+            await query.answer("Not authorized", show_alert=True)
+        except TelegramError:
+            pass
+        return
+    await query.answer()
+    repo = query.data[len("repo:") :]
+    if "/" not in repo or len(repo.split("/")) != 2:
+        return
+    chat_id = query.message.chat_id
+    if not gh_client:
+        await query.edit_message_text("GitHub not configured. Set GITHUB_TOKEN in environment.")
+        return
+    try:
+        default_branch = gh_client.get_default_branch(repo)
+        active_repos[chat_id] = repo
+        save_active_repo(chat_id, repo)
+        set_active_branch(chat_id, None)
+        await query.edit_message_text(f"Active repo set to: {repo} (default branch: {default_branch})")
+    except Exception as e:
+        await query.edit_message_text(f"Can't access {repo}: {e}")
 
 
 async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3267,6 +3332,7 @@ def main() -> None:
     app.add_handler(CommandHandler("usage", usage_command))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CallbackQueryHandler(_ask_user_callback, pattern=r"^ask_user:"))
+    app.add_handler(CallbackQueryHandler(_repo_callback, pattern=r"^repo:"))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(
         MessageHandler(

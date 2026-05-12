@@ -420,6 +420,49 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _find_repo_candidates(name: str, limit: int = 5) -> list[str]:
+    """Resolve a bare repo name to up to `limit` 'owner/name' candidates.
+
+    Looks first at locally cloned repos under workspaces/pzfreo/, then at the
+    GitHub user's most-recently-pushed repos. Case-insensitive substring match.
+    Local matches are preferred and listed first.
+    """
+    needle = name.lower()
+    seen: set[str] = set()
+    candidates: list[str] = []
+
+    if claude_code_mgr:
+        local_root = claude_code_mgr.workspace_root / "pzfreo"
+        try:
+            local_dirs = sorted(p.name for p in local_root.iterdir() if p.is_dir())
+        except (FileNotFoundError, NotADirectoryError):
+            local_dirs = []
+        for d in local_dirs:
+            if needle in d.lower():
+                full = f"pzfreo/{d}"
+                if full not in seen:
+                    seen.add(full)
+                    candidates.append(full)
+                    if len(candidates) >= limit:
+                        return candidates
+
+    if gh_client:
+        try:
+            repos = gh_client.list_user_repos(100)
+        except Exception as e:
+            logger.warning("list_user_repos failed during search: %s", e)
+            repos = []
+        for r in repos:
+            full = r["full_name"]
+            if needle in full.lower() and full not in seen:
+                seen.add(full)
+                candidates.append(full)
+                if len(candidates) >= limit:
+                    break
+
+    return candidates
+
+
 async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
@@ -472,8 +515,21 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         repo = arg
         if "/" not in repo or len(repo.split("/")) != 2:
-            await update.message.reply_text("Format: /repo owner/name")
-            return
+            loop = asyncio.get_running_loop()
+            matches = await loop.run_in_executor(None, _find_repo_candidates, arg)
+            if not matches:
+                await update.message.reply_text(f"No repo found matching '{arg}'. Use: /repo owner/name")
+                return
+            if len(matches) == 1:
+                repo = matches[0]
+                await update.message.reply_text(f"Matched: {repo}")
+            else:
+                buttons = [[InlineKeyboardButton(m, callback_data=f"repo:{m}")] for m in matches]
+                await update.message.reply_text(
+                    f"Multiple matches for '{arg}'. Tap one:",
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
+                return
 
     # If stream mode is active, tear it down before switching repos — the
     # running CC process has cwd pointing at the old repo. We'll relaunch

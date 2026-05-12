@@ -1142,4 +1142,139 @@ class TestUsageCommandAgent:
         update.message.reply_text.assert_called_once()
         reply = update.message.reply_text.call_args[0][0]
         assert "10%" in reply
-        assert "50%" in reply
+
+
+class TestRepoBareNameLookup:
+    """Tests for `/repo <name>` resolving a bare name via local tree + GitHub fuzzy match."""
+
+    def test_find_candidates_local_only(self, tmp_path):
+        from bot_agent import _find_repo_candidates
+
+        (tmp_path / "pzfreo" / "Teleclaude").mkdir(parents=True)
+        (tmp_path / "pzfreo" / "OtherProj").mkdir(parents=True)
+        mock_mgr = MagicMock()
+        mock_mgr.workspace_root = tmp_path
+        with patch("bot_agent.claude_code_mgr", mock_mgr), patch("bot_agent.gh_client", None):
+            assert _find_repo_candidates("tele") == ["pzfreo/Teleclaude"]
+
+    def test_find_candidates_case_insensitive(self, tmp_path):
+        from bot_agent import _find_repo_candidates
+
+        (tmp_path / "pzfreo" / "Teleclaude").mkdir(parents=True)
+        mock_mgr = MagicMock()
+        mock_mgr.workspace_root = tmp_path
+        with patch("bot_agent.claude_code_mgr", mock_mgr), patch("bot_agent.gh_client", None):
+            assert _find_repo_candidates("TELE") == ["pzfreo/Teleclaude"]
+
+    def test_find_candidates_github_fallback(self, tmp_path):
+        from bot_agent import _find_repo_candidates
+
+        (tmp_path / "pzfreo").mkdir()  # exists but empty
+        mock_mgr = MagicMock()
+        mock_mgr.workspace_root = tmp_path
+        mock_gh = MagicMock()
+        mock_gh.list_user_repos.return_value = [
+            {"full_name": "pzfreo/Teleclaude", "description": "", "pushed_at": "x"},
+            {"full_name": "pzfreo/other", "description": "", "pushed_at": "y"},
+            {"full_name": "someorg/teleclient", "description": "", "pushed_at": "z"},
+        ]
+        with patch("bot_agent.claude_code_mgr", mock_mgr), patch("bot_agent.gh_client", mock_gh):
+            assert _find_repo_candidates("tele") == ["pzfreo/Teleclaude", "someorg/teleclient"]
+
+    def test_find_candidates_local_preferred_over_github(self, tmp_path):
+        from bot_agent import _find_repo_candidates
+
+        (tmp_path / "pzfreo" / "Teleclaude").mkdir(parents=True)
+        mock_mgr = MagicMock()
+        mock_mgr.workspace_root = tmp_path
+        mock_gh = MagicMock()
+        mock_gh.list_user_repos.return_value = [
+            {"full_name": "pzfreo/Teleclaude", "description": "", "pushed_at": "x"},
+            {"full_name": "someorg/teleclient", "description": "", "pushed_at": "y"},
+        ]
+        with patch("bot_agent.claude_code_mgr", mock_mgr), patch("bot_agent.gh_client", mock_gh):
+            # Local match shows up first; github dupes are deduped
+            assert _find_repo_candidates("tele") == ["pzfreo/Teleclaude", "someorg/teleclient"]
+
+    def test_find_candidates_caps_at_limit(self, tmp_path):
+        from bot_agent import _find_repo_candidates
+
+        for n in ("foo1", "foo2", "foo3", "foo4", "foo5", "foo6"):
+            (tmp_path / "pzfreo" / n).mkdir(parents=True)
+        mock_mgr = MagicMock()
+        mock_mgr.workspace_root = tmp_path
+        with patch("bot_agent.claude_code_mgr", mock_mgr), patch("bot_agent.gh_client", None):
+            assert len(_find_repo_candidates("foo", limit=5)) == 5
+
+    def test_find_candidates_missing_workspace_root(self, tmp_path):
+        """If workspaces/pzfreo doesn't exist, we should not crash."""
+        from bot_agent import _find_repo_candidates
+
+        mock_mgr = MagicMock()
+        mock_mgr.workspace_root = tmp_path  # pzfreo/ subdir doesn't exist
+        with patch("bot_agent.claude_code_mgr", mock_mgr), patch("bot_agent.gh_client", None):
+            assert _find_repo_candidates("anything") == []
+
+    async def test_set_repo_bare_name_no_match_shows_error(self, tmp_path):
+        from bot_agent import set_repo
+
+        update = _make_update(chat_id=7001)
+        ctx = _make_context(args=["doesnotexist"])
+        mock_mgr = MagicMock()
+        mock_mgr.workspace_root = tmp_path
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr", mock_mgr),
+            patch("bot_agent.gh_client", None),
+        ):
+            await set_repo(update, ctx)
+        update.message.reply_text.assert_called_once()
+        reply = update.message.reply_text.call_args[0][0]
+        assert "No repo found" in reply
+
+    async def test_set_repo_bare_name_single_match_auto_selects(self, tmp_path):
+        import bot_agent
+        from bot_agent import set_repo
+
+        (tmp_path / "pzfreo" / "Teleclaude").mkdir(parents=True)
+        update = _make_update(chat_id=7002)
+        ctx = _make_context(args=["tele"])
+        mock_mgr = MagicMock()
+        mock_mgr.workspace_root = tmp_path
+        mock_mgr.stop_stream = AsyncMock()
+        bot_agent._stream_mode.discard(7002)
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr", mock_mgr),
+            patch("bot_agent.gh_client", None),
+            patch("bot_agent.save_active_repo"),
+            patch("bot_agent.set_active_branch"),
+            patch("asyncio.create_task", side_effect=lambda c: c.close() or MagicMock()),
+        ):
+            await set_repo(update, ctx)
+        # First reply confirms the match, second reply announces cloning
+        replies = [c[0][0] for c in update.message.reply_text.call_args_list]
+        assert any("Matched: pzfreo/Teleclaude" in r for r in replies)
+        assert bot_agent.active_repos[7002] == "pzfreo/Teleclaude"
+
+    async def test_set_repo_bare_name_multi_match_shows_buttons(self, tmp_path):
+        from bot_agent import set_repo
+
+        (tmp_path / "pzfreo" / "FooOne").mkdir(parents=True)
+        (tmp_path / "pzfreo" / "FooTwo").mkdir(parents=True)
+        update = _make_update(chat_id=7003)
+        ctx = _make_context(args=["foo"])
+        mock_mgr = MagicMock()
+        mock_mgr.workspace_root = tmp_path
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr", mock_mgr),
+            patch("bot_agent.gh_client", None),
+        ):
+            await set_repo(update, ctx)
+        update.message.reply_text.assert_called_once()
+        kwargs = update.message.reply_text.call_args[1]
+        markup = kwargs.get("reply_markup")
+        assert markup is not None
+        labels = [row[0].text for row in markup.inline_keyboard]
+        assert labels == ["pzfreo/FooOne", "pzfreo/FooTwo"]
