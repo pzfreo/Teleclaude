@@ -940,3 +940,125 @@ class TestUsageCommand:
         assert "61%" in reply
         assert "45%" in reply
         assert "2026-05-06" in reply
+
+
+class TestRepoBareNameLookup:
+    """Tests for /repo <name> bare-name fuzzy match against GitHub."""
+
+    def test_find_candidates_substring_match(self):
+        from bot import _find_repo_candidates
+
+        mock_gh = MagicMock()
+        mock_gh.list_user_repos.return_value = [
+            {"full_name": "pzfreo/Teleclaude", "description": "", "pushed_at": "x"},
+            {"full_name": "pzfreo/other", "description": "", "pushed_at": "y"},
+            {"full_name": "someorg/teleclient", "description": "", "pushed_at": "z"},
+        ]
+        with patch("bot.gh_client", mock_gh):
+            assert _find_repo_candidates("tele") == ["pzfreo/Teleclaude", "someorg/teleclient"]
+
+    def test_find_candidates_case_insensitive(self):
+        from bot import _find_repo_candidates
+
+        mock_gh = MagicMock()
+        mock_gh.list_user_repos.return_value = [
+            {"full_name": "pzfreo/Teleclaude", "description": "", "pushed_at": "x"},
+        ]
+        with patch("bot.gh_client", mock_gh):
+            assert _find_repo_candidates("TELE") == ["pzfreo/Teleclaude"]
+
+    def test_find_candidates_no_gh_client(self):
+        from bot import _find_repo_candidates
+
+        with patch("bot.gh_client", None):
+            assert _find_repo_candidates("anything") == []
+
+    def test_find_candidates_respects_limit(self):
+        from bot import _find_repo_candidates
+
+        mock_gh = MagicMock()
+        mock_gh.list_user_repos.return_value = [
+            {"full_name": f"pzfreo/foo{i}", "description": "", "pushed_at": "x"} for i in range(10)
+        ]
+        with patch("bot.gh_client", mock_gh):
+            assert len(_find_repo_candidates("foo", limit=3)) == 3
+
+    async def test_set_repo_bare_name_no_match(self):
+        from bot import set_repo
+
+        update = _make_update()
+        ctx = _make_context(args=["zzznomatchzzz"])
+        with (
+            patch("bot.is_authorized", return_value=True),
+            patch("bot.gh_client", MagicMock(list_user_repos=MagicMock(return_value=[]))),
+        ):
+            await set_repo(update, ctx)
+        reply = update.message.reply_text.call_args[0][0]
+        assert "No repo found" in reply
+
+    async def test_set_repo_bare_name_single_match_auto_selects(self):
+        import bot
+        from bot import set_repo
+
+        update = _make_update(chat_id=8001)
+        ctx = _make_context(args=["tele"])
+        mock_gh = MagicMock()
+        mock_gh.list_user_repos.return_value = [
+            {"full_name": "pzfreo/Teleclaude", "description": "", "pushed_at": "x"},
+        ]
+        mock_gh.get_default_branch.return_value = "main"
+        with (
+            patch("bot.is_authorized", return_value=True),
+            patch("bot.gh_client", mock_gh),
+            patch("bot.save_active_repo"),
+            patch("bot.set_active_branch"),
+        ):
+            await set_repo(update, ctx)
+        replies = [c[0][0] for c in update.message.reply_text.call_args_list]
+        assert any("Matched: pzfreo/Teleclaude" in r for r in replies)
+        assert bot.active_repos[8001] == "pzfreo/Teleclaude"
+
+    async def test_set_repo_bare_name_multi_match_shows_buttons(self):
+        from bot import set_repo
+
+        update = _make_update()
+        ctx = _make_context(args=["foo"])
+        mock_gh = MagicMock()
+        mock_gh.list_user_repos.return_value = [
+            {"full_name": "pzfreo/foo1", "description": "", "pushed_at": "x"},
+            {"full_name": "pzfreo/foo2", "description": "", "pushed_at": "y"},
+        ]
+        with (
+            patch("bot.is_authorized", return_value=True),
+            patch("bot.gh_client", mock_gh),
+        ):
+            await set_repo(update, ctx)
+        kwargs = update.message.reply_text.call_args[1]
+        markup = kwargs.get("reply_markup")
+        assert markup is not None
+        labels = [row[0].text for row in markup.inline_keyboard]
+        assert labels == ["pzfreo/foo1", "pzfreo/foo2"]
+
+    async def test_repo_callback_sets_active_repo(self):
+        import bot
+        from bot import _repo_callback
+
+        query = MagicMock()
+        query.data = "repo:pzfreo/Teleclaude"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        query.message.chat_id = 8002
+        update = MagicMock()
+        update.callback_query = query
+        update.effective_user.id = 42
+        mock_gh = MagicMock()
+        mock_gh.get_default_branch.return_value = "main"
+        with (
+            patch("bot.is_authorized", return_value=True),
+            patch("bot.gh_client", mock_gh),
+            patch("bot.save_active_repo"),
+            patch("bot.set_active_branch"),
+        ):
+            await _repo_callback(update, MagicMock())
+        assert bot.active_repos[8002] == "pzfreo/Teleclaude"
+        query.edit_message_text.assert_awaited_once()
