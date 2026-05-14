@@ -163,8 +163,16 @@ def _md_render_inline(tokens: list) -> str:
     return "".join(out)
 
 
+_TABLE_HORIZONTAL_MAX_WIDTH = 40
+
+
 def _md_render_table(tokens: list) -> str:
-    """Render table tokens as an aligned-column <pre> block."""
+    """Render table tokens.
+
+    Narrow tables (total width <= 40 chars) render as an aligned-column <pre> block.
+    Wider tables flip to a vertical "header: value" layout per row, separated by a
+    divider line, because monospaced columns wrap unreadably on phone screens.
+    """
     rows: list[list[str]] = []
     separator_after: set[int] = set()
     current_row: list[str] | None = None
@@ -195,15 +203,38 @@ def _md_render_table(tokens: list) -> str:
     for row in rows:
         for j, cell in enumerate(row):
             widths[j] = max(widths[j], len(cell))
+    total_width = sum(widths) + 3 * max(col_count - 1, 0)
 
-    lines: list[str] = []
-    for idx, row in enumerate(rows):
-        cells = [row[j].ljust(widths[j]) if j < len(row) else " " * widths[j] for j in range(col_count)]
-        lines.append("   ".join(cells).rstrip())
-        if idx in separator_after:
-            lines.append("─" * (sum(widths) + 3 * max(col_count - 1, 0)))
+    if total_width <= _TABLE_HORIZONTAL_MAX_WIDTH:
+        lines: list[str] = []
+        for idx, row in enumerate(rows):
+            cells = [row[j].ljust(widths[j]) if j < len(row) else " " * widths[j] for j in range(col_count)]
+            lines.append("   ".join(cells).rstrip())
+            if idx in separator_after:
+                lines.append("─" * total_width)
+        return f"<pre>{escape(chr(10).join(lines))}</pre>\n"
 
-    return f"<pre>{escape(chr(10).join(lines))}</pre>\n"
+    if separator_after:
+        header_idx = min(separator_after)
+        headers = rows[header_idx]
+        data_rows = [r for i, r in enumerate(rows) if i != header_idx]
+    else:
+        headers = [f"Col {i + 1}" for i in range(col_count)]
+        data_rows = rows
+
+    blocks: list[str] = []
+    for row in data_rows:
+        block_lines: list[str] = []
+        for j in range(col_count):
+            header = headers[j] if j < len(headers) else f"Col {j + 1}"
+            value = row[j] if j < len(row) else ""
+            if not value.strip():
+                continue
+            block_lines.append(f"<b>{header}:</b> {value}")
+        if block_lines:
+            blocks.append("\n".join(block_lines))
+
+    return "\n─────────\n".join(blocks) + "\n"
 
 
 # ── Telegram helpers ─────────────────────────────────────────────────
