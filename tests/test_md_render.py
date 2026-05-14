@@ -69,6 +69,34 @@ class TestMdToTelegramHtml:
         assert "A" in result
         assert "B" in result
 
+    def test_wide_table_renders_vertically(self):
+        md = (
+            "| Location | Direction | Purpose |\n"
+            "|---|---|---|\n"
+            "| Top face, on the bore axis | facing UP, going DOWN into the plate | "
+            "Captures the M6x45 flat-head axial sleeve bolt |\n"
+            "| Front face, X = +27, mid-Z | facing FORWARD (-Y), going +Y into the plate | "
+            "One of the 2x M6x20 face-plate-to-bottom-plate bolts |"
+        )
+        result = self.html(md)
+        assert "<pre>" not in result
+        assert "<b>Location:</b>" in result
+        assert "<b>Direction:</b>" in result
+        assert "<b>Purpose:</b>" in result
+        assert "─────────" in result
+        assert "Top face, on the bore axis" in result
+        assert "Front face, X = +27, mid-Z" in result
+
+    def test_wide_table_divider_between_rows_only(self):
+        md = (
+            "| Name | Long description column |\n"
+            "|---|---|\n"
+            "| First | a fairly long description that pushes the table past forty chars |\n"
+            "| Second | another long description that also pushes things wider |"
+        )
+        result = self.html(md)
+        assert result.count("─────────") == 1
+
     def test_strikethrough(self):
         result = self.html("~~deleted~~")
         assert "<s>deleted</s>" in result
