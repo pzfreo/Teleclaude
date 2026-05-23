@@ -272,6 +272,137 @@ class TestAgentCommands:
         assert "Agent" in text
 
 
+# ── /df and /cleanup ──────────────────────────────────────────────────
+
+
+class TestDiskCommands:
+    def test_human_size_units(self):
+        from bot_agent import _human_size
+
+        assert _human_size(0) == "0 B"
+        assert _human_size(512) == "512 B"
+        assert _human_size(2048) == "2.0 KB"
+        assert _human_size(5 * 1024 * 1024) == "5.0 MB"
+        assert _human_size(3 * 1024**3) == "3.0 GB"
+
+    def test_dir_size_sums_files(self, tmp_path):
+        from bot_agent import _dir_size
+
+        (tmp_path / "a.txt").write_bytes(b"x" * 100)
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "b.txt").write_bytes(b"y" * 250)
+        assert _dir_size(tmp_path) == 350
+
+    def test_compute_disk_report_lists_owner_dirs(self, tmp_path):
+        from bot_agent import _compute_disk_report
+
+        (tmp_path / "alice").mkdir()
+        (tmp_path / "alice" / "f").write_bytes(b"x" * 100)
+        (tmp_path / "bob").mkdir()
+        (tmp_path / ".hidden").mkdir()  # should be filtered out
+
+        report = _compute_disk_report(tmp_path)
+        assert "Disk:" in report
+        assert "GB free" in report
+        assert "alice/" in report
+        assert "bob/" in report
+        assert ".hidden/" not in report
+
+    def test_cleanup_removes_targets_only(self, tmp_path):
+        import bot_agent
+
+        repo = tmp_path / "myrepo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        (repo / "src" / "main.py").write_text("print('hi')")
+        venv = repo / ".venv"
+        venv.mkdir()
+        (venv / "marker").write_bytes(b"z" * 1024)
+        pycache = repo / "src" / "__pycache__"
+        pycache.mkdir()
+        (pycache / "x.pyc").write_bytes(b"compiled")
+
+        freed, count = bot_agent._cleanup_cache_dirs(tmp_path)
+        assert count == 2
+        assert not venv.exists()
+        assert not pycache.exists()
+        assert (repo / "src" / "main.py").exists()
+        # freed is filesystem-level and may be 0 on small tmpfs, so just verify non-negative.
+        assert freed >= 0
+
+    def test_cleanup_does_not_descend_into_targets(self, tmp_path):
+        import bot_agent
+
+        nested_venv = tmp_path / "repo" / ".venv"
+        nested_venv.mkdir(parents=True)
+        # An inner __pycache__ inside .venv shouldn't get counted twice
+        (nested_venv / "__pycache__").mkdir()
+        _freed, count = bot_agent._cleanup_cache_dirs(tmp_path)
+        assert count == 1  # only the outer .venv
+
+    async def test_df_command_unauthorized_no_response(self):
+        from bot_agent import df_command
+
+        update = _make_update()
+        ctx = _make_context()
+        with patch("bot_agent.is_authorized", return_value=False):
+            await df_command(update, ctx)
+        update.message.reply_text.assert_not_called()
+
+    async def test_df_command_authorized_sends_report(self, tmp_path):
+        from unittest.mock import AsyncMock
+
+        from bot_agent import df_command
+
+        update = _make_update()
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_mgr.workspace_root = tmp_path
+            await df_command(update, ctx)
+        mock_send.assert_awaited_once()
+        sent_text = mock_send.call_args[0][1]
+        assert "Disk:" in sent_text
+
+    async def test_df_command_handles_missing_mgr(self):
+        from bot_agent import df_command
+
+        update = _make_update()
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr", None),
+        ):
+            await df_command(update, ctx)
+        update.message.reply_text.assert_called_once()
+        assert "not configured" in update.message.reply_text.call_args[0][0].lower()
+
+    async def test_cleanup_command_runs_and_reports(self, tmp_path):
+        from bot_agent import cleanup_command
+
+        # Set up something to clean
+        (tmp_path / "repo").mkdir()
+        (tmp_path / "repo" / ".venv").mkdir()
+        (tmp_path / "repo" / ".venv" / "f").write_bytes(b"x" * 10)
+
+        update = _make_update()
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+        ):
+            mock_mgr.workspace_root = tmp_path
+            await cleanup_command(update, ctx)
+        # Two messages: "Cleaning…" then "Removed N dirs…"
+        assert update.message.reply_text.await_count == 2
+        final = update.message.reply_text.await_args_list[-1].args[0]
+        assert "Removed 1 dirs" in final
+
+
 # ── Plan / Work mode tests ────────────────────────────────────────────
 
 
