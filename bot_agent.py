@@ -147,9 +147,11 @@ SKIP_DIRS = frozenset(
     {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build", ".cache", ".tox"}
 )
 MAX_FILE_BYTES = 50 * 1024 * 1024  # Telegram bot file size limit
-SEND_MARKER_RE = re.compile(r"^\[SEND:\s*([^\]]+)\]", re.IGNORECASE | re.MULTILINE)
+SEND_MARKER_RE = re.compile(r"\[SEND:\s*([^\]]+)\]", re.IGNORECASE)
+ASK_MARKER_RE = re.compile(r"\[ASK:\s*([^\]]+)\]", re.IGNORECASE)
 
 _files_cache: dict[int, list[Path]] = {}  # chat_id -> file list for inline keyboard
+_ask_options: dict[int, list[str]] = {}  # chat_id -> options for current [ASK:] question
 
 
 def is_authorized(user_id: int) -> bool:
@@ -357,15 +359,13 @@ async def _send_file_to_user(chat_id: int, path: Path, bot) -> bool:
 
 
 async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot) -> str:
-    """Strip [SEND: path] markers from text and send each referenced file."""
-    markers = SEND_MARKER_RE.findall(text)
-    if not markers:
-        return text
+    """Strip [SEND: path] and [ASK: question | opt1 | opt2] markers from text and handle them."""
+    send_markers = SEND_MARKER_RE.findall(text)
     workspace = claude_code_mgr.workspace_path(repo) if repo else None
     workspace_str = str(workspace.resolve()) if workspace else None
     shared_str = str((claude_code_mgr.workspace_root / ".shared" / str(chat_id)).resolve())
     tmp_str = str(Path("/tmp").resolve())
-    for raw in markers:
+    for raw in send_markers:
         raw = raw.strip()
         p = Path(raw)
         if not p.is_absolute() and workspace:
@@ -381,7 +381,20 @@ async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot
             await _send_file_to_user(chat_id, p, bot)
         else:
             logger.warning("Blocked file send outside workspace: %s", p)
-    return SEND_MARKER_RE.sub("", text).strip()
+    text = SEND_MARKER_RE.sub("", text).strip()
+
+    for match in ASK_MARKER_RE.finditer(text):
+        parts = [p.strip() for p in match.group(1).split("|")]
+        if len(parts) >= 3:
+            question, options = parts[0], parts[1:]
+            _ask_options[chat_id] = options
+            buttons = [
+                [InlineKeyboardButton(opt, callback_data=f"ask_agent:{chat_id}:{i}")] for i, opt in enumerate(options)
+            ]
+            await bot.send_message(chat_id=chat_id, text=question, reply_markup=InlineKeyboardMarkup(buttons))
+    text = ASK_MARKER_RE.sub("", text).strip()
+
+    return text
 
 
 # ── Commands ──────────────────────────────────────────────────────────
@@ -1005,6 +1018,29 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         save_model(chat_id, model_id)
         claude_code_mgr.clear_last_model(chat_id)
         await query.edit_message_text(f"Model switched to: {model_id}")
+
+    elif data.startswith("ask_agent:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            return
+        try:
+            target_chat = int(parts[1])
+            idx = int(parts[2])
+        except ValueError:
+            return
+        options = _ask_options.get(target_chat, [])
+        if idx >= len(options):
+            await query.edit_message_text("Options expired — send your answer as a message.")
+            return
+        answer = options[idx]
+        _ask_options.pop(target_chat, None)
+        await query.edit_message_text(f"You chose: {answer}")
+        sent = await claude_code_mgr.feed(target_chat, answer)
+        if not sent:
+            await context.bot.send_message(
+                chat_id=target_chat,
+                text=f"You chose: {answer}\n(No active session — your choice was not sent to Claude.)",
+            )
 
 
 def _get_usage_credentials() -> tuple[str, str]:

@@ -563,8 +563,14 @@ class ClaudeCodeManager:
                 "- The Telegram bot detects `[SEND: path]` markers in your responses and delivers the file directly to the user's phone.\n"
                 "- When an MCP tool returns an image or generates a file, save it to disk (e.g. /tmp/) and use [SEND: path] to deliver it — do NOT pass image data back through the API as vision content.\n"
                 "- For render_view: always pass save_to='/tmp/screenshot.png' (or similar) so the image is written to disk. Never let render_view return raw image data into the conversation.\n"
-                "- Place [SEND: path] markers on their own line at the end of your response.\n"
-                "- You can include multiple markers for multiple files.",
+                "- You can include multiple [SEND: path] markers for multiple files.\n"
+                "\n"
+                "Asking the user to choose:\n"
+                "- Use `[ASK: question | option1 | option2 | ...]` to present the user with inline buttons and get their choice before continuing.\n"
+                "- Format: the part before the first | is the question text; each subsequent | delimited part is one button option (2-5 options).\n"
+                "- Example: [ASK: Which approach should I use? | Refactor in place | Create new module | Skip for now]\n"
+                "- The user's selection will be sent back to you as the next message — wait for it before proceeding.\n"
+                "- Do NOT use [ASK:] for yes/no confirmations that don't need user input; just proceed unless the decision is genuinely ambiguous.",
             ]
         )
 
