@@ -361,9 +361,9 @@ async def _send_file_to_user(chat_id: int, path: Path, bot) -> bool:
 async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot) -> str:
     """Strip [SEND: path] and [ASK: question | opt1 | opt2] markers from text and handle them."""
     send_markers = SEND_MARKER_RE.findall(text)
-    workspace = claude_code_mgr.workspace_path(repo) if repo else None
+    workspace = claude_code_mgr.workspace_path(repo) if repo and claude_code_mgr else None
     workspace_str = str(workspace.resolve()) if workspace else None
-    shared_str = str((claude_code_mgr.workspace_root / ".shared" / str(chat_id)).resolve())
+    shared_str = str((claude_code_mgr.workspace_root / ".shared" / str(chat_id)).resolve()) if claude_code_mgr else None
     tmp_str = str(Path("/tmp").resolve())
     for raw in send_markers:
         raw = raw.strip()
@@ -374,7 +374,7 @@ async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot
             p = p.resolve()
         safe = (
             (workspace_str and str(p).startswith(workspace_str))
-            or str(p).startswith(shared_str)
+            or (shared_str and str(p).startswith(shared_str))
             or str(p).startswith(tmp_str)
         )
         if safe:
