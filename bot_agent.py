@@ -1508,6 +1508,13 @@ async def notify_startup(app: Application) -> None:
             ("help", "Show help message"),
         ]
     )
+    if claude_code_mgr is not None:
+        try:
+            fixed = await claude_code_mgr.sanitize_all_remotes()
+            if fixed:
+                logger.warning("Sanitized %d workspace remote(s) with embedded tokens", fixed)
+        except Exception as e:
+            logger.warning("Remote URL sanitization failed: %s", e)
     if not ALLOWED_USER_IDS:
         return
     now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
