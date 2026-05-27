@@ -268,7 +268,7 @@ class TestCacheFunctions:
 
         conversations.pop(8885, None)
         msgs = [{"role": "user", "content": "hello"}]
-        with patch("bot.load_conversation", return_value=msgs):
+        with patch("history.load_conversation", return_value=msgs):
             result = get_conversation(8885)
         assert len(result) >= 1
         conversations.pop(8885, None)
