@@ -269,46 +269,46 @@ class TestManagePulseTool:
 
 class TestQuietHours:
     def test_overnight_quiet_in_range(self):
-        from bot import _is_quiet_hours
+        from pulse_agent import _is_quiet_hours
 
         # 23:30 is within 22:00-07:00
         tz = datetime.UTC
-        with patch("bot.datetime") as mock_dt:
+        with patch("pulse_agent.datetime") as mock_dt:
             mock_dt.datetime.now.return_value = datetime.datetime(2026, 2, 18, 23, 30, tzinfo=tz)
             mock_dt.UTC = datetime.UTC
             result = _is_quiet_hours("22:00", "07:00", tz)
         assert result is True
 
     def test_overnight_quiet_out_of_range(self):
-        from bot import _is_quiet_hours
+        from pulse_agent import _is_quiet_hours
 
         # 12:00 is outside 22:00-07:00
         tz = datetime.UTC
-        with patch("bot.datetime") as mock_dt:
+        with patch("pulse_agent.datetime") as mock_dt:
             mock_dt.datetime.now.return_value = datetime.datetime(2026, 2, 18, 12, 0, tzinfo=tz)
             mock_dt.UTC = datetime.UTC
             result = _is_quiet_hours("22:00", "07:00", tz)
         assert result is False
 
     def test_same_day_quiet_in_range(self):
-        from bot import _is_quiet_hours
+        from pulse_agent import _is_quiet_hours
 
         # 10:00 is within 09:00-17:00
         tz = datetime.UTC
-        with patch("bot.datetime") as mock_dt:
+        with patch("pulse_agent.datetime") as mock_dt:
             mock_dt.datetime.now.return_value = datetime.datetime(2026, 2, 18, 10, 0, tzinfo=tz)
             mock_dt.UTC = datetime.UTC
             result = _is_quiet_hours("09:00", "17:00", tz)
         assert result is True
 
     def test_no_quiet_hours(self):
-        from bot import _is_quiet_hours
+        from pulse_agent import _is_quiet_hours
 
         tz = datetime.UTC
         assert _is_quiet_hours(None, None, tz) is False
 
     def test_invalid_quiet_hours(self):
-        from bot import _is_quiet_hours
+        from pulse_agent import _is_quiet_hours
 
         tz = datetime.UTC
         assert _is_quiet_hours("invalid", "also_invalid", tz) is False
@@ -597,7 +597,7 @@ class TestPulseJob:
             ctx.job.data = {"chat_id": 1001}
             ctx.bot = AsyncMock()
 
-            with patch("bot._run_pulse_triage", new_callable=AsyncMock) as mock_triage:
+            with patch("pulse_agent._run_pulse_triage", new_callable=AsyncMock) as mock_triage:
                 await _run_pulse(ctx)
                 mock_triage.assert_not_called()
 
@@ -605,7 +605,7 @@ class TestPulseJob:
     async def test_skips_quiet_hours(self, tmp_db):
         with (
             patch("persistence.DB_PATH", tmp_db),
-            patch("bot._is_quiet_hours", return_value=True),
+            patch("pulse_agent._is_quiet_hours", return_value=True),
         ):
             from persistence import save_pulse_config, save_pulse_goal
 
@@ -617,7 +617,7 @@ class TestPulseJob:
             ctx.job.data = {"chat_id": 1001}
             ctx.bot = AsyncMock()
 
-            with patch("bot._run_pulse_triage", new_callable=AsyncMock) as mock_triage:
+            with patch("pulse_agent._run_pulse_triage", new_callable=AsyncMock) as mock_triage:
                 await _run_pulse(ctx)
                 mock_triage.assert_not_called()
 
@@ -633,7 +633,7 @@ class TestPulseJob:
             ctx.job.data = {"chat_id": 1001}
             ctx.bot = AsyncMock()
 
-            with patch("bot._run_pulse_triage", new_callable=AsyncMock) as mock_triage:
+            with patch("pulse_agent._run_pulse_triage", new_callable=AsyncMock) as mock_triage:
                 await _run_pulse(ctx)
                 mock_triage.assert_not_called()
 
@@ -641,30 +641,7 @@ class TestPulseJob:
     async def test_triage_no_act_skips_action(self, tmp_db):
         with (
             patch("persistence.DB_PATH", tmp_db),
-            patch("bot._is_quiet_hours", return_value=False),
-        ):
-            from persistence import save_pulse_config, save_pulse_goal
-
-            save_pulse_config(1001, enabled=True, interval_minutes=60, quiet_start=None, quiet_end=None)
-            save_pulse_goal(1001, "Watch PRs", "high")
-            from bot import _run_pulse
-
-            ctx = MagicMock()
-            ctx.job.data = {"chat_id": 1001}
-            ctx.bot = AsyncMock()
-
-            with (
-                patch("bot._run_pulse_triage", new_callable=AsyncMock, return_value={"act": False, "reason": ""}),
-                patch("bot._run_pulse_action", new_callable=AsyncMock) as mock_action,
-            ):
-                await _run_pulse(ctx)
-                mock_action.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_triage_act_triggers_action(self, tmp_db):
-        with (
-            patch("persistence.DB_PATH", tmp_db),
-            patch("bot._is_quiet_hours", return_value=False),
+            patch("pulse_agent._is_quiet_hours", return_value=False),
         ):
             from persistence import save_pulse_config, save_pulse_goal
 
@@ -678,11 +655,36 @@ class TestPulseJob:
 
             with (
                 patch(
-                    "bot._run_pulse_triage",
+                    "pulse_agent._run_pulse_triage", new_callable=AsyncMock, return_value={"act": False, "reason": ""}
+                ),
+                patch("pulse_agent._run_pulse_action", new_callable=AsyncMock) as mock_action,
+            ):
+                await _run_pulse(ctx)
+                mock_action.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_triage_act_triggers_action(self, tmp_db):
+        with (
+            patch("persistence.DB_PATH", tmp_db),
+            patch("pulse_agent._is_quiet_hours", return_value=False),
+        ):
+            from persistence import save_pulse_config, save_pulse_goal
+
+            save_pulse_config(1001, enabled=True, interval_minutes=60, quiet_start=None, quiet_end=None)
+            save_pulse_goal(1001, "Watch PRs", "high")
+            from bot import _run_pulse
+
+            ctx = MagicMock()
+            ctx.job.data = {"chat_id": 1001}
+            ctx.bot = AsyncMock()
+
+            with (
+                patch(
+                    "pulse_agent._run_pulse_triage",
                     new_callable=AsyncMock,
                     return_value={"act": True, "reason": "Overdue task"},
                 ),
-                patch("bot._run_pulse_action", new_callable=AsyncMock) as mock_action,
+                patch("pulse_agent._run_pulse_action", new_callable=AsyncMock) as mock_action,
             ):
                 await _run_pulse(ctx)
                 mock_action.assert_called_once_with(ctx.bot, 1001, {"act": True, "reason": "Overdue task"})

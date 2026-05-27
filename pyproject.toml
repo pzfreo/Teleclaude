@@ -42,6 +42,7 @@ py-modules = [
     "bot", "bot_agent", "persistence", "shared", "github_tools", "web_tools",
     "calendar_tools", "tasks_tools", "email_tools", "claude_code",
     "contacts_tools", "train_tools", "station_codes", "setup_google", "webhooks", "streaming", "mcp_tools",
+    "pulse_agent", "monitor_system", "history", "tool_execution",
 ]
 
 [tool.setuptools.dynamic]
@@ -128,7 +129,7 @@ module = [
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["bot", "bot_agent"]
+module = ["bot", "bot_agent", "pulse_agent", "monitor_system", "tool_execution"]
 # Telegram Update fields (message, effective_user, effective_chat) are Optional
 # but handlers guard with early returns. Suppress the noisy union-attr warnings.
 disable_error_code = ["union-attr", "arg-type"]

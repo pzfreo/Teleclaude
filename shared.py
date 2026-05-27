@@ -279,3 +279,39 @@ async def download_telegram_file(file_obj, bot) -> bytes:
     """Download a Telegram file and return its bytes."""
     tg_file = await bot.get_file(file_obj.file_id)
     return bytes(await tg_file.download_as_bytearray())
+
+
+# ── Per-chat cache getters ───────────────────────────────────────────
+
+
+def cached_get(cache: dict, loader, chat_id: int, default=None):
+    """Look up chat_id in `cache`; on miss, call `loader(chat_id)` and memoize truthy results.
+
+    Both bots use the same in-memory-cache-backed-by-SQLite pattern for model,
+    active repo, and active branch. This helper deduplicates the boilerplate.
+    Returns `default` if neither the cache nor the loader has a value.
+    """
+    if chat_id not in cache:
+        loaded = loader(chat_id)
+        if loaded:
+            cache[chat_id] = loaded
+    return cache.get(chat_id, default)
+
+
+def setup_logging() -> RingBufferHandler:
+    """Configure logging for a bot entry point.
+
+    - Installs a RingBufferHandler on the root logger so `/logs` can dump
+      the recent buffer.
+    - Sets the basic format used by both bots.
+    - Silences the httpx logger (it leaks bot tokens in URLs at INFO).
+    Returns the RingBufferHandler so the caller can read from it later.
+    """
+    handler = RingBufferHandler()
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.INFO,
+    )
+    logging.getLogger().addHandler(handler)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    return handler
