@@ -457,6 +457,7 @@ from pulse_agent import (
     _unregister_pulse,
     pulse_command,
 )
+from tool_execution import _execute_tool_call, _truncate_result
 
 ASK_USER_TIMEOUT = 300  # seconds to wait for user response
 _ask_user_futures: dict[int, asyncio.Future] = {}
@@ -510,13 +511,6 @@ def _build_tool_list(*, interactive: bool = False, include_email: bool = True) -
     if interactive and MCP_TOOLS:
         tools.extend(MCP_TOOLS)
     return tools
-
-
-def _truncate_result(text: str, max_len: int = 10000) -> str:
-    """Truncate text and append a marker if it exceeds max_len."""
-    if len(text) > max_len:
-        return text[:max_len] + "\n... (truncated)"
-    return text
 
 
 api_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -1145,58 +1139,6 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     cmd = update.message.text.split()[0] if update.message.text else "/?"
     await update.message.reply_text(f"Unknown command: {cmd}\nType /help to see available commands.")
-
-
-def _execute_tool_call(block, repo, chat_id) -> str:
-    """Dispatch a single tool call to the right handler."""
-    try:
-        if block.name == "update_todo_list":
-            todos = block.input.get("todos", [])
-            chat_todos[chat_id] = todos
-            save_todos(chat_id, todos)
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
-            return format_todo_list(todos)
-        if block.name == "schedule_check":
-            return _handle_schedule_check(block.input, chat_id)
-        if block.name == "manage_pulse":
-            audit_log("tool_call", chat_id=chat_id, detail=f"manage_pulse:{block.input.get('action', '')}")
-            return _handle_manage_pulse(block.input, chat_id)
-        if block.name == "web_search" and execute_web_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: {block.input.get('query', '')[:100]}")
-            return execute_web_tool(web_client, block.name, block.input)
-        elif block.name in _tasks_tool_names and execute_tasks_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
-            return execute_tasks_tool(tasks_client, block.name, block.input)
-        elif block.name in _calendar_tool_names and execute_calendar_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
-            return execute_calendar_tool(calendar_client, block.name, block.input)
-        elif block.name in _email_tool_names and execute_email_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: to={block.input.get('to', '')}")
-            return execute_email_tool(email_client, block.name, block.input)
-        elif block.name in _contacts_tool_names and execute_contacts_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
-            return execute_contacts_tool(contacts_client, block.name, block.input)
-        elif block.name in _train_tool_names and execute_train_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: {block.input.get('station', '')}")
-            return execute_train_tool(train_client, block.name, block.input)
-        elif block.name in _github_tool_names and execute_github_tool:
-            if not repo:
-                return "No active repo. Ask the user to set one with /repo owner/name first."
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name} on {repo}")
-            result = execute_github_tool(gh_client, repo, block.name, block.input)
-            # Auto-track branch
-            if block.name == "create_branch":
-                set_active_branch(chat_id, block.input.get("branch_name"))
-            elif block.name in ("create_or_update_file", "upload_binary_file", "delete_file", "commit_multiple_files"):
-                branch = block.input.get("branch")
-                if branch:
-                    set_active_branch(chat_id, branch)
-            return result
-        return f"Tool '{block.name}' is not available."
-    except Exception as e:
-        logger.error("Tool '%s' crashed: %s", block.name, e, exc_info=True)
-        audit_log("tool_error", chat_id=chat_id, detail=f"{block.name}: {e}")
-        return f"Tool error: {e}"
 
 
 

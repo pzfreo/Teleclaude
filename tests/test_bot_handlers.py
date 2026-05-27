@@ -115,7 +115,7 @@ class TestExecuteToolCall:
         from bot import _execute_tool_call, chat_todos
 
         block = self._make_block("update_todo_list", {"todos": [{"content": "Test", "status": "pending"}]})
-        with patch("bot.save_todos"):
+        with patch("tool_execution.save_todos"):
             result = _execute_tool_call(block, "owner/repo", 9999)
         assert "Test" in result
         assert chat_todos.get(9999) == [{"content": "Test", "status": "pending"}]

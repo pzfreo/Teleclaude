@@ -42,7 +42,7 @@ py-modules = [
     "bot", "bot_agent", "persistence", "shared", "github_tools", "web_tools",
     "calendar_tools", "tasks_tools", "email_tools", "claude_code",
     "contacts_tools", "train_tools", "station_codes", "setup_google", "webhooks", "streaming", "mcp_tools",
-    "pulse_agent", "monitor_system", "history",
+    "pulse_agent", "monitor_system", "history", "tool_execution",
 ]
 
 [tool.setuptools.dynamic]
