@@ -2087,6 +2087,13 @@ async def _process_message(
             # Tool use round
             history.append({"role": "assistant", "content": response.content})
 
+            # Non-streaming fallback: text blocks aren't streamed, so send them now
+            # (ensures explanation appears before any ask_user buttons)
+            if streamed_text is None:
+                text_parts = [b.text for b in response.content if b.type == "text"]
+                if text_parts:
+                    await send_long_message(chat_id, "\n".join(text_parts), bot, parse_mode="HTML")
+
             tool_results = []
             loop = asyncio.get_running_loop()
             for block in response.content:
@@ -2094,7 +2101,16 @@ async def _process_message(
                     logger.info("Tool call [%d]: %s(%s)", round_num + 1, block.name, json.dumps(block.input)[:200])
                     progress["tools"].append(block.name)
                     if block.name == "ask_user":
+                        # Stop typing indicator before waiting for user input so progress
+                        # messages don't appear while the inline keyboard is visible
+                        stop_typing.set()
+                        await typing_task
                         result = await _handle_ask_user(block, chat_id, bot)
+                        # Restart typing indicator for any subsequent tool rounds
+                        stop_typing = asyncio.Event()
+                        typing_task = asyncio.create_task(
+                            keep_typing(update.effective_chat, stop_typing, time.time(), bot, progress)
+                        )
                     elif block.name.startswith("mcp_") and mcp_manager:
                         result = await mcp_manager.call_tool(block.name, block.input)
                     else:
