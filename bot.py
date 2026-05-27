@@ -67,9 +67,10 @@ from persistence import (
     update_pulse_last_run,
 )
 from shared import (
-    RingBufferHandler,
+    cached_get,
     download_telegram_file,
     send_long_message,
+    setup_logging,
 )
 from shared import (
     is_authorized as _is_authorized,
@@ -78,19 +79,10 @@ from shared import (
 load_dotenv()
 
 
-_ring_handler = RingBufferHandler()
+_ring_handler = setup_logging()
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-# Attach ring buffer to root logger so it captures everything
-logging.getLogger().addHandler(_ring_handler)
-
-# Silence noisy/leaky loggers:
-#   httpx logs every HTTP request with full URL (includes bot token!)
-#   googleapiclient.discovery_cache warns about oauth2client version
-logging.getLogger("httpx").setLevel(logging.WARNING)
+# Silence the googleapiclient.discovery_cache warning about oauth2client version
+# (extra to the defaults configured by setup_logging).
 logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
@@ -630,11 +622,7 @@ async def _stream_round(
 
 
 def get_model(chat_id: int) -> str:
-    if chat_id not in chat_models:
-        saved = load_model(chat_id)
-        if saved:
-            chat_models[chat_id] = saved
-    return chat_models.get(chat_id, DEFAULT_MODEL)
+    return cached_get(chat_models, load_model, chat_id, DEFAULT_MODEL)
 
 
 def get_todos(chat_id: int) -> list[dict]:
@@ -666,20 +654,12 @@ def is_authorized(user_id: int) -> bool:
 
 def get_active_repo(chat_id: int) -> str | None:
     """Get active repo from cache or load from DB."""
-    if chat_id not in active_repos:
-        repo = load_active_repo(chat_id)
-        if repo:
-            active_repos[chat_id] = repo
-    return active_repos.get(chat_id)
+    return cached_get(active_repos, load_active_repo, chat_id)
 
 
 def get_active_branch(chat_id: int) -> str | None:
     """Get active branch from cache or load from DB."""
-    if chat_id not in active_branches:
-        branch = load_active_branch(chat_id)
-        if branch:
-            active_branches[chat_id] = branch
-    return active_branches.get(chat_id)
+    return cached_get(active_branches, load_active_branch, chat_id)
 
 
 def set_active_branch(chat_id: int, branch: str | None) -> None:

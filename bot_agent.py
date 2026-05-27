@@ -40,9 +40,10 @@ from persistence import (
     save_session_id,
 )
 from shared import (
-    RingBufferHandler,
+    cached_get,
     download_telegram_file,
     send_long_message,
+    setup_logging,
 )
 from shared import (
     is_authorized as _is_authorized,
@@ -50,14 +51,7 @@ from shared import (
 
 load_dotenv()
 
-_ring_handler = RingBufferHandler()
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logging.getLogger().addHandler(_ring_handler)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+_ring_handler = setup_logging()
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -164,27 +158,15 @@ def is_authorized(user_id: int) -> bool:
 
 
 def get_model(chat_id: int) -> str:
-    if chat_id not in chat_models:
-        saved = load_model(chat_id)
-        if saved:
-            chat_models[chat_id] = saved
-    return chat_models.get(chat_id, DEFAULT_MODEL)
+    return cached_get(chat_models, load_model, chat_id, DEFAULT_MODEL)
 
 
 def get_active_repo(chat_id: int) -> str | None:
-    if chat_id not in active_repos:
-        repo = load_active_repo(chat_id)
-        if repo:
-            active_repos[chat_id] = repo
-    return active_repos.get(chat_id)
+    return cached_get(active_repos, load_active_repo, chat_id)
 
 
 def get_active_branch(chat_id: int) -> str | None:
-    if chat_id not in active_branches:
-        branch = load_active_branch(chat_id)
-        if branch:
-            active_branches[chat_id] = branch
-    return active_branches.get(chat_id)
+    return cached_get(active_branches, load_active_branch, chat_id)
 
 
 def set_active_branch(chat_id: int, branch: str | None) -> None:
