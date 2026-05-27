@@ -654,7 +654,9 @@ class TestPulseJob:
             ctx.bot = AsyncMock()
 
             with (
-                patch("pulse_agent._run_pulse_triage", new_callable=AsyncMock, return_value={"act": False, "reason": ""}),
+                patch(
+                    "pulse_agent._run_pulse_triage", new_callable=AsyncMock, return_value={"act": False, "reason": ""}
+                ),
                 patch("pulse_agent._run_pulse_action", new_callable=AsyncMock) as mock_action,
             ):
                 await _run_pulse(ctx)

@@ -34,9 +34,7 @@ from telegram.ext import (
 from persistence import (
     audit_log,
     clear_conversation,
-    count_monitors,
     delete_monitor,
-    delete_pulse_goal,
     delete_schedule,
     disable_monitor,
     init_db,
@@ -45,26 +43,17 @@ from persistence import (
     load_all_monitors,
     load_all_pulse_configs,
     load_all_schedules,
-    load_conversation,
     load_model,
     load_monitors,
     load_plan_mode,
-    load_pulse_config,
-    load_pulse_goals,
     load_schedules,
     load_todos,
     save_active_branch,
     save_active_repo,
-    save_conversation,
     save_model,
-    save_monitor,
     save_plan_mode,
-    save_pulse_config,
-    save_pulse_goal,
     save_schedule,
     save_todos,
-    update_monitor_result,
-    update_pulse_last_run,
 )
 from shared import (
     cached_get,
@@ -417,10 +406,10 @@ ASK_USER_TOOL = {
         "required": ["question", "options"],
     },
 }
-from history import (
+from history import (  # noqa: F401  re-exported for tests + tool_execution
+    _KEEP_IMAGES_LAST_N,
     MAX_CONTENT_SIZE,
     MAX_HISTORY,
-    _KEEP_IMAGES_LAST_N,
     _sanitize_history,
     _trim_content,
     conversations,
@@ -428,7 +417,7 @@ from history import (
     save_state,
     trim_history,
 )
-from monitor_system import (
+from monitor_system import (  # noqa: F401  re-exported for tests + tool_execution
     MAX_MONITOR_DURATION_HOURS,
     MAX_MONITORS_PER_CHAT,
     SCHEDULE_CHECK_TOOL,
@@ -441,7 +430,7 @@ from monitor_system import (
     _run_monitor_prompt,
     _unregister_monitor,
 )
-from pulse_agent import (
+from pulse_agent import (  # noqa: F401  re-exported for tests + tool_execution
     MANAGE_PULSE_TOOL,
     _build_triage_context,
     _handle_manage_pulse,
@@ -1141,7 +1130,6 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(f"Unknown command: {cmd}\nType /help to see available commands.")
 
 
-
 async def _handle_ask_user(block, chat_id: int, bot) -> str:
     """Send inline keyboard to user and wait for their selection."""
     question = block.input.get("question", "Please choose:")
@@ -1721,7 +1709,6 @@ async def _process_message(
         stop_typing.set()
         await typing_task
         await send_long_message(chat_id, "Something went wrong. Please try again.", bot)
-
 
 
 async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:

@@ -730,7 +730,7 @@ class TestTrimHistory:
             long_history.append({"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"})
         conversations[4444] = long_history
 
-        with patch("bot.save_conversation"):
+        with patch("history.save_conversation"):
             trim_history(4444)
 
         from bot import MAX_HISTORY
@@ -757,7 +757,7 @@ class TestTrimHistory:
                 history.append({"role": "assistant", "content": f"reply {i}"})
         conversations[4443] = history
 
-        with patch("bot.save_conversation"):
+        with patch("history.save_conversation"):
             trim_history(4443)
 
         # Old messages (outside last 10) should have images stripped
