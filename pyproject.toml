@@ -18,6 +18,7 @@ dependencies = [
     "mcp>=1.0.0",
     "zeep>=4.2.0",
     "markdown-it-py>=3.0",
+    "boo-cloud[mcp] @ git+https://github.com/estampo/boo-cloud.git@main",
 ]
 
 [project.optional-dependencies]
