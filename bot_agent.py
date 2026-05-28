@@ -370,16 +370,22 @@ async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot
             logger.warning("Blocked file send outside workspace: %s", p)
     text = SEND_MARKER_RE.sub("", text).strip()
 
-    for match in ASK_MARKER_RE.finditer(text):
+    match = ASK_MARKER_RE.search(text)
+    if match:
         parts = [p.strip() for p in match.group(1).split("|")]
         if len(parts) >= 3:
+            pre = text[: match.start()].strip()
+            if pre:
+                await send_long_message(chat_id, pre, bot, parse_mode="HTML")
             question, options = parts[0], parts[1:]
             _ask_options[chat_id] = options
             buttons = [
                 [InlineKeyboardButton(opt, callback_data=f"ask_agent:{chat_id}:{i}")] for i, opt in enumerate(options)
             ]
             await bot.send_message(chat_id=chat_id, text=question, reply_markup=InlineKeyboardMarkup(buttons))
-    text = ASK_MARKER_RE.sub("", text).strip()
+            text = text[match.end() :].strip()
+        else:
+            text = ASK_MARKER_RE.sub("", text).strip()
 
     return text
 
