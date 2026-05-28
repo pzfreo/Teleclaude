@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         jq \
         gnupg \
         openssh-client \
+        procps \
         rsync \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg \
