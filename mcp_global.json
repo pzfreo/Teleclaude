@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "boo-cloud": {
+      "command": "boocloud-mcp"
+    }
+  }
+}

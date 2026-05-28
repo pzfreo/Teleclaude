@@ -12,6 +12,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 GIT_TIMEOUT = 120  # 2 minutes for git operations
+# Global MCP config merged into every CLI invocation alongside any per-repo .mcp.json
+GLOBAL_MCP_CONFIG = Path(__file__).parent / "mcp_global.json"
 NPM_UPDATE_TIMEOUT = 180  # 3 minutes for npm update
 
 
@@ -102,7 +104,7 @@ async def get_claude_cli_version() -> str | None:
     return None
 
 
-def _resolve_mcp_config(mcp_config_path: Path) -> str:
+def _resolve_mcp_config(mcp_config_path: Path) -> dict:
     """Load .mcp.json and work around Claude Code ignoring the cwd field.
 
     Claude Code CLI ignores the 'cwd' field in server configs passed via
@@ -123,7 +125,38 @@ def _resolve_mcp_config(mcp_config_path: Path) -> str:
         server_config["command"] = "bash"
         server_config["args"] = ["-c", f"cd {shlex.quote(cwd)} && {shlex.quote(cmd)} {arg_str}"]
 
-    return json.dumps(config)
+    return config
+
+
+def _build_mcp_config(repo_mcp: Path) -> str | None:
+    """Merge global mcp_global.json with an optional per-repo .mcp.json.
+
+    Returns the merged config as a JSON string for --mcp-config, or None if
+    neither file exists.
+    """
+    merged: dict = {"mcpServers": {}}
+
+    if GLOBAL_MCP_CONFIG.is_file():
+        try:
+            with open(GLOBAL_MCP_CONFIG) as f:
+                global_cfg = json.load(f)
+            merged["mcpServers"].update(global_cfg.get("mcpServers", {}))
+            logger.info("Claude Code: loaded global MCP config from %s", GLOBAL_MCP_CONFIG)
+        except Exception as e:
+            logger.warning("Failed to load global MCP config: %s", e)
+
+    if repo_mcp.is_file():
+        try:
+            repo_cfg = _resolve_mcp_config(repo_mcp)
+            for name, srv in repo_cfg.get("mcpServers", {}).items():
+                merged["mcpServers"][name] = srv
+            logger.info("Claude Code: loaded repo MCP config from %s", repo_mcp)
+        except Exception as e:
+            logger.warning("Failed to load repo MCP config %s: %s", repo_mcp, e)
+
+    if not merged["mcpServers"]:
+        return None
+    return json.dumps(merged)
 
 
 class ClaudeCodeManager:
@@ -568,11 +601,9 @@ class ClaudeCodeManager:
         if permission_mode:
             cmd.extend(["--permission-mode", permission_mode])
 
-        mcp_config = repo_dir / ".mcp.json"
-        if mcp_config.is_file():
-            resolved = _resolve_mcp_config(mcp_config)
-            cmd.extend(["--mcp-config", resolved])
-            logger.info("Claude Code: loading MCP config from %s", mcp_config)
+        merged_mcp = _build_mcp_config(repo_dir / ".mcp.json")
+        if merged_mcp:
+            cmd.extend(["--mcp-config", merged_mcp])
 
         session_key = (chat_id, repo)
         session_id = self._sessions.get(session_key)
