@@ -36,6 +36,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV NPM_CONFIG_PREFIX=/home/teleclaude/.npm-global
 RUN npm install -g @anthropic-ai/claude-code
 
+# Install boocloud-bridge (Bambu Lab printer bridge used by the agent's
+# boo-cloud MCP server). Tracks the latest published release; rebuild the
+# container to pick up a new version.
+RUN curl -fsSL https://github.com/estampo/boo-cloud/releases/latest/download/install.sh \
+    | BOO_CLOUD_INSTALL_DIR=/usr/local/bin sh
+
 # Install agent-browser (Vercel) + its MCP wrapper and Playwright/Chromium.
 # Browsers are installed to /opt/playwright-browsers so the non-root user can read them.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
