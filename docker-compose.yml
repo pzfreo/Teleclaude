@@ -38,6 +38,8 @@ services:
         runuser -u teleclaude -- sh -c '
           claude mcp remove build123d-mcp 2>/dev/null
           claude mcp add -s user build123d-mcp -- uvx --refresh build123d-mcp
+          claude mcp remove boo-cloud 2>/dev/null
+          claude mcp add -s user boo-cloud -- boocloud-mcp
         '
         exec runuser -u teleclaude -- python bot_agent.py
     volumes:
