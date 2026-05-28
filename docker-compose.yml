@@ -32,6 +32,14 @@ services:
             /opt/teleclaude-agent/CLAUDE.md \
             /home/teleclaude/.claude/CLAUDE.md
         fi
+        # Write boo-cloud credentials from env to the default config path so
+        # boocloud-mcp finds them without needing any env var at runtime.
+        if [ -n "$BOO_CLOUD_CREDENTIALS_TOML" ]; then
+          mkdir -p /home/teleclaude/.config/boo-cloud
+          printf '%s' "$BOO_CLOUD_CREDENTIALS_TOML" > /home/teleclaude/.config/boo-cloud/credentials.toml
+          chmod 600 /home/teleclaude/.config/boo-cloud/credentials.toml
+          chown -R teleclaude:teleclaude /home/teleclaude/.config/boo-cloud
+        fi
         # Register build123d-mcp globally (user scope). Remove first so this is
         # idempotent across restarts. uvx --refresh fetches the latest PyPI
         # release on each session start, providing automatic updates.
