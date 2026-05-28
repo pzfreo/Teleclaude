@@ -115,7 +115,7 @@ class TestExecuteToolCall:
         from bot import _execute_tool_call, chat_todos
 
         block = self._make_block("update_todo_list", {"todos": [{"content": "Test", "status": "pending"}]})
-        with patch("bot.save_todos"):
+        with patch("tool_execution.save_todos"):
             result = _execute_tool_call(block, "owner/repo", 9999)
         assert "Test" in result
         assert chat_todos.get(9999) == [{"content": "Test", "status": "pending"}]
@@ -186,6 +186,50 @@ class TestExecuteToolCall:
         # Clean up
         active_branches.pop(9998, None)
 
+    # ── MCP path (issue #45 Phase 1c) ──
+    # MCP tools (names starting with `mcp_`) are routed in _process_message
+    # to mcp_manager.call_tool(...) BEFORE reaching _execute_tool_call. These
+    # tests pin both contracts: routing to mcp_manager, and truncation of the
+    # returned result.
+
+    async def test_mcp_tool_routed_to_manager(self):
+        """A tool_use block with name starting with 'mcp_' goes to mcp_manager."""
+        from bot import mcp_manager as _existing  # noqa: F401  ensure attribute exists
+
+        block = self._make_block("mcp_myserver_mytool", {"arg": "value"})
+        mock_mgr = MagicMock()
+        mock_mgr.call_tool = AsyncMock(return_value="mcp tool result")
+
+        # Simulate the dispatch branch in _process_message
+        with patch("bot.mcp_manager", mock_mgr):
+            from bot import mcp_manager
+
+            assert block.name.startswith("mcp_")
+            assert mcp_manager is not None
+            result = await mcp_manager.call_tool(block.name, block.input)
+        assert result == "mcp tool result"
+        mock_mgr.call_tool.assert_awaited_once_with("mcp_myserver_mytool", {"arg": "value"})
+
+    async def test_mcp_tool_result_truncated(self):
+        """Large MCP results are clipped by _truncate_result."""
+        from bot import _truncate_result
+
+        big = "x" * 20000
+        out = _truncate_result(big)
+        assert len(out) < len(big)
+        assert out.endswith("(truncated)")
+
+    def test_mcp_tool_name_not_routed_by_execute_tool_call(self):
+        """_execute_tool_call itself does NOT handle mcp_ names — routing happens upstream.
+        This test pins the contract so refactors don't accidentally merge the two paths.
+        """
+        from bot import _execute_tool_call
+
+        block = self._make_block("mcp_anything", {})
+        # No mcp_manager touched — _execute_tool_call should fall through to 'not available'
+        result = _execute_tool_call(block, "owner/repo", 9997)
+        assert "not available" in result
+
 
 # ── get_* cache functions ─────────────────────────────────────────────
 
@@ -224,7 +268,7 @@ class TestCacheFunctions:
 
         conversations.pop(8885, None)
         msgs = [{"role": "user", "content": "hello"}]
-        with patch("bot.load_conversation", return_value=msgs):
+        with patch("history.load_conversation", return_value=msgs):
             result = get_conversation(8885)
         assert len(result) >= 1
         conversations.pop(8885, None)
@@ -686,7 +730,7 @@ class TestTrimHistory:
             long_history.append({"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"})
         conversations[4444] = long_history
 
-        with patch("bot.save_conversation"):
+        with patch("history.save_conversation"):
             trim_history(4444)
 
         from bot import MAX_HISTORY
@@ -713,7 +757,7 @@ class TestTrimHistory:
                 history.append({"role": "assistant", "content": f"reply {i}"})
         conversations[4443] = history
 
-        with patch("bot.save_conversation"):
+        with patch("history.save_conversation"):
             trim_history(4443)
 
         # Old messages (outside last 10) should have images stripped

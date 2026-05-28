@@ -121,8 +121,8 @@ class TestHandleScheduleCheck:
             "summary": "CHI train delays",
         }
         with (
-            patch("bot.count_monitors", return_value=0),
-            patch("bot.save_monitor", return_value=42),
+            patch("monitor_system.count_monitors", return_value=0),
+            patch("monitor_system.save_monitor", return_value=42),
         ):
             result = _handle_schedule_check(tool_input, 1001)
 
@@ -144,7 +144,7 @@ class TestHandleScheduleCheck:
             "expires_at": "2099-01-01T12:00:00",
             "summary": "Over limit",
         }
-        with patch("bot.count_monitors", return_value=5):
+        with patch("monitor_system.count_monitors", return_value=5):
             result = _handle_schedule_check(tool_input, 1001)
 
         assert "limit reached" in result.lower()
@@ -160,8 +160,8 @@ class TestHandleScheduleCheck:
             "summary": "Clamped interval",
         }
         with (
-            patch("bot.count_monitors", return_value=0),
-            patch("bot.save_monitor", return_value=1) as mock_save,
+            patch("monitor_system.count_monitors", return_value=0),
+            patch("monitor_system.save_monitor", return_value=1) as mock_save,
         ):
             _handle_schedule_check(tool_input, 1001)
 
@@ -180,8 +180,8 @@ class TestHandleScheduleCheck:
             "summary": "Capped expiry",
         }
         with (
-            patch("bot.count_monitors", return_value=0),
-            patch("bot.save_monitor", return_value=1) as mock_save,
+            patch("monitor_system.count_monitors", return_value=0),
+            patch("monitor_system.save_monitor", return_value=1) as mock_save,
         ):
             _handle_schedule_check(tool_input, 1001)
 
@@ -194,7 +194,7 @@ class TestHandleScheduleCheck:
         from bot import _handle_schedule_check
 
         tool_input = {"interval_minutes": 10, "summary": "Incomplete"}
-        with patch("bot.count_monitors", return_value=0):
+        with patch("monitor_system.count_monitors", return_value=0):
             result = _handle_schedule_check(tool_input, 1001)
         assert "Error" in result
 
@@ -267,8 +267,8 @@ class TestRunMonitorJob:
         context.bot = AsyncMock()
 
         with (
-            patch("bot._run_monitor_prompt", new_callable=AsyncMock, return_value="All trains on time"),
-            patch("bot.update_monitor_result") as mock_update,
+            patch("monitor_system._run_monitor_prompt", new_callable=AsyncMock, return_value="All trains on time"),
+            patch("monitor_system.update_monitor_result") as mock_update,
         ):
             await _run_monitor_job(context)
 
@@ -293,9 +293,9 @@ class TestRunMonitorJob:
         context.bot = AsyncMock()
 
         with (
-            patch("bot._run_monitor_prompt", new_callable=AsyncMock, return_value="All on time still"),
-            patch("bot._compare_monitor_results", new_callable=AsyncMock, return_value=(False, None)),
-            patch("bot.update_monitor_result"),
+            patch("monitor_system._run_monitor_prompt", new_callable=AsyncMock, return_value="All on time still"),
+            patch("monitor_system._compare_monitor_results", new_callable=AsyncMock, return_value=(False, None)),
+            patch("monitor_system.update_monitor_result"),
         ):
             await _run_monitor_job(context)
 
@@ -318,14 +318,14 @@ class TestRunMonitorJob:
         context.bot = AsyncMock()
 
         with (
-            patch("bot._run_monitor_prompt", new_callable=AsyncMock, return_value="10:15 delayed by 20 min"),
+            patch("monitor_system._run_monitor_prompt", new_callable=AsyncMock, return_value="10:15 delayed by 20 min"),
             patch(
-                "bot._compare_monitor_results",
+                "monitor_system._compare_monitor_results",
                 new_callable=AsyncMock,
                 return_value=(True, "The 10:15 is now delayed by 20 minutes"),
             ),
-            patch("bot.update_monitor_result"),
-            patch("bot.send_long_message", new_callable=AsyncMock) as mock_send,
+            patch("monitor_system.update_monitor_result"),
+            patch("monitor_system.send_long_message", new_callable=AsyncMock) as mock_send,
         ):
             await _run_monitor_job(context)
 
@@ -350,8 +350,8 @@ class TestRunMonitorJob:
         context.bot = AsyncMock()
 
         with (
-            patch("bot._unregister_monitor") as mock_unreg,
-            patch("bot.disable_monitor") as mock_disable,
+            patch("monitor_system._unregister_monitor") as mock_unreg,
+            patch("monitor_system.disable_monitor") as mock_disable,
         ):
             await _run_monitor_job(context)
 

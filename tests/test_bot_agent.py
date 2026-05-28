@@ -272,6 +272,137 @@ class TestAgentCommands:
         assert "Agent" in text
 
 
+# ── /df and /cleanup ──────────────────────────────────────────────────
+
+
+class TestDiskCommands:
+    def test_human_size_units(self):
+        from bot_agent import _human_size
+
+        assert _human_size(0) == "0 B"
+        assert _human_size(512) == "512 B"
+        assert _human_size(2048) == "2.0 KB"
+        assert _human_size(5 * 1024 * 1024) == "5.0 MB"
+        assert _human_size(3 * 1024**3) == "3.0 GB"
+
+    def test_dir_size_sums_files(self, tmp_path):
+        from bot_agent import _dir_size
+
+        (tmp_path / "a.txt").write_bytes(b"x" * 100)
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "b.txt").write_bytes(b"y" * 250)
+        assert _dir_size(tmp_path) == 350
+
+    def test_compute_disk_report_lists_owner_dirs(self, tmp_path):
+        from bot_agent import _compute_disk_report
+
+        (tmp_path / "alice").mkdir()
+        (tmp_path / "alice" / "f").write_bytes(b"x" * 100)
+        (tmp_path / "bob").mkdir()
+        (tmp_path / ".hidden").mkdir()  # should be filtered out
+
+        report = _compute_disk_report(tmp_path)
+        assert "Disk:" in report
+        assert "GB free" in report
+        assert "alice/" in report
+        assert "bob/" in report
+        assert ".hidden/" not in report
+
+    def test_cleanup_removes_targets_only(self, tmp_path):
+        import bot_agent
+
+        repo = tmp_path / "myrepo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        (repo / "src" / "main.py").write_text("print('hi')")
+        venv = repo / ".venv"
+        venv.mkdir()
+        (venv / "marker").write_bytes(b"z" * 1024)
+        pycache = repo / "src" / "__pycache__"
+        pycache.mkdir()
+        (pycache / "x.pyc").write_bytes(b"compiled")
+
+        freed, count = bot_agent._cleanup_cache_dirs(tmp_path)
+        assert count == 2
+        assert not venv.exists()
+        assert not pycache.exists()
+        assert (repo / "src" / "main.py").exists()
+        # freed is filesystem-level and may be 0 on small tmpfs, so just verify non-negative.
+        assert freed >= 0
+
+    def test_cleanup_does_not_descend_into_targets(self, tmp_path):
+        import bot_agent
+
+        nested_venv = tmp_path / "repo" / ".venv"
+        nested_venv.mkdir(parents=True)
+        # An inner __pycache__ inside .venv shouldn't get counted twice
+        (nested_venv / "__pycache__").mkdir()
+        _freed, count = bot_agent._cleanup_cache_dirs(tmp_path)
+        assert count == 1  # only the outer .venv
+
+    async def test_df_command_unauthorized_no_response(self):
+        from bot_agent import df_command
+
+        update = _make_update()
+        ctx = _make_context()
+        with patch("bot_agent.is_authorized", return_value=False):
+            await df_command(update, ctx)
+        update.message.reply_text.assert_not_called()
+
+    async def test_df_command_authorized_sends_report(self, tmp_path):
+        from unittest.mock import AsyncMock
+
+        from bot_agent import df_command
+
+        update = _make_update()
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            mock_mgr.workspace_root = tmp_path
+            await df_command(update, ctx)
+        mock_send.assert_awaited_once()
+        sent_text = mock_send.call_args[0][1]
+        assert "Disk:" in sent_text
+
+    async def test_df_command_handles_missing_mgr(self):
+        from bot_agent import df_command
+
+        update = _make_update()
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr", None),
+        ):
+            await df_command(update, ctx)
+        update.message.reply_text.assert_called_once()
+        assert "not configured" in update.message.reply_text.call_args[0][0].lower()
+
+    async def test_cleanup_command_runs_and_reports(self, tmp_path):
+        from bot_agent import cleanup_command
+
+        # Set up something to clean
+        (tmp_path / "repo").mkdir()
+        (tmp_path / "repo" / ".venv").mkdir()
+        (tmp_path / "repo" / ".venv" / "f").write_bytes(b"x" * 10)
+
+        update = _make_update()
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+        ):
+            mock_mgr.workspace_root = tmp_path
+            await cleanup_command(update, ctx)
+        # Two messages: "Cleaning…" then "Removed N dirs…"
+        assert update.message.reply_text.await_count == 2
+        final = update.message.reply_text.await_args_list[-1].args[0]
+        assert "Removed 1 dirs" in final
+
+
 # ── Plan / Work mode tests ────────────────────────────────────────────
 
 
@@ -1278,3 +1409,442 @@ class TestRepoBareNameLookup:
         assert markup is not None
         labels = [row[0].text for row in markup.inline_keyboard]
         assert labels == ["pzfreo/FooOne", "pzfreo/FooTwo"]
+
+
+# ── Additional handler smoke tests (issue #45 Phase 1b) ────────────────
+
+
+class TestRepoShortcut:
+    """Tests for /1 through /5 numeric repo shortcuts."""
+
+    async def test_repo_shortcut_delegates_to_set_repo(self):
+        from bot_agent import repo_shortcut
+
+        update = _make_update(chat_id=11001)
+        update.effective_message = MagicMock()
+        update.effective_message.text = "/3"
+        ctx = _make_context()
+        with patch("bot_agent.set_repo", new_callable=AsyncMock) as mock_set:
+            await repo_shortcut(update, ctx)
+        mock_set.assert_awaited_once_with(update, ctx)
+        assert ctx.args == ["3"]
+
+    async def test_repo_shortcut_strips_leading_slash(self):
+        from bot_agent import repo_shortcut
+
+        update = _make_update(chat_id=11002)
+        update.effective_message = MagicMock()
+        update.effective_message.text = "/5 extra ignored"
+        ctx = _make_context()
+        with patch("bot_agent.set_repo", new_callable=AsyncMock):
+            await repo_shortcut(update, ctx)
+        assert ctx.args == ["5"]
+
+
+class TestSetBranch:
+    """Tests for /branch handler."""
+
+    async def test_set_branch_unauthorized(self):
+        from bot_agent import set_branch
+
+        update = _make_update()
+        ctx = _make_context(args=["feature"])
+        with patch("bot_agent.is_authorized", return_value=False):
+            await set_branch(update, ctx)
+        update.message.reply_text.assert_not_called()
+
+    async def test_set_branch_no_args_shows_active(self):
+        from bot_agent import set_branch
+
+        update = _make_update(chat_id=11101)
+        ctx = _make_context(args=[])
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value=None),
+            patch("bot_agent.get_active_branch", return_value="main"),
+        ):
+            await set_branch(update, ctx)
+        text = update.message.reply_text.call_args[0][0]
+        assert "main" in text
+
+    async def test_set_branch_no_args_no_branch(self):
+        from bot_agent import set_branch
+
+        update = _make_update(chat_id=11102)
+        ctx = _make_context(args=[])
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value=None),
+            patch("bot_agent.get_active_branch", return_value=None),
+        ):
+            await set_branch(update, ctx)
+        text = update.message.reply_text.call_args[0][0]
+        assert "No branch set" in text
+
+    async def test_set_branch_clear(self):
+        from bot_agent import set_branch
+
+        update = _make_update(chat_id=11103)
+        ctx = _make_context(args=["clear"])
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value=None),
+            patch("bot_agent.set_active_branch") as mock_set,
+        ):
+            await set_branch(update, ctx)
+        mock_set.assert_called_once_with(11103, None)
+        text = update.message.reply_text.call_args[0][0]
+        assert "cleared" in text.lower()
+
+    async def test_set_branch_with_name_no_repo(self):
+        from bot_agent import set_branch
+
+        update = _make_update(chat_id=11104)
+        ctx = _make_context(args=["my-feature"])
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value=None),
+            patch("bot_agent.set_active_branch") as mock_set,
+        ):
+            await set_branch(update, ctx)
+        mock_set.assert_called_once_with(11104, "my-feature")
+        text = update.message.reply_text.call_args[0][0]
+        assert "my-feature" in text
+
+
+class TestUpdateCli:
+    """Tests for /update — Claude CLI update command."""
+
+    async def test_update_cli_unauthorized(self):
+        from bot_agent import update_cli
+
+        update = _make_update()
+        ctx = _make_context()
+        with patch("bot_agent.is_authorized", return_value=False):
+            await update_cli(update, ctx)
+        update.message.reply_text.assert_not_called()
+
+    async def test_update_cli_success(self):
+        from bot_agent import update_cli
+
+        update = _make_update(chat_id=11201)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "updated to 1.2.3")),
+        ):
+            await update_cli(update, ctx)
+        replies = [c[0][0] for c in update.message.reply_text.call_args_list]
+        assert any("Checking" in r for r in replies)
+        assert any("updated" in r for r in replies)
+
+    async def test_update_cli_failure_shows_version(self):
+        from bot_agent import update_cli
+
+        update = _make_update(chat_id=11202)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(False, "permission denied")),
+            patch("bot_agent.get_claude_cli_version", new_callable=AsyncMock, return_value="1.0.0"),
+        ):
+            await update_cli(update, ctx)
+        replies = [c[0][0] for c in update.message.reply_text.call_args_list]
+        # The failure branch reports current version + info
+        assert any("1.0.0" in r for r in replies)
+
+
+class TestSendLogs:
+    """Tests for /logs handler."""
+
+    async def test_send_logs_unauthorized(self):
+        from bot_agent import send_logs
+
+        update = _make_update()
+        ctx = _make_context()
+        with patch("bot_agent.is_authorized", return_value=False):
+            await send_logs(update, ctx)
+        update.message.reply_text.assert_not_called()
+
+    async def test_send_logs_empty(self):
+        from bot_agent import send_logs
+
+        update = _make_update(chat_id=11301)
+        ctx = _make_context(args=[])
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent._ring_handler") as mock_handler,
+        ):
+            mock_handler.get_recent.return_value = []
+            await send_logs(update, ctx)
+        text = update.message.reply_text.call_args[0][0]
+        assert "No logs" in text
+
+    async def test_send_logs_sends_document(self):
+        from bot_agent import send_logs
+
+        update = _make_update(chat_id=11302)
+        update.message.reply_document = AsyncMock()
+        ctx = _make_context(args=["10"])
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent._ring_handler") as mock_handler,
+        ):
+            mock_handler.get_recent.return_value = ["line1", "line2"]
+            await send_logs(update, ctx)
+        update.message.reply_document.assert_awaited_once()
+        # get_recent should be called with 10 * 60 seconds
+        mock_handler.get_recent.assert_called_once_with(seconds=600)
+
+
+class TestListFiles:
+    """Tests for /files handler."""
+
+    async def test_list_files_unauthorized(self):
+        from bot_agent import list_files
+
+        update = _make_update()
+        ctx = _make_context()
+        with patch("bot_agent.is_authorized", return_value=False):
+            await list_files(update, ctx)
+        update.message.reply_text.assert_not_called()
+
+    async def test_list_files_no_repo(self):
+        from bot_agent import list_files
+
+        update = _make_update(chat_id=11401)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value=None),
+        ):
+            await list_files(update, ctx)
+        text = update.message.reply_text.call_args[0][0]
+        assert "No repo set" in text
+
+    async def test_list_files_workspace_missing(self, tmp_path):
+        from bot_agent import list_files
+
+        update = _make_update(chat_id=11402)
+        ctx = _make_context()
+        with (
+            patch("bot_agent.is_authorized", return_value=True),
+            patch("bot_agent.get_active_repo", return_value="owner/repo"),
+            patch("bot_agent.claude_code_mgr") as mock_mgr,
+        ):
+            missing = tmp_path / "no-such-workspace"
+            mock_mgr.workspace_path = MagicMock(return_value=missing)
+            await list_files(update, ctx)
+        text = update.message.reply_text.call_args[0][0]
+        assert "not cloned" in text.lower()
+
+    async def test_list_files_with_files(self, tmp_path):
+        import bot_agent
+        from bot_agent import list_files
+
+        workspace = tmp_path / "owner" / "repo"
+        workspace.mkdir(parents=True)
+        (workspace / "a.py").write_text("x = 1\n")
+        (workspace / "b.txt").write_text("hi\n")
+
+        update = _make_update(chat_id=11403)
+        ctx = _make_context()
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr.workspace_path = MagicMock(return_value=workspace)
+                await list_files(update, ctx)
+            # Files cache should be populated and an inline keyboard should be sent
+            assert 11403 in bot_agent._files_cache
+            kwargs = update.message.reply_text.call_args[1]
+            markup = kwargs.get("reply_markup")
+            assert markup is not None
+        finally:
+            bot_agent._files_cache.pop(11403, None)
+
+
+class TestInlineCallback:
+    """Tests for the agent bot's CallbackQueryHandler."""
+
+    def _make_callback_update(self, data: str, chat_id: int = 12001, user_id: int = 42):
+        update = MagicMock()
+        update.callback_query = MagicMock()
+        update.callback_query.from_user = MagicMock()
+        update.callback_query.from_user.id = user_id
+        update.callback_query.data = data
+        update.callback_query.message = MagicMock()
+        update.callback_query.message.chat_id = chat_id
+        update.callback_query.answer = AsyncMock()
+        update.callback_query.edit_message_text = AsyncMock()
+        return update
+
+    async def test_callback_unauthorized(self):
+        from bot_agent import inline_callback
+
+        update = self._make_callback_update("dl:0")
+        ctx = _make_context()
+        with patch("bot_agent.is_authorized", return_value=False):
+            await inline_callback(update, ctx)
+        update.callback_query.answer.assert_awaited_once_with("Not authorized.")
+
+    async def test_callback_no_query_noop(self):
+        from bot_agent import inline_callback
+
+        update = MagicMock()
+        update.callback_query = None
+        ctx = _make_context()
+        await inline_callback(update, ctx)  # should not raise
+
+    async def test_callback_dl_expired(self):
+        import bot_agent
+        from bot_agent import inline_callback
+
+        chat_id = 12002
+        bot_agent._files_cache.pop(chat_id, None)
+        update = self._make_callback_update("dl:5", chat_id=chat_id)
+        ctx = _make_context()
+        try:
+            with patch("bot_agent.is_authorized", return_value=True):
+                await inline_callback(update, ctx)
+            update.callback_query.edit_message_text.assert_awaited_once()
+            text = update.callback_query.edit_message_text.call_args[0][0]
+            assert "expired" in text.lower()
+        finally:
+            bot_agent._files_cache.pop(chat_id, None)
+
+    async def test_callback_model_switch(self):
+        import bot_agent
+        from bot_agent import inline_callback
+
+        chat_id = 12003
+        bot_agent.chat_models.pop(chat_id, None)
+        update = self._make_callback_update("model:opus", chat_id=chat_id)
+        ctx = _make_context()
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.save_model") as mock_save,
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr.clear_last_model = MagicMock()
+                await inline_callback(update, ctx)
+            mock_save.assert_called_once_with(chat_id, "opus")
+            assert bot_agent.chat_models[chat_id] == "opus"
+            update.callback_query.edit_message_text.assert_awaited_once()
+        finally:
+            bot_agent.chat_models.pop(chat_id, None)
+
+    async def test_callback_repo_switch(self):
+        import bot_agent
+        from bot_agent import inline_callback
+
+        chat_id = 12004
+        bot_agent.active_repos.pop(chat_id, None)
+        bot_agent._stream_mode.discard(chat_id)
+        update = self._make_callback_update("repo:owner/newrepo", chat_id=chat_id)
+        ctx = _make_context()
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.save_active_repo") as mock_save_repo,
+                patch("bot_agent.set_active_branch") as mock_set_branch,
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("asyncio.create_task", side_effect=lambda c: c.close() or MagicMock()),
+            ):
+                mock_mgr.stop_stream = AsyncMock()
+                await inline_callback(update, ctx)
+            mock_save_repo.assert_called_once_with(chat_id, "owner/newrepo")
+            mock_set_branch.assert_called_once_with(chat_id, None)
+            assert bot_agent.active_repos[chat_id] == "owner/newrepo"
+            update.callback_query.edit_message_text.assert_awaited_once()
+        finally:
+            bot_agent.active_repos.pop(chat_id, None)
+
+
+class TestDispatchPrompt:
+    """Tests for _dispatch_prompt — core routing for assembled prompts."""
+
+    async def test_dispatch_no_repo(self):
+        from bot_agent import _dispatch_prompt
+
+        update = _make_update(chat_id=13001)
+        ctx = _make_context()
+        with patch("bot_agent.get_active_repo", return_value=None):
+            await _dispatch_prompt(13001, "do something", update, ctx)
+        text = update.message.reply_text.call_args[0][0]
+        assert "No repo set" in text
+
+    async def test_dispatch_feeds_running_stream(self):
+        import bot_agent
+        from bot_agent import _dispatch_prompt
+
+        chat_id = 13002
+        bot_agent._stream_mode.add(chat_id)
+        update = _make_update(chat_id=chat_id)
+        ctx = _make_context()
+        try:
+            with (
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.load_session_id", return_value=None),
+                patch("bot_agent.save_session_id"),
+                patch("bot_agent._start_stream_typing"),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr.get_session_id = MagicMock(return_value="sess-1")
+                mock_mgr.stream_mode_active = MagicMock(return_value=True)
+                mock_mgr.feed = AsyncMock(return_value=True)
+                await _dispatch_prompt(chat_id, "hello", update, ctx)
+            mock_mgr.feed.assert_awaited_once_with(chat_id, "hello")
+        finally:
+            bot_agent._stream_mode.discard(chat_id)
+
+    async def test_dispatch_followup_prefix_sends_followup(self):
+        import bot_agent
+        from bot_agent import _dispatch_prompt
+
+        chat_id = 13003
+        bot_agent._stream_mode.add(chat_id)
+        update = _make_update(chat_id=chat_id)
+        ctx = _make_context()
+        try:
+            with (
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr.stream_mode_active = MagicMock(return_value=True)
+                mock_mgr.send_followup = AsyncMock(return_value=True)
+                await _dispatch_prompt(chat_id, "- side note", update, ctx)
+            mock_mgr.send_followup.assert_awaited_once_with(chat_id, "side note")
+            text = update.message.reply_text.call_args[0][0]
+            assert "Sent to Claude" in text
+        finally:
+            bot_agent._stream_mode.discard(chat_id)
+
+    async def test_dispatch_auto_starts_stream(self):
+        import bot_agent
+        from bot_agent import _dispatch_prompt
+
+        chat_id = 13004
+        bot_agent._stream_mode.discard(chat_id)
+        update = _make_update(chat_id=chat_id)
+        ctx = _make_context()
+        try:
+            with (
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.load_session_id", return_value=None),
+                patch("bot_agent.save_session_id"),
+                patch("bot_agent._start_stream_for_chat", new_callable=AsyncMock, return_value=None) as mock_start,
+                patch("bot_agent._start_stream_typing"),
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+            ):
+                mock_mgr.get_session_id = MagicMock(return_value=None)
+                mock_mgr.stream_mode_active = MagicMock(return_value=False)
+                mock_mgr.feed = AsyncMock(return_value=True)
+                await _dispatch_prompt(chat_id, "hi", update, ctx)
+            mock_start.assert_awaited_once()
+            mock_mgr.feed.assert_awaited_once_with(chat_id, "hi")
+        finally:
+            bot_agent._stream_mode.discard(chat_id)

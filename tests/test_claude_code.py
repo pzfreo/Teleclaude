@@ -126,6 +126,72 @@ class TestTokenNotInCloneUrl:
         assert "GIT_CONFIG_COUNT" not in env
         assert "GIT_CONFIG_KEY_0" not in env
 
+    async def test_sanitize_remote_rewrites_tainted_url(self, tmp_path):
+        """Existing clones with token-embedded URLs get rewritten on ensure_clone."""
+        token = "ghp_LEAKEDTOKEN"
+        mgr = ClaudeCodeManager(token, workspace_root=str(tmp_path))
+        path = tmp_path / "owner" / "repo"
+        (path / ".git").mkdir(parents=True)
+
+        # Fake git: return tainted URL on get-url, record set-url call
+        calls: list[tuple] = []
+
+        async def fake_git(cwd, *args):
+            calls.append((cwd, args))
+            if args[:3] == ("remote", "get-url", "origin"):
+                return f"https://x-access-token:{token}@github.com/owner/repo.git"
+            return ""
+
+        with patch.object(mgr, "_git", side_effect=fake_git):
+            await mgr.ensure_clone("owner/repo")
+
+        set_url_calls = [c for c in calls if c[1][:3] == ("remote", "set-url", "origin")]
+        assert len(set_url_calls) == 1
+        assert set_url_calls[0][1][3] == "https://github.com/owner/repo.git"
+
+    async def test_sanitize_remote_leaves_clean_url_alone(self, tmp_path):
+        """A clean origin URL must not be rewritten."""
+        mgr = ClaudeCodeManager("tok", workspace_root=str(tmp_path))
+        path = tmp_path / "owner" / "repo"
+        (path / ".git").mkdir(parents=True)
+
+        calls: list[tuple] = []
+
+        async def fake_git(cwd, *args):
+            calls.append((cwd, args))
+            if args[:3] == ("remote", "get-url", "origin"):
+                return "https://github.com/owner/repo.git"
+            return ""
+
+        with patch.object(mgr, "_git", side_effect=fake_git):
+            await mgr.ensure_clone("owner/repo")
+
+        assert not [c for c in calls if c[1][:3] == ("remote", "set-url", "origin")]
+
+    async def test_sanitize_all_remotes_walks_workspace(self, tmp_path):
+        """sanitize_all_remotes finds tainted clones across owner/name dirs."""
+        token = "ghp_SECRET"
+        mgr = ClaudeCodeManager(token, workspace_root=str(tmp_path))
+        for repo in ("owner-a/repo1", "owner-b/repo2"):
+            (tmp_path / repo / ".git").mkdir(parents=True)
+        # A third repo with a clean URL should not be counted.
+        (tmp_path / "owner-a" / "repo3" / ".git").mkdir(parents=True)
+
+        tainted = {"owner-a/repo1", "owner-b/repo2"}
+
+        async def fake_git(cwd, *args):
+            if args[:3] == ("remote", "get-url", "origin"):
+                rel = cwd.relative_to(tmp_path).as_posix()
+                if rel in tainted:
+                    return f"https://x-access-token:{token}@github.com/{rel}.git"
+                return f"https://github.com/{rel}.git"
+            return ""
+
+        with patch.object(mgr, "_git", side_effect=fake_git):
+            fixed = await mgr.sanitize_all_remotes()
+
+        assert fixed == 2
+
 
 class TestPathTraversal:
     """TODO #2: Directory sandboxing — workspace_path blocks traversal."""

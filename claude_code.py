@@ -217,12 +217,55 @@ class ClaudeCodeManager:
         path = self.workspace_path(repo)
         if (path / ".git").is_dir():
             logger.info("Workspace already exists: %s", path)
+            await self._sanitize_remote(path, repo)
             return path
         path.parent.mkdir(parents=True, exist_ok=True)
         url = f"https://github.com/{repo}.git"
         await self._git(path.parent, "clone", url, path.name)
         logger.info("Cloned %s to %s", repo, path)
         return path
+
+    async def _sanitize_remote(self, path: Path, repo: str) -> bool:
+        """Strip embedded credentials from origin URL of an existing clone.
+
+        Earlier versions (and the agent itself, when asked to clone) sometimes
+        wrote URLs like https://<token>@github.com/owner/repo.git into
+        .git/config, exposing the token via `git remote -v`. Rewrites the
+        remote to the clean form. Returns True if a change was made.
+        """
+        try:
+            url = await self._git(path, "remote", "get-url", "origin")
+        except RuntimeError:
+            return False
+        if "@github.com" not in url:
+            return False
+        clean = f"https://github.com/{repo}.git"
+        await self._git(path, "remote", "set-url", "origin", clean)
+        logger.warning("Sanitized token-embedded origin URL for %s", repo)
+        return True
+
+    async def sanitize_all_remotes(self) -> int:
+        """Walk the workspace root and sanitize every clone's origin URL.
+
+        Returns the number of remotes that were rewritten.
+        """
+        root = self.workspace_root
+        if not root.is_dir():
+            return 0
+        fixed = 0
+        for owner_dir in root.iterdir():
+            if not owner_dir.is_dir():
+                continue
+            for repo_dir in owner_dir.iterdir():
+                if not (repo_dir / ".git").is_dir():
+                    continue
+                repo = f"{owner_dir.name}/{repo_dir.name}"
+                try:
+                    if await self._sanitize_remote(repo_dir, repo):
+                        fixed += 1
+                except Exception as e:
+                    logger.warning("Failed to sanitize remote for %s: %s", repo, e)
+        return fixed
 
     async def checkout_branch(self, repo: str, branch: str) -> str:
         """Fetch and checkout a branch in the local clone."""
@@ -614,6 +657,7 @@ class ClaudeCodeManager:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=10 * 1024 * 1024,
+            env=self._git_env(),
         )
 
         self._running_procs[chat_id] = proc

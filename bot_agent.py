@@ -40,9 +40,10 @@ from persistence import (
     save_session_id,
 )
 from shared import (
-    RingBufferHandler,
+    cached_get,
     download_telegram_file,
     send_long_message,
+    setup_logging,
 )
 from shared import (
     is_authorized as _is_authorized,
@@ -50,14 +51,7 @@ from shared import (
 
 load_dotenv()
 
-_ring_handler = RingBufferHandler()
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logging.getLogger().addHandler(_ring_handler)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+_ring_handler = setup_logging()
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -150,6 +144,11 @@ MAX_FILE_BYTES = 50 * 1024 * 1024  # Telegram bot file size limit
 SEND_MARKER_RE = re.compile(r"\[SEND:\s*([^\]]+)\]", re.IGNORECASE)
 ASK_MARKER_RE = re.compile(r"\[ASK:\s*([^\]]+)\]", re.IGNORECASE)
 
+# Reproducible cache dirs that /cleanup will remove from workspaces.
+CACHE_DIR_NAMES = frozenset(
+    {".venv", ".conda", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+)
+
 _files_cache: dict[int, list[Path]] = {}  # chat_id -> file list for inline keyboard
 _ask_options: dict[int, list[str]] = {}  # chat_id -> options for current [ASK:] question
 
@@ -159,27 +158,15 @@ def is_authorized(user_id: int) -> bool:
 
 
 def get_model(chat_id: int) -> str:
-    if chat_id not in chat_models:
-        saved = load_model(chat_id)
-        if saved:
-            chat_models[chat_id] = saved
-    return chat_models.get(chat_id, DEFAULT_MODEL)
+    return cached_get(chat_models, load_model, chat_id, DEFAULT_MODEL)
 
 
 def get_active_repo(chat_id: int) -> str | None:
-    if chat_id not in active_repos:
-        repo = load_active_repo(chat_id)
-        if repo:
-            active_repos[chat_id] = repo
-    return active_repos.get(chat_id)
+    return cached_get(active_repos, load_active_repo, chat_id)
 
 
 def get_active_branch(chat_id: int) -> str | None:
-    if chat_id not in active_branches:
-        branch = load_active_branch(chat_id)
-        if branch:
-            active_branches[chat_id] = branch
-    return active_branches.get(chat_id)
+    return cached_get(active_branches, load_active_branch, chat_id)
 
 
 def set_active_branch(chat_id: int, branch: str | None) -> None:
@@ -361,9 +348,9 @@ async def _send_file_to_user(chat_id: int, path: Path, bot) -> bool:
 async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot) -> str:
     """Strip [SEND: path] and [ASK: question | opt1 | opt2] markers from text and handle them."""
     send_markers = SEND_MARKER_RE.findall(text)
-    workspace = claude_code_mgr.workspace_path(repo) if repo else None
+    workspace = claude_code_mgr.workspace_path(repo) if repo and claude_code_mgr else None
     workspace_str = str(workspace.resolve()) if workspace else None
-    shared_str = str((claude_code_mgr.workspace_root / ".shared" / str(chat_id)).resolve())
+    shared_str = str((claude_code_mgr.workspace_root / ".shared" / str(chat_id)).resolve()) if claude_code_mgr else None
     tmp_str = str(Path("/tmp").resolve())
     for raw in send_markers:
         raw = raw.strip()
@@ -374,7 +361,7 @@ async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot
             p = p.resolve()
         safe = (
             (workspace_str and str(p).startswith(workspace_str))
-            or str(p).startswith(shared_str)
+            or (shared_str and str(p).startswith(shared_str))
             or str(p).startswith(tmp_str)
         )
         if safe:
@@ -429,6 +416,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model - Show or switch model (opus/sonnet/haiku)\n"
         "/logs [min] - Download recent logs\n"
         "/version - Show bot version\n"
+        "/df - Show free disk space and workspace sizes\n"
+        "/cleanup - Delete reproducible cache dirs (.venv, .conda, node_modules, etc.)\n"
         "/help - Show this message"
     )
 
@@ -1144,6 +1133,87 @@ async def show_version(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"Teleclaude Agent v{VERSION}\nModel: {get_model(update.effective_chat.id)}")
 
 
+def _human_size(n: int) -> str:
+    """Format byte count as a short human-readable string."""
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} PB"
+
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path, onerror=lambda _e: None):
+        for name in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, name))
+            except OSError:
+                pass
+    return total
+
+
+def _compute_disk_report(workspace_root: Path) -> str:
+    total, _used, free = shutil.disk_usage(workspace_root)
+    gb = 1024**3
+    pct = (total - free) * 100 // total
+    lines = [f"Disk: {free / gb:.1f} GB free / {total / gb:.1f} GB ({pct}% used)"]
+    if workspace_root.exists():
+        owners = sorted(
+            (p for p in workspace_root.iterdir() if p.is_dir() and not p.name.startswith(".")),
+            key=lambda p: p.name,
+        )
+        if owners:
+            lines.append("")
+            lines.append("Workspaces:")
+            for owner in owners:
+                lines.append(f"  {owner.name}/ — {_human_size(_dir_size(owner))}")
+    return "\n".join(lines)
+
+
+def _cleanup_cache_dirs(workspace_root: Path) -> tuple[int, int]:
+    """Remove reproducible cache dirs under workspace_root.
+
+    Returns (bytes_freed, dirs_removed). Bytes freed is measured by
+    disk_usage delta — approximate but reflects actual reclaim.
+    """
+    if not workspace_root.exists():
+        return 0, 0
+    before = shutil.disk_usage(workspace_root).free
+    removed = 0
+    for dirpath, dirnames, _filenames in os.walk(workspace_root, topdown=True):
+        targets = [d for d in dirnames if d in CACHE_DIR_NAMES]
+        for d in targets:
+            shutil.rmtree(os.path.join(dirpath, d), ignore_errors=True)
+            removed += 1
+        dirnames[:] = [d for d in dirnames if d not in CACHE_DIR_NAMES]
+    after = shutil.disk_usage(workspace_root).free
+    return max(0, after - before), removed
+
+
+async def df_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not is_authorized(update.effective_user.id):
+        return
+    if not claude_code_mgr:
+        await update.message.reply_text("Workspaces not configured.")
+        return
+    text = await asyncio.to_thread(_compute_disk_report, claude_code_mgr.workspace_root)
+    await send_long_message(update.effective_chat.id, text, context.bot)
+
+
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not is_authorized(update.effective_user.id):
+        return
+    if not claude_code_mgr:
+        await update.message.reply_text("Workspaces not configured.")
+        return
+    targets = ", ".join(sorted(CACHE_DIR_NAMES))
+    await update.message.reply_text(f"Cleaning {targets} across workspaces…")
+    freed, count = await asyncio.to_thread(_cleanup_cache_dirs, claude_code_mgr.workspace_root)
+    await update.message.reply_text(f"Removed {count} dirs, freed {_human_size(freed)}.")
+
+
 async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /plan — toggle plan mode or plan a specific task."""
     if not update.message or not is_authorized(update.effective_user.id):
@@ -1420,6 +1490,13 @@ async def notify_startup(app: Application) -> None:
             ("help", "Show help message"),
         ]
     )
+    if claude_code_mgr is not None:
+        try:
+            fixed = await claude_code_mgr.sanitize_all_remotes()
+            if fixed:
+                logger.warning("Sanitized %d workspace remote(s) with embedded tokens", fixed)
+        except Exception as e:
+            logger.warning("Remote URL sanitization failed: %s", e)
     if not ALLOWED_USER_IDS:
         return
     now = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC")
@@ -1484,6 +1561,8 @@ def main() -> None:
     app.add_handler(CommandHandler("files", list_files))
     app.add_handler(CommandHandler("usage", usage_command))
     app.add_handler(CommandHandler("version", show_version))
+    app.add_handler(CommandHandler("df", df_command))
+    app.add_handler(CommandHandler("cleanup", cleanup_command))
     app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(CommandHandler("work", work_command))
     app.add_handler(CommandHandler("btw", btw_command))

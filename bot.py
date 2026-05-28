@@ -34,9 +34,7 @@ from telegram.ext import (
 from persistence import (
     audit_log,
     clear_conversation,
-    count_monitors,
     delete_monitor,
-    delete_pulse_goal,
     delete_schedule,
     disable_monitor,
     init_db,
@@ -45,31 +43,23 @@ from persistence import (
     load_all_monitors,
     load_all_pulse_configs,
     load_all_schedules,
-    load_conversation,
     load_model,
     load_monitors,
     load_plan_mode,
-    load_pulse_config,
-    load_pulse_goals,
     load_schedules,
     load_todos,
     save_active_branch,
     save_active_repo,
-    save_conversation,
     save_model,
-    save_monitor,
     save_plan_mode,
-    save_pulse_config,
-    save_pulse_goal,
     save_schedule,
     save_todos,
-    update_monitor_result,
-    update_pulse_last_run,
 )
 from shared import (
-    RingBufferHandler,
+    cached_get,
     download_telegram_file,
     send_long_message,
+    setup_logging,
 )
 from shared import (
     is_authorized as _is_authorized,
@@ -78,19 +68,10 @@ from shared import (
 load_dotenv()
 
 
-_ring_handler = RingBufferHandler()
+_ring_handler = setup_logging()
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-# Attach ring buffer to root logger so it captures everything
-logging.getLogger().addHandler(_ring_handler)
-
-# Silence noisy/leaky loggers:
-#   httpx logs every HTTP request with full URL (includes bot token!)
-#   googleapiclient.discovery_cache warns about oauth2client version
-logging.getLogger("httpx").setLevel(logging.WARNING)
+# Silence the googleapiclient.discovery_cache warning about oauth2client version
+# (extra to the defaults configured by setup_logging).
 logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
@@ -425,124 +406,47 @@ ASK_USER_TOOL = {
         "required": ["question", "options"],
     },
 }
-
-SCHEDULE_CHECK_TOOL = {
-    "name": "schedule_check",
-    "description": (
-        "Schedule a recurring background check that monitors something and notifies the user "
-        "when conditions change. Use this when the user wants to be alerted about future changes "
-        "(e.g. train delays, new GitHub issues, PR merges). The check runs every interval_minutes "
-        "until expires_at, using all available tools to gather current state. It compares each "
-        "result with the previous one and only notifies the user if the notify_condition is met. "
-        "First run captures a baseline silently. Auto-expires — max 24 hours. Max 5 active monitors."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "check_prompt": {
-                "type": "string",
-                "description": (
-                    "The prompt to run each check cycle. Should instruct use of specific tools "
-                    "(e.g. get_train_departures, list_issues). Be specific about what data to gather."
-                ),
-            },
-            "notify_condition": {
-                "type": "string",
-                "description": (
-                    "When to notify the user. Describe the change that matters. "
-                    "E.g. 'Any train is delayed by more than 5 minutes or cancelled', "
-                    "'A new issue was opened', 'The CI check failed'"
-                ),
-            },
-            "interval_minutes": {
-                "type": "integer",
-                "description": "How often to check, in minutes. Min 5, max 60. Use 5-10 for trains, 15-30 for GitHub.",
-                "minimum": 5,
-                "maximum": 60,
-            },
-            "expires_at": {
-                "type": "string",
-                "description": (
-                    "ISO 8601 datetime when monitoring should stop. Max 24h from now. "
-                    "Choose sensibly: train monitoring until journey time, GitHub until end of day."
-                ),
-            },
-            "summary": {
-                "type": "string",
-                "description": "Brief human-readable label, e.g. 'CHI→VIC train delays', 'New issues on Teleclaude'",
-            },
-        },
-        "required": ["check_prompt", "notify_condition", "interval_minutes", "expires_at", "summary"],
-    },
-}
-
-MANAGE_PULSE_TOOL = {
-    "name": "manage_pulse",
-    "description": (
-        "Configure the autonomous Pulse agent. Pulse periodically reviews your context (calendar, tasks, goals) "
-        "and proactively sends helpful updates when something needs attention. Most pulses are silent — "
-        "it only messages you when there's something worth knowing. "
-        "Use this when the user wants to: add/remove goals for Pulse to watch, enable/disable Pulse, "
-        "change check interval, set quiet hours, or check Pulse status."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": [
-                    "add_goal",
-                    "remove_goal",
-                    "list_goals",
-                    "enable",
-                    "disable",
-                    "set_interval",
-                    "set_quiet_hours",
-                    "status",
-                ],
-                "description": "The action to perform.",
-            },
-            "goal": {
-                "type": "string",
-                "description": "For add_goal: description of what Pulse should watch for.",
-            },
-            "priority": {
-                "type": "string",
-                "enum": ["high", "normal", "low"],
-                "description": "For add_goal: priority level. Default normal.",
-            },
-            "goal_id": {
-                "type": "integer",
-                "description": "For remove_goal: the goal ID to remove.",
-            },
-            "interval_minutes": {
-                "type": "integer",
-                "description": "For set_interval: how often to check, in minutes (15-240).",
-                "minimum": 15,
-                "maximum": 240,
-            },
-            "quiet_start": {
-                "type": "string",
-                "description": "For set_quiet_hours: start of quiet period, e.g. '22:00'.",
-            },
-            "quiet_end": {
-                "type": "string",
-                "description": "For set_quiet_hours: end of quiet period, e.g. '07:00'.",
-            },
-        },
-        "required": ["action"],
-    },
-}
-
-# Registered pulse jobs: chat_id -> Job
-_pulse_jobs: dict[int, Any] = {}
-# In-memory pulse config cache: chat_id -> dict
-_pulse_configs: dict[int, dict] = {}
-
-MAX_MONITORS_PER_CHAT = 5
-MAX_MONITOR_DURATION_HOURS = 24
-# Registered monitor jobs: monitor_id -> Job
-_monitor_jobs: dict[int, Any] = {}
+from history import (  # noqa: F401  re-exported for tests + tool_execution
+    _KEEP_IMAGES_LAST_N,
+    MAX_CONTENT_SIZE,
+    MAX_HISTORY,
+    _sanitize_history,
+    _trim_content,
+    conversations,
+    get_conversation,
+    save_state,
+    trim_history,
+)
+from monitor_system import (  # noqa: F401  re-exported for tests + tool_execution
+    MAX_MONITOR_DURATION_HOURS,
+    MAX_MONITORS_PER_CHAT,
+    SCHEDULE_CHECK_TOOL,
+    _compare_monitor_results,
+    _handle_schedule_check,
+    _monitor_jobs,
+    _pending_monitor_registrations,
+    _register_monitor,
+    _run_monitor_job,
+    _run_monitor_prompt,
+    _unregister_monitor,
+)
+from pulse_agent import (  # noqa: F401  re-exported for tests + tool_execution
+    MANAGE_PULSE_TOOL,
+    _build_triage_context,
+    _handle_manage_pulse,
+    _is_quiet_hours,
+    _pending_pulse_registrations,
+    _pending_pulse_unregistrations,
+    _pulse_configs,
+    _pulse_jobs,
+    _register_pulse,
+    _run_pulse,
+    _run_pulse_action,
+    _run_pulse_triage,
+    _unregister_pulse,
+    pulse_command,
+)
+from tool_execution import _execute_tool_call, _truncate_result
 
 ASK_USER_TIMEOUT = 300  # seconds to wait for user response
 _ask_user_futures: dict[int, asyncio.Future] = {}
@@ -553,7 +457,6 @@ for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
     if uid.isdigit():
         ALLOWED_USER_IDS.add(int(uid))
 
-MAX_HISTORY = 50
 MAX_TELEGRAM_LENGTH = 4096
 MAX_TOOL_ROUNDS = 15
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — reject Telegram file downloads above this
@@ -599,13 +502,6 @@ def _build_tool_list(*, interactive: bool = False, include_email: bool = True) -
     return tools
 
 
-def _truncate_result(text: str, max_len: int = 10000) -> str:
-    """Truncate text and append a marker if it exceeds max_len."""
-    if len(text) > max_len:
-        return text[:max_len] + "\n... (truncated)"
-    return text
-
-
 api_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 async_api_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -618,7 +514,6 @@ _contacts_tool_names = {t["name"] for t in CONTACTS_TOOLS}
 _train_tool_names = {t["name"] for t in TRAIN_TOOLS}
 
 # In-memory cache (backed by SQLite)
-conversations: dict[int, list] = {}
 active_repos: dict[int, str] = {}
 active_branches: dict[int, str] = {}
 chat_models: dict[int, str] = {}
@@ -710,11 +605,7 @@ async def _stream_round(
 
 
 def get_model(chat_id: int) -> str:
-    if chat_id not in chat_models:
-        saved = load_model(chat_id)
-        if saved:
-            chat_models[chat_id] = saved
-    return chat_models.get(chat_id, DEFAULT_MODEL)
+    return cached_get(chat_models, load_model, chat_id, DEFAULT_MODEL)
 
 
 def get_todos(chat_id: int) -> list[dict]:
@@ -744,30 +635,14 @@ def is_authorized(user_id: int) -> bool:
     return _is_authorized(user_id, ALLOWED_USER_IDS)
 
 
-def get_conversation(chat_id: int) -> list:
-    """Get conversation from cache or load from DB (sanitized)."""
-    if chat_id not in conversations:
-        loaded = load_conversation(chat_id)
-        conversations[chat_id] = _sanitize_history(loaded)
-    return conversations[chat_id]
-
-
 def get_active_repo(chat_id: int) -> str | None:
     """Get active repo from cache or load from DB."""
-    if chat_id not in active_repos:
-        repo = load_active_repo(chat_id)
-        if repo:
-            active_repos[chat_id] = repo
-    return active_repos.get(chat_id)
+    return cached_get(active_repos, load_active_repo, chat_id)
 
 
 def get_active_branch(chat_id: int) -> str | None:
     """Get active branch from cache or load from DB."""
-    if chat_id not in active_branches:
-        branch = load_active_branch(chat_id)
-        if branch:
-            active_branches[chat_id] = branch
-    return active_branches.get(chat_id)
+    return cached_get(active_branches, load_active_branch, chat_id)
 
 
 def set_active_branch(chat_id: int, branch: str | None) -> None:
@@ -795,202 +670,6 @@ def _evict_idle_caches() -> None:
         # Don't evict _chat_locks — defaultdict, harmless
     if stale:
         logger.info("Evicted in-memory caches for %d idle chat(s)", len(stale))
-
-
-MAX_CONTENT_SIZE = 20000  # max chars per content string in history
-
-
-def _trim_content(content, keep_images: bool = True) -> Any:
-    """Truncate oversized content blocks when reloading history.
-
-    When keep_images is False, replace image/document blocks with text placeholders
-    to save context space for older messages.
-    """
-    if isinstance(content, str) and len(content) > MAX_CONTENT_SIZE:
-        return content[:MAX_CONTENT_SIZE] + "\n... (truncated)"
-    if isinstance(content, list):
-        trimmed = []
-        for item in content:
-            if isinstance(item, dict):
-                item = dict(item)  # shallow copy
-                # Strip binary data from old messages
-                if not keep_images and item.get("type") == "image":
-                    trimmed.append({"type": "text", "text": "[image was here]"})
-                    continue
-                if not keep_images and item.get("type") == "document":
-                    trimmed.append({"type": "text", "text": "[document was here]"})
-                    continue
-                if isinstance(item.get("content"), str) and len(item["content"]) > MAX_CONTENT_SIZE:
-                    item["content"] = item["content"][:MAX_CONTENT_SIZE] + "\n... (truncated)"
-            trimmed.append(item)
-        return trimmed
-    return content
-
-
-# Number of recent messages to keep images for (the rest get stripped)
-_KEEP_IMAGES_LAST_N = 10
-
-
-def _sanitize_history(history: list[dict]) -> list[dict]:
-    """Ensure history is valid for the Anthropic API.
-
-    - Every tool_use block must have a matching tool_result in the next message.
-    - History must start with a user message.
-    - Remove thinking blocks (they cause issues when sent back).
-    """
-    if not history:
-        return history
-
-    # Clean assistant content blocks:
-    # - Convert SDK objects to plain dicts (SDK objects bypass isinstance(b, dict) checks below)
-    # - Strip thinking blocks (they can't be replayed)
-    # - Remove SDK-internal fields like parsed_output that the API rejects
-    _KNOWN_TEXT_KEYS = {"type", "text"}
-    _KNOWN_TOOL_USE_KEYS = {"type", "id", "name", "input"}
-    for msg in history:
-        if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
-            cleaned = []
-            for b in msg["content"]:
-                # Convert SDK objects (e.g. ToolUseBlock, TextBlock) to plain dicts
-                if not isinstance(b, dict) and hasattr(b, "model_dump"):
-                    b = b.model_dump(exclude_none=True)
-                elif not isinstance(b, dict) and hasattr(b, "__dict__"):
-                    b = dict(b.__dict__)
-                if not isinstance(b, dict):
-                    continue  # Skip non-dict, non-SDK items we can't process
-                if b.get("type") == "thinking":
-                    continue
-                if b.get("type") == "text":
-                    cleaned.append({k: v for k, v in b.items() if k in _KNOWN_TEXT_KEYS})
-                elif b.get("type") == "tool_use":
-                    cleaned.append({k: v for k, v in b.items() if k in _KNOWN_TOOL_USE_KEYS})
-                else:
-                    cleaned.append(b)
-            msg["content"] = cleaned
-        # Also convert SDK objects in user messages (tool_result blocks)
-        elif msg.get("role") == "user" and isinstance(msg.get("content"), list):
-            cleaned = []
-            for b in msg["content"]:
-                if not isinstance(b, dict) and hasattr(b, "model_dump"):
-                    b = b.model_dump(exclude_none=True)
-                elif not isinstance(b, dict) and hasattr(b, "__dict__"):
-                    b = dict(b.__dict__)
-                if isinstance(b, dict):
-                    cleaned.append(b)
-            if cleaned:
-                msg["content"] = cleaned
-
-    # Walk forward and remove orphaned tool_use/tool_result pairs
-    sanitized = []
-    i = 0
-    while i < len(history):
-        msg = history[i]
-
-        # Check if this assistant message has tool_use blocks
-        if msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
-            tool_use_ids = {
-                b["id"] for b in msg["content"] if isinstance(b, dict) and b.get("type") == "tool_use" and "id" in b
-            }
-
-            if tool_use_ids:
-                # There must be a next message with matching tool_results
-                if i + 1 < len(history):
-                    next_msg = history[i + 1]
-                    if next_msg.get("role") == "user" and isinstance(next_msg.get("content"), list):
-                        result_ids = {
-                            b.get("tool_use_id")
-                            for b in next_msg["content"]
-                            if isinstance(b, dict) and b.get("type") == "tool_result"
-                        }
-                        if tool_use_ids == result_ids:
-                            # Pair is complete, keep both
-                            sanitized.append(msg)
-                            sanitized.append(next_msg)
-                            i += 2
-                            continue
-                # Pair is broken — skip the assistant message
-                logger.warning("Dropping orphaned tool_use message at index %d", i)
-                # Also skip the next message if it contains orphaned tool_results
-                if i + 1 < len(history):
-                    next_msg = history[i + 1]
-                    if next_msg.get("role") == "user" and isinstance(next_msg.get("content"), list):
-                        has_tool_results = any(
-                            isinstance(b, dict) and b.get("type") == "tool_result" for b in next_msg["content"]
-                        )
-                        if has_tool_results:
-                            # Strip tool_result blocks, keep any other content (e.g. text)
-                            kept = [
-                                b
-                                for b in next_msg["content"]
-                                if not (isinstance(b, dict) and b.get("type") == "tool_result")
-                            ]
-                            if kept:
-                                sanitized.append({"role": "user", "content": kept})
-                            logger.warning("Stripped orphaned tool_result blocks from message at index %d", i + 1)
-                            i += 2
-                            continue
-                i += 1
-                continue
-
-        # Check if a user message has tool_result blocks without a preceding tool_use
-        if msg.get("role") == "user" and isinstance(msg.get("content"), list):
-            has_tool_results = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in msg["content"])
-            if has_tool_results:
-                # Check if previous sanitized message is an assistant with matching tool_use
-                prev = sanitized[-1] if sanitized else None
-                prev_tool_ids: set[str] = set()
-                if prev and prev.get("role") == "assistant" and isinstance(prev.get("content"), list):
-                    prev_tool_ids = {
-                        b["id"]
-                        for b in prev["content"]
-                        if isinstance(b, dict) and b.get("type") == "tool_use" and "id" in b
-                    }
-                result_ids = {
-                    b.get("tool_use_id")
-                    for b in msg["content"]
-                    if isinstance(b, dict) and b.get("type") == "tool_result"
-                }
-                if not prev_tool_ids or not (result_ids <= prev_tool_ids):
-                    # Orphaned tool_results — strip them, keep other content
-                    kept = [b for b in msg["content"] if not (isinstance(b, dict) and b.get("type") == "tool_result")]
-                    if kept:
-                        sanitized.append({"role": "user", "content": kept})
-                    logger.warning("Stripped orphaned tool_result blocks from user message at index %d", i)
-                    i += 1
-                    continue
-
-        sanitized.append(msg)
-        i += 1
-
-    # Ensure history starts with a user message
-    while sanitized and sanitized[0].get("role") != "user":
-        sanitized.pop(0)
-
-    # Removing orphans can create new orphans (e.g. a tool_result whose tool_use
-    # was inside a dropped pair). Re-run until stable.
-    if len(sanitized) < len(history):
-        return _sanitize_history(sanitized)
-
-    return sanitized
-
-
-def trim_history(chat_id: int) -> None:
-    history = get_conversation(chat_id)
-    if len(history) > MAX_HISTORY * 2:
-        del history[: len(history) - MAX_HISTORY * 2]
-    # Sanitize to fix any broken tool_use/tool_result pairs
-    # IMPORTANT: modify in-place to preserve list reference held by _process_message
-    sanitized = _sanitize_history(history)
-    history.clear()
-    history.extend(sanitized)
-    cutoff = max(0, len(history) - _KEEP_IMAGES_LAST_N)
-    for i, msg in enumerate(history):
-        msg["content"] = _trim_content(msg.get("content"), keep_images=(i >= cutoff))
-
-
-def save_state(chat_id: int) -> None:
-    """Persist current conversation to SQLite."""
-    save_conversation(chat_id, get_conversation(chat_id))
 
 
 _EXTENDED_THINKING_PATTERN = re.compile(
@@ -1449,136 +1128,6 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     cmd = update.message.text.split()[0] if update.message.text else "/?"
     await update.message.reply_text(f"Unknown command: {cmd}\nType /help to see available commands.")
-
-
-def _execute_tool_call(block, repo, chat_id) -> str:
-    """Dispatch a single tool call to the right handler."""
-    try:
-        if block.name == "update_todo_list":
-            todos = block.input.get("todos", [])
-            chat_todos[chat_id] = todos
-            save_todos(chat_id, todos)
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
-            return format_todo_list(todos)
-        if block.name == "schedule_check":
-            return _handle_schedule_check(block.input, chat_id)
-        if block.name == "manage_pulse":
-            audit_log("tool_call", chat_id=chat_id, detail=f"manage_pulse:{block.input.get('action', '')}")
-            return _handle_manage_pulse(block.input, chat_id)
-        if block.name == "web_search" and execute_web_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: {block.input.get('query', '')[:100]}")
-            return execute_web_tool(web_client, block.name, block.input)
-        elif block.name in _tasks_tool_names and execute_tasks_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
-            return execute_tasks_tool(tasks_client, block.name, block.input)
-        elif block.name in _calendar_tool_names and execute_calendar_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
-            return execute_calendar_tool(calendar_client, block.name, block.input)
-        elif block.name in _email_tool_names and execute_email_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: to={block.input.get('to', '')}")
-            return execute_email_tool(email_client, block.name, block.input)
-        elif block.name in _contacts_tool_names and execute_contacts_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}")
-            return execute_contacts_tool(contacts_client, block.name, block.input)
-        elif block.name in _train_tool_names and execute_train_tool:
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name}: {block.input.get('station', '')}")
-            return execute_train_tool(train_client, block.name, block.input)
-        elif block.name in _github_tool_names and execute_github_tool:
-            if not repo:
-                return "No active repo. Ask the user to set one with /repo owner/name first."
-            audit_log("tool_call", chat_id=chat_id, detail=f"{block.name} on {repo}")
-            result = execute_github_tool(gh_client, repo, block.name, block.input)
-            # Auto-track branch
-            if block.name == "create_branch":
-                set_active_branch(chat_id, block.input.get("branch_name"))
-            elif block.name in ("create_or_update_file", "upload_binary_file", "delete_file", "commit_multiple_files"):
-                branch = block.input.get("branch")
-                if branch:
-                    set_active_branch(chat_id, branch)
-            return result
-        return f"Tool '{block.name}' is not available."
-    except Exception as e:
-        logger.error("Tool '%s' crashed: %s", block.name, e, exc_info=True)
-        audit_log("tool_error", chat_id=chat_id, detail=f"{block.name}: {e}")
-        return f"Tool error: {e}"
-
-
-def _handle_schedule_check(tool_input: dict, chat_id: int) -> str:
-    """Handle the schedule_check tool call — validate and persist a new monitor."""
-    # Validate limits
-    active_count = count_monitors(chat_id)
-    if active_count >= MAX_MONITORS_PER_CHAT:
-        return f"Monitor limit reached ({MAX_MONITORS_PER_CHAT} active). Remove one with /monitors remove <id> first."
-
-    check_prompt = tool_input.get("check_prompt", "")
-    notify_condition = tool_input.get("notify_condition", "")
-    interval_minutes = tool_input.get("interval_minutes", 10)
-    expires_at_str = tool_input.get("expires_at", "")
-    summary = tool_input.get("summary", "Monitor")
-
-    if not check_prompt or not notify_condition:
-        return "Error: check_prompt and notify_condition are required."
-
-    interval_minutes = max(5, min(60, int(interval_minutes)))
-
-    # Parse expiry
-    tz = _get_user_tz()
-
-    now = datetime.datetime.now(tz)
-    try:
-        expires_dt = datetime.datetime.fromisoformat(expires_at_str)
-        if expires_dt.tzinfo is None:
-            expires_dt = expires_dt.replace(tzinfo=tz)
-    except (ValueError, TypeError):
-        # Default: 2 hours from now
-        expires_dt = now + datetime.timedelta(hours=2)
-
-    # Cap at 24 hours
-    max_expiry = now + datetime.timedelta(hours=MAX_MONITOR_DURATION_HOURS)
-    if expires_dt > max_expiry:
-        expires_dt = max_expiry
-    if expires_dt <= now:
-        return "Error: expires_at must be in the future."
-
-    expires_at_ts = expires_dt.timestamp()
-
-    monitor_id = save_monitor(
-        chat_id=chat_id,
-        check_prompt=check_prompt,
-        notify_condition=notify_condition,
-        interval_minutes=interval_minutes,
-        expires_at=expires_at_ts,
-        summary=summary,
-    )
-
-    # Register with job queue (needs to happen on the event loop)
-    # Store pending registration — picked up by the async tool loop in _process_message
-    _pending_monitor_registrations.append(
-        {
-            "id": monitor_id,
-            "chat_id": chat_id,
-            "check_prompt": check_prompt,
-            "notify_condition": notify_condition,
-            "interval_minutes": interval_minutes,
-            "expires_at": expires_at_ts,
-            "summary": summary,
-            "last_result": None,
-        }
-    )
-
-    expires_str = (
-        expires_dt.strftime("%H:%M %Z") if expires_dt.date() == now.date() else expires_dt.strftime("%b %d %H:%M")
-    )
-    audit_log("monitor_created", chat_id=chat_id, detail=f"#{monitor_id}: {summary}")
-    return (
-        f"Monitor #{monitor_id} created: {summary}\n"
-        f"Checking every {interval_minutes}m until {expires_str}.\n"
-        f"First check will run shortly to capture a baseline."
-    )
-
-
-# Pending registrations from sync _execute_tool_call → picked up by async _process_message
-_pending_monitor_registrations: list[dict] = []
 
 
 async def _handle_ask_user(block, chat_id: int, bot) -> str:
@@ -2087,6 +1636,13 @@ async def _process_message(
             # Tool use round
             history.append({"role": "assistant", "content": response.content})
 
+            # Non-streaming fallback: text blocks aren't streamed, so send them now
+            # (ensures explanation appears before any ask_user buttons)
+            if streamed_text is None:
+                text_parts = [b.text for b in response.content if b.type == "text"]
+                if text_parts:
+                    await send_long_message(chat_id, "\n".join(text_parts), bot, parse_mode="HTML")
+
             tool_results = []
             loop = asyncio.get_running_loop()
             for block in response.content:
@@ -2094,7 +1650,16 @@ async def _process_message(
                     logger.info("Tool call [%d]: %s(%s)", round_num + 1, block.name, json.dumps(block.input)[:200])
                     progress["tools"].append(block.name)
                     if block.name == "ask_user":
+                        # Stop typing indicator before waiting for user input so progress
+                        # messages don't appear while the inline keyboard is visible
+                        stop_typing.set()
+                        await typing_task
                         result = await _handle_ask_user(block, chat_id, bot)
+                        # Restart typing indicator for any subsequent tool rounds
+                        stop_typing = asyncio.Event()
+                        typing_task = asyncio.create_task(
+                            keep_typing(update.effective_chat, stop_typing, time.time(), bot, progress)
+                        )
                     elif block.name.startswith("mcp_") and mcp_manager:
                         result = await mcp_manager.call_tool(block.name, block.input)
                     else:
@@ -2144,737 +1709,6 @@ async def _process_message(
         stop_typing.set()
         await typing_task
         await send_long_message(chat_id, "Something went wrong. Please try again.", bot)
-
-
-# ── Monitor execution ─────────────────────────────────────────────────
-
-
-def _register_monitor(job_queue, monitor: dict, bot=None) -> None:
-    """Register a monitor dict as a repeating JobQueue job."""
-    monitor_id = monitor["id"]
-    job_data = {**monitor, "bot": bot}
-    job_name = f"monitor_{monitor_id}"
-    interval = monitor["interval_minutes"] * 60
-
-    job = job_queue.run_repeating(
-        _run_monitor_job,
-        interval=interval,
-        first=10,  # first check 10s after creation
-        data=job_data,
-        name=job_name,
-    )
-    _monitor_jobs[monitor_id] = job
-    logger.info("Registered monitor #%d: every %dm — %s", monitor_id, monitor["interval_minutes"], monitor["summary"])
-
-
-def _unregister_monitor(monitor_id: int) -> None:
-    """Remove a monitor job from the job queue."""
-    job = _monitor_jobs.pop(monitor_id, None)
-    if job:
-        job.schedule_removal()
-
-
-async def _run_monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Job callback for monitor checks."""
-    job_data: dict = context.job.data  # type: ignore[assignment]  # job.data is always a dict in our handlers
-    monitor_id = job_data["id"]
-    chat_id = job_data["chat_id"]
-    check_prompt = job_data["check_prompt"]
-    notify_condition = job_data["notify_condition"]
-    summary = job_data["summary"]
-    expires_at = job_data["expires_at"]
-    last_result = job_data.get("last_result")
-
-    # Check expiry
-    if time.time() > expires_at:
-        _unregister_monitor(monitor_id)
-        disable_monitor(monitor_id)
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=f"Monitor expired: {summary}")
-        except Exception:
-            pass
-        logger.info("Monitor #%d expired: %s", monitor_id, summary)
-        return
-
-    try:
-        # Run the check prompt through the tool loop to get current state
-        current_result = await _run_monitor_prompt(context.bot, chat_id, check_prompt)
-
-        if last_result is None:
-            # First run — capture baseline silently
-            job_data["last_result"] = current_result
-            update_monitor_result(monitor_id, current_result)
-            logger.info("Monitor #%d baseline captured", monitor_id)
-            return
-
-        # Compare old vs new
-        should_notify, alert_msg = await _compare_monitor_results(
-            last_result, current_result, notify_condition, summary
-        )
-
-        # Update stored result
-        job_data["last_result"] = current_result
-        update_monitor_result(monitor_id, current_result)
-
-        if should_notify and alert_msg:
-            await send_long_message(chat_id, f"🔔 {summary}\n\n{alert_msg}", context.bot, parse_mode="HTML")
-            audit_log("monitor_alert", chat_id=chat_id, detail=f"#{monitor_id}: {summary}")
-
-    except Exception as e:
-        logger.warning("Monitor #%d check failed: %s", monitor_id, e)
-
-
-async def _run_monitor_prompt(bot, chat_id: int, prompt: str) -> str:
-    """Run a monitor check prompt through the tool loop, returning the text result.
-
-    Similar to run_scheduled_prompt but returns text instead of sending it.
-    """
-    tools = _build_tool_list(include_email=False)
-
-    tz = _get_user_tz()
-    now = datetime.datetime.now(tz)
-
-    system = (
-        f"Today is {now.strftime('%A, %B %d, %Y at %I:%M %p')} ({USER_TIMEZONE}).\n\n"
-        "You are running a background monitoring check. Gather the requested data using the "
-        "available tools and return a concise factual summary of the current state. "
-        "Do NOT address the user — just report the data."
-    )
-
-    repo = get_active_repo(chat_id)
-    if repo:
-        system += f"\n\nActive repository: {repo}"
-
-    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-    loop = asyncio.get_running_loop()
-
-    for _ in range(5):  # fewer rounds than interactive — monitors should be quick
-        response = await _call_anthropic(
-            model=BACKGROUND_MODEL,  # use Haiku for cost efficiency
-            max_tokens=1024,
-            system=system,
-            messages=messages,
-            **({"tools": tools} if tools else {}),
-        )
-
-        if response.stop_reason != "tool_use":
-            text_parts = [b.text for b in response.content if b.type == "text"]
-            return "\n".join(text_parts) if text_parts else "(no data)"
-
-        messages.append({"role": "assistant", "content": response.content})
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                try:
-                    result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
-                except Exception as e:
-                    result = f"Tool error: {e}"
-                result = _truncate_result(result)
-                tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
-        messages.append({"role": "user", "content": tool_results})
-
-    return "(monitor check hit tool limit)"
-
-
-async def _compare_monitor_results(
-    previous: str, current: str, notify_condition: str, summary: str
-) -> tuple[bool, str | None]:
-    """Use Claude to compare two monitor snapshots and decide whether to notify.
-
-    Returns (should_notify, alert_message_or_none).
-    """
-    prompt = (
-        f"You are comparing two snapshots from a background monitor: '{summary}'.\n\n"
-        f"PREVIOUS STATE:\n{previous[:3000]}\n\n"
-        f"CURRENT STATE:\n{current[:3000]}\n\n"
-        f"NOTIFY CONDITION: {notify_condition}\n\n"
-        "Does the current state meet the notify condition (compared to the previous state)?\n"
-        "If YES: write a concise alert message for a phone notification (2-3 lines max).\n"
-        "If NO: respond with exactly the word NO_CHANGE and nothing else."
-    )
-
-    response = await _call_anthropic(
-        model=BACKGROUND_MODEL,
-        max_tokens=256,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    text_parts = [b.text for b in response.content if b.type == "text"]
-    reply = "\n".join(text_parts).strip()
-
-    if reply == "NO_CHANGE" or reply.startswith("NO_CHANGE"):
-        return False, None
-    return True, reply
-
-
-# ── Pulse: autonomous agent ───────────────────────────────────────────
-
-
-def _handle_manage_pulse(tool_input: dict, chat_id: int) -> str:
-    """Handle the manage_pulse tool call."""
-    action = tool_input.get("action", "")
-
-    if action == "add_goal":
-        goal_text = tool_input.get("goal", "").strip()
-        if not goal_text:
-            return "Error: goal text is required."
-        priority = tool_input.get("priority", "normal")
-        # Ensure config exists
-        config = load_pulse_config(chat_id)
-        if not config:
-            save_pulse_config(chat_id, enabled=False, interval_minutes=60, quiet_start=None, quiet_end=None)
-        goal_id = save_pulse_goal(chat_id, goal_text, priority)
-        return f"Goal #{goal_id} added: {goal_text} (priority: {priority})"
-
-    if action == "remove_goal":
-        remove_id = tool_input.get("goal_id")
-        if remove_id is None:
-            return "Error: goal_id is required."
-        if delete_pulse_goal(int(remove_id), chat_id):
-            return f"Goal #{remove_id} removed."
-        return f"Goal #{remove_id} not found."
-
-    if action == "list_goals":
-        goals = load_pulse_goals(chat_id)
-        if not goals:
-            return "No pulse goals configured. Add some with add_goal."
-        lines = []
-        for g in goals:
-            lines.append(f"#{g['id']} [{g['priority']}] {g['goal']}")
-        return "\n".join(lines)
-
-    if action == "enable":
-        config = load_pulse_config(chat_id)
-        if not config:
-            save_pulse_config(chat_id, enabled=True, interval_minutes=60, quiet_start=None, quiet_end=None)
-        else:
-            save_pulse_config(
-                chat_id,
-                enabled=True,
-                interval_minutes=config["interval_minutes"],
-                quiet_start=config["quiet_start"],
-                quiet_end=config["quiet_end"],
-            )
-        _pulse_configs.pop(chat_id, None)  # invalidate cache
-        _pending_pulse_registrations.append(chat_id)
-        goals = load_pulse_goals(chat_id)
-        if not goals:
-            return "Pulse enabled, but no goals configured yet. Add goals so Pulse knows what to watch."
-        return "Pulse enabled. It will start checking on the next interval."
-
-    if action == "disable":
-        config = load_pulse_config(chat_id)
-        if config:
-            save_pulse_config(
-                chat_id,
-                enabled=False,
-                interval_minutes=config["interval_minutes"],
-                quiet_start=config["quiet_start"],
-                quiet_end=config["quiet_end"],
-            )
-        _pulse_configs.pop(chat_id, None)
-        _pending_pulse_unregistrations.append(chat_id)
-        return "Pulse disabled."
-
-    if action == "set_interval":
-        minutes = tool_input.get("interval_minutes", 60)
-        minutes = max(15, min(240, int(minutes)))
-        config = load_pulse_config(chat_id)
-        if not config:
-            save_pulse_config(chat_id, enabled=False, interval_minutes=minutes, quiet_start=None, quiet_end=None)
-        else:
-            save_pulse_config(
-                chat_id,
-                enabled=config["enabled"],
-                interval_minutes=minutes,
-                quiet_start=config["quiet_start"],
-                quiet_end=config["quiet_end"],
-            )
-        _pulse_configs.pop(chat_id, None)
-        if config and config["enabled"]:
-            _pending_pulse_registrations.append(chat_id)
-        return f"Pulse interval set to {minutes} minutes."
-
-    if action == "set_quiet_hours":
-        quiet_start = tool_input.get("quiet_start")
-        quiet_end = tool_input.get("quiet_end")
-        if not quiet_start or not quiet_end:
-            return "Error: both quiet_start and quiet_end are required (e.g. '22:00' and '07:00')."
-        config = load_pulse_config(chat_id)
-        if not config:
-            save_pulse_config(chat_id, enabled=False, interval_minutes=60, quiet_start=quiet_start, quiet_end=quiet_end)
-        else:
-            save_pulse_config(
-                chat_id,
-                enabled=config["enabled"],
-                interval_minutes=config["interval_minutes"],
-                quiet_start=quiet_start,
-                quiet_end=quiet_end,
-            )
-        _pulse_configs.pop(chat_id, None)
-        return f"Quiet hours set: {quiet_start} - {quiet_end}."
-
-    if action == "status":
-        config = load_pulse_config(chat_id)
-        if not config:
-            return "Pulse is not configured. Enable it and add goals to get started."
-        goals = load_pulse_goals(chat_id)
-        lines = [
-            f"Enabled: {'yes' if config['enabled'] else 'no'}",
-            f"Interval: every {config['interval_minutes']}m",
-        ]
-        if config["quiet_start"] and config["quiet_end"]:
-            lines.append(f"Quiet hours: {config['quiet_start']} - {config['quiet_end']}")
-        if config["last_pulse_at"]:
-            tz = _get_user_tz()
-            last_dt = datetime.datetime.fromtimestamp(config["last_pulse_at"], tz=tz)
-            lines.append(f"Last pulse: {last_dt.strftime('%H:%M %b %d')}")
-        lines.append(f"Goals: {len(goals)}")
-        for g in goals:
-            lines.append(f"  #{g['id']} [{g['priority']}] {g['goal']}")
-        return "\n".join(lines)
-
-    return f"Unknown action: {action}"
-
-
-# Pending pulse registrations/unregistrations from sync tool call → picked up by async _process_message
-_pending_pulse_registrations: list[int] = []
-_pending_pulse_unregistrations: list[int] = []
-
-
-def _is_quiet_hours(quiet_start: str | None, quiet_end: str | None, tz: datetime.tzinfo) -> bool:
-    """Check if current time is within quiet hours."""
-    if not quiet_start or not quiet_end:
-        return False
-    now = datetime.datetime.now(tz)
-    try:
-        start_h, start_m = (int(x) for x in quiet_start.split(":"))
-        end_h, end_m = (int(x) for x in quiet_end.split(":"))
-    except (ValueError, AttributeError):
-        return False
-    current_minutes = now.hour * 60 + now.minute
-    start_minutes = start_h * 60 + start_m
-    end_minutes = end_h * 60 + end_m
-
-    if start_minutes <= end_minutes:
-        # Same day: e.g. 09:00 - 17:00
-        return start_minutes <= current_minutes < end_minutes
-    else:
-        # Overnight: e.g. 22:00 - 07:00
-        return current_minutes >= start_minutes or current_minutes < end_minutes
-
-
-async def _build_triage_context(chat_id: int) -> str:
-    """Build a compact context snapshot for pulse triage (~500 tokens)."""
-    parts = []
-    loop = asyncio.get_running_loop()
-
-    tz = _get_user_tz()
-    now = datetime.datetime.now(tz)
-    parts.append(f"Time: {now.strftime('%A %H:%M %Z')}")
-
-    # Goals
-    goals = load_pulse_goals(chat_id)
-    if goals:
-        goal_lines = [f"- [{g['priority']}] {g['goal']}" for g in goals]
-        parts.append("Goals:\n" + "\n".join(goal_lines))
-
-    # Calendar (next 4 hours)
-    if calendar_client and execute_calendar_tool:
-        try:
-            time_min = now.isoformat()
-            time_max = (now + datetime.timedelta(hours=4)).isoformat()
-            result = await loop.run_in_executor(
-                None,
-                execute_calendar_tool,
-                calendar_client,
-                "list_events",
-                {"time_min": time_min, "time_max": time_max, "max_results": 5},
-            )
-            parts.append(f"Calendar (next 4h): {result[:500]}")
-        except Exception as e:
-            logger.debug("Pulse triage calendar fetch failed: %s", e)
-
-    # Tasks
-    if tasks_client and execute_tasks_tool:
-        try:
-            result = await loop.run_in_executor(
-                None, execute_tasks_tool, tasks_client, "list_tasks", {"max_results": 10}
-            )
-            parts.append(f"Tasks: {result[:500]}")
-        except Exception as e:
-            logger.debug("Pulse triage tasks fetch failed: %s", e)
-
-    # Todos
-    todos = get_todos(chat_id)
-    if todos:
-        pending = [t for t in todos if t.get("status") != "completed"]
-        if pending:
-            parts.append(f"Todos: {format_todo_list(pending)}")
-
-    # Last pulse summary
-    config = load_pulse_config(chat_id)
-    if config and config.get("last_pulse_summary"):
-        parts.append(f"Last pulse said: {config['last_pulse_summary'][:300]}")
-
-    return "\n\n".join(parts)
-
-
-async def _run_pulse_triage(chat_id: int) -> dict:
-    """Run triage with Haiku. Returns {"act": bool, "reason": str}."""
-    context_text = await _build_triage_context(chat_id)
-
-    triage_prompt = (
-        "You are a triage agent for a personal assistant. Review this context snapshot and decide "
-        "if there's anything worth proactively telling the user about RIGHT NOW.\n\n"
-        "Consider:\n"
-        "- Upcoming events they should prepare for\n"
-        "- Overdue or urgent tasks\n"
-        "- Things matching their stated goals\n"
-        "- Time-sensitive information\n\n"
-        "Be conservative — silence is better than noise. Only recommend action if there's genuine value.\n"
-        "If the last pulse already covered this information, don't repeat it.\n\n"
-        f"CONTEXT:\n{context_text}\n\n"
-        'Respond with ONLY valid JSON: {"act": true/false, "reason": "brief reason or empty"}'
-    )
-
-    try:
-        response = await _call_anthropic(
-            model=BACKGROUND_MODEL,
-            max_tokens=150,
-            messages=[{"role": "user", "content": triage_prompt}],
-        )
-        text = "".join(b.text for b in response.content if b.type == "text").strip()
-        # Parse JSON from response (handle markdown code blocks)
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        result = json.loads(text)
-        return {"act": bool(result.get("act", False)), "reason": result.get("reason", "")}
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
-        logger.warning("Pulse triage JSON parse failed: %s — raw: %s", e, text[:200] if "text" in dir() else "n/a")
-        return {"act": False, "reason": ""}
-    except Exception as e:
-        logger.warning("Pulse triage failed: %s", e)
-        return {"act": False, "reason": ""}
-
-
-async def _run_pulse_action(bot, chat_id: int, triage_result: dict) -> None:
-    """Run the action phase with Sonnet + full tools. Sends result to user."""
-    goals = load_pulse_goals(chat_id)
-    config = load_pulse_config(chat_id)
-    goal_text = "\n".join(f"- [{g['priority']}] {g['goal']}" for g in goals) if goals else "(no specific goals)"
-    last_summary = config.get("last_pulse_summary", "") if config else ""
-
-    tz = _get_user_tz()
-    now = datetime.datetime.now(tz)
-
-    action_prompt = (
-        f"You are Teleclaude's Pulse agent running a proactive check at {now.strftime('%H:%M %Z')}.\n\n"
-        f"TRIAGE REASON: {triage_result.get('reason', 'General check')}\n\n"
-        f"USER'S GOALS:\n{goal_text}\n\n"
-        + (f"LAST PULSE SAID: {last_summary[:500]}\n\n" if last_summary else "")
-        + "Use the available tools to gather current information relevant to the triage reason and goals. "
-        "Then compose a concise, helpful update for the user's phone screen.\n\n"
-        "Guidelines:\n"
-        "- Be brief — 2-5 lines max unless there's a lot to report.\n"
-        "- Don't repeat info from the last pulse unless it has changed.\n"
-        "- Actionable > informational.\n"
-        "- End with a one-line summary of what you checked (this will be stored as context for next pulse)."
-    )
-
-    # Build tools
-    tools = _build_tool_list()
-
-    system = (
-        f"Today is {now.strftime('%A, %B %d, %Y at %I:%M %p')} ({USER_TIMEZONE}).\n\n"
-        "You are running as Teleclaude's Pulse agent — a proactive background check. "
-        "Keep responses concise and useful for a phone screen."
-    )
-
-    repo = get_active_repo(chat_id)
-    if repo:
-        system += f"\n\nActive repository: {repo}"
-
-    messages: list[dict[str, Any]] = [{"role": "user", "content": action_prompt}]
-    loop = asyncio.get_running_loop()
-
-    for _ in range(8):
-        response = await _call_anthropic(
-            model=get_model(chat_id),
-            max_tokens=2048,
-            system=system,
-            messages=messages,
-            **({"tools": tools} if tools else {}),
-        )
-
-        if response.stop_reason != "tool_use":
-            text_parts = [b.text for b in response.content if b.type == "text"]
-            reply = "\n".join(text_parts) if text_parts else "(Pulse check completed with no output.)"
-            await send_long_message(chat_id, f"Pulse\n\n{reply}", bot, parse_mode="HTML")
-            # Store summary (last line or truncated reply)
-            summary = reply.split("\n")[-1][:300] if reply else ""
-            update_pulse_last_run(chat_id, summary)
-            _pulse_configs.pop(chat_id, None)  # invalidate cache
-            audit_log("pulse_action", chat_id=chat_id, detail=summary[:100])
-            return
-
-        messages.append({"role": "assistant", "content": response.content})
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                try:
-                    result = await loop.run_in_executor(None, _execute_tool_call, block, repo, chat_id)
-                except Exception as e:
-                    result = f"Tool error: {e}"
-                result = _truncate_result(result)
-                tool_results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
-        messages.append({"role": "user", "content": tool_results})
-
-    await send_long_message(chat_id, "Pulse check hit tool limit.", bot)
-
-
-async def _run_pulse(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """JobQueue callback for pulse checks."""
-    job_data: dict = context.job.data  # type: ignore[assignment]  # job.data is always a dict in our handlers
-    chat_id = job_data["chat_id"]
-
-    # Reload config in case it changed
-    config = load_pulse_config(chat_id)
-    if not config or not config["enabled"]:
-        return
-
-    tz = _get_user_tz()
-
-    # Check quiet hours
-    if _is_quiet_hours(config.get("quiet_start"), config.get("quiet_end"), tz):
-        logger.debug("Pulse for chat %d skipped — quiet hours", chat_id)
-        return
-
-    # Check goals exist
-    goals = load_pulse_goals(chat_id)
-    if not goals:
-        logger.debug("Pulse for chat %d skipped — no goals", chat_id)
-        return
-
-    logger.info("Pulse triage starting for chat %d", chat_id)
-
-    # Phase 1: Triage (cheap)
-    triage = await _run_pulse_triage(chat_id)
-    if not triage.get("act"):
-        logger.info("Pulse triage for chat %d: no action needed", chat_id)
-        return
-
-    # Phase 2: Action (full tools)
-    logger.info("Pulse action for chat %d: %s", chat_id, triage.get("reason", "")[:80])
-    try:
-        await _run_pulse_action(context.bot, chat_id, triage)
-    except Exception as e:
-        logger.warning("Pulse action failed for chat %d: %s", chat_id, e)
-
-
-def _register_pulse(job_queue, chat_id: int) -> None:
-    """Register a pulse job for a chat."""
-    # Unregister existing first
-    _unregister_pulse(chat_id)
-
-    config = load_pulse_config(chat_id)
-    if not config or not config["enabled"]:
-        return
-
-    interval = config["interval_minutes"] * 60
-    job_data = {"chat_id": chat_id}
-    job_name = f"pulse_{chat_id}"
-
-    job = job_queue.run_repeating(
-        _run_pulse,
-        interval=interval,
-        first=30,  # first check 30s after registration
-        data=job_data,
-        name=job_name,
-    )
-    _pulse_jobs[chat_id] = job
-    logger.info("Registered pulse for chat %d: every %dm", chat_id, config["interval_minutes"])
-
-
-def _unregister_pulse(chat_id: int) -> None:
-    """Remove a pulse job from the job queue."""
-    job = _pulse_jobs.pop(chat_id, None)
-    if job:
-        job.schedule_removal()
-
-
-async def pulse_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/pulse command handler."""
-    if not is_authorized(update.effective_user.id):
-        return
-
-    chat_id = update.effective_chat.id
-    args = context.args or []
-
-    if not args:
-        # Show status
-        config = load_pulse_config(chat_id)
-        goals = load_pulse_goals(chat_id)
-        if not config:
-            await update.message.reply_text(
-                "Pulse is not configured yet.\n\n"
-                "Pulse is an autonomous agent that periodically checks your context "
-                "(calendar, tasks, goals) and sends updates when something needs attention.\n\n"
-                "Get started:\n"
-                "/pulse on — enable Pulse\n"
-                "Then tell me what to watch for, e.g.:\n"
-                '"Keep an eye on my PRs"\n'
-                '"Remind me about overdue tasks"\n'
-                '"Watch for calendar conflicts"'
-            )
-            return
-
-        lines = [f"Pulse: {'ON' if config['enabled'] else 'OFF'}"]
-        lines.append(f"Interval: every {config['interval_minutes']}m")
-        if config["quiet_start"] and config["quiet_end"]:
-            lines.append(f"Quiet hours: {config['quiet_start']} - {config['quiet_end']}")
-        if config.get("last_pulse_at"):
-            tz = _get_user_tz()
-            last_dt = datetime.datetime.fromtimestamp(config["last_pulse_at"], tz=tz)
-            lines.append(f"Last active pulse: {last_dt.strftime('%H:%M %b %d')}")
-
-        if goals:
-            lines.append(f"\nGoals ({len(goals)}):")
-            for g in goals:
-                lines.append(f"  #{g['id']} [{g['priority']}] {g['goal']}")
-        else:
-            lines.append("\nNo goals. Tell me what to watch for.")
-
-        await update.message.reply_text("\n".join(lines))
-        return
-
-    subcmd = args[0].lower()
-
-    if subcmd in ("on", "enable"):
-        config = load_pulse_config(chat_id)
-        if not config:
-            save_pulse_config(chat_id, enabled=True, interval_minutes=60, quiet_start=None, quiet_end=None)
-        else:
-            save_pulse_config(
-                chat_id,
-                enabled=True,
-                interval_minutes=config["interval_minutes"],
-                quiet_start=config["quiet_start"],
-                quiet_end=config["quiet_end"],
-            )
-        _pulse_configs.pop(chat_id, None)
-        if context.application.job_queue:
-            _register_pulse(context.application.job_queue, chat_id)
-        goals = load_pulse_goals(chat_id)
-        if goals:
-            await update.message.reply_text("Pulse enabled.")
-        else:
-            await update.message.reply_text("Pulse enabled. Now tell me what to watch for.")
-        return
-
-    if subcmd in ("off", "disable"):
-        config = load_pulse_config(chat_id)
-        if config:
-            save_pulse_config(
-                chat_id,
-                enabled=False,
-                interval_minutes=config["interval_minutes"],
-                quiet_start=config["quiet_start"],
-                quiet_end=config["quiet_end"],
-            )
-        _pulse_configs.pop(chat_id, None)
-        _unregister_pulse(chat_id)
-        await update.message.reply_text("Pulse disabled.")
-        return
-
-    if subcmd == "every":
-        if len(args) < 2:
-            await update.message.reply_text("Usage: /pulse every 30m or /pulse every 2h")
-            return
-        interval_str = args[1].lower()
-        match = re.match(r"^(\d+)(m|h)$", interval_str)
-        if not match:
-            await update.message.reply_text("Invalid interval. Use e.g. 30m or 2h.")
-            return
-        value = int(match.group(1))
-        unit = match.group(2)
-        minutes = value if unit == "m" else value * 60
-        minutes = max(15, min(240, minutes))
-        config = load_pulse_config(chat_id)
-        if not config:
-            save_pulse_config(chat_id, enabled=False, interval_minutes=minutes, quiet_start=None, quiet_end=None)
-        else:
-            save_pulse_config(
-                chat_id,
-                enabled=config["enabled"],
-                interval_minutes=minutes,
-                quiet_start=config["quiet_start"],
-                quiet_end=config["quiet_end"],
-            )
-        _pulse_configs.pop(chat_id, None)
-        if config and config["enabled"] and context.application.job_queue:
-            _register_pulse(context.application.job_queue, chat_id)
-        await update.message.reply_text(f"Pulse interval set to {minutes} minutes.")
-        return
-
-    if subcmd == "quiet":
-        if len(args) < 2:
-            await update.message.reply_text("Usage: /pulse quiet 22:00-07:00")
-            return
-        time_range = args[1]
-        parts = time_range.split("-")
-        if len(parts) != 2:
-            await update.message.reply_text("Usage: /pulse quiet 22:00-07:00")
-            return
-        quiet_start, quiet_end = parts[0].strip(), parts[1].strip()
-        config = load_pulse_config(chat_id)
-        if not config:
-            save_pulse_config(chat_id, enabled=False, interval_minutes=60, quiet_start=quiet_start, quiet_end=quiet_end)
-        else:
-            save_pulse_config(
-                chat_id,
-                enabled=config["enabled"],
-                interval_minutes=config["interval_minutes"],
-                quiet_start=quiet_start,
-                quiet_end=quiet_end,
-            )
-        _pulse_configs.pop(chat_id, None)
-        await update.message.reply_text(f"Quiet hours set: {quiet_start} - {quiet_end}")
-        return
-
-    if subcmd == "goals":
-        goals = load_pulse_goals(chat_id)
-        if not goals:
-            await update.message.reply_text("No goals. Tell me what to watch for.")
-        else:
-            lines = [f"#{g['id']} [{g['priority']}] {g['goal']}" for g in goals]
-            await update.message.reply_text("\n".join(lines))
-        return
-
-    if subcmd == "remove":
-        if len(args) < 2:
-            await update.message.reply_text("Usage: /pulse remove <goal_id>")
-            return
-        try:
-            goal_id = int(args[1].lstrip("#"))
-        except ValueError:
-            await update.message.reply_text("Invalid goal ID.")
-            return
-        if delete_pulse_goal(goal_id, chat_id):
-            await update.message.reply_text(f"Goal #{goal_id} removed.")
-        else:
-            await update.message.reply_text(f"Goal #{goal_id} not found.")
-        return
-
-    await update.message.reply_text(
-        "Usage:\n"
-        "/pulse — show status\n"
-        "/pulse on/off — enable/disable\n"
-        "/pulse every 30m — set interval\n"
-        "/pulse quiet 22:00-07:00 — set quiet hours\n"
-        "/pulse goals — list goals\n"
-        "/pulse remove <id> — remove a goal"
-    )
 
 
 async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
