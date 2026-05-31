@@ -68,8 +68,11 @@ services:
             nohup headroom proxy --host 127.0.0.1 --port $${HEADROOM_PORT} \
               > /home/teleclaude/.headroom/logs/proxy.boot.log 2>&1 &
           " || true
+          # Cold start is slow: ~7s for imports plus a one-time HuggingFace
+          # model download (kompress + ModernBERT) on a fresh container, so we
+          # wait up to ~60s for the port to accept connections.
           HEADROOM_UP=0
-          for i in $$(seq 1 30); do
+          for i in $$(seq 1 120); do
             if (exec 3<>/dev/tcp/127.0.0.1/$${HEADROOM_PORT}) 2>/dev/null; then
               HEADROOM_UP=1
               break
@@ -78,11 +81,11 @@ services:
           done
           if [ "$$HEADROOM_UP" = "1" ]; then
             export ANTHROPIC_BASE_URL=http://127.0.0.1:$${HEADROOM_PORT}
-            echo "[headroom] proxy UP on 127.0.0.1:$${HEADROOM_PORT} — routing Claude through it (ANTHROPIC_BASE_URL set)."
+            echo "[headroom] proxy UP on 127.0.0.1:$${HEADROOM_PORT} after ~$$((i / 2))s — routing Claude through it (ANTHROPIC_BASE_URL set)."
             timeout 20 runuser -u teleclaude -- rtk init --global --auto-patch < /dev/null || true
           else
             unset ANTHROPIC_BASE_URL
-            echo "[headroom] WARNING: proxy did NOT come up on 127.0.0.1:$${HEADROOM_PORT} within ~15s — DISABLING Headroom; Claude will use the Anthropic API directly. Proxy boot log follows:" >&2
+            echo "[headroom] WARNING: proxy did NOT come up on 127.0.0.1:$${HEADROOM_PORT} within ~60s — DISABLING Headroom; Claude will use the Anthropic API directly. Proxy boot log follows:" >&2
             tail -n 30 /home/teleclaude/.headroom/logs/proxy.boot.log 2>/dev/null >&2 || true
             timeout 10 runuser -u teleclaude -- rtk init --global --uninstall < /dev/null > /dev/null 2>&1 || true
           fi
