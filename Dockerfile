@@ -43,6 +43,15 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN curl -fsSL https://github.com/estampo/boo-cloud/releases/latest/download/install.sh \
     | BOO_CLOUD_INSTALL_DIR=/usr/local/bin sh
 
+# Install rtk (Rust Token Killer) — Headroom's CLI "context tool". The agent
+# entrypoint registers an rtk PreToolUse hook in ~/.claude/settings.json that
+# transparently compresses Bash command output before it enters the model's
+# context. Pinned to the version Headroom's `wrap` targets. Needs jq (above).
+ENV RTK_VERSION=v0.28.2
+RUN curl -fsSL "https://github.com/rtk-ai/rtk/releases/download/${RTK_VERSION}/rtk-x86_64-unknown-linux-musl.tar.gz" \
+    | tar -xz -C /usr/local/bin rtk \
+    && chmod +x /usr/local/bin/rtk
+
 # Install agent-browser (Vercel) + its MCP wrapper and Playwright/Chromium.
 # Browsers are installed to /opt/playwright-browsers so the non-root user can read them.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
@@ -76,6 +85,13 @@ RUN uv sync --frozen --no-dev --no-editable
 RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install black \
     && UV_TOOL_BIN_DIR=/usr/local/bin uv tool install ruff \
     && UV_TOOL_BIN_DIR=/usr/local/bin uv tool install mypy
+
+# Install Headroom as an isolated uv tool — provides the `headroom` CLI. The
+# agent entrypoint starts `headroom proxy` and points the Claude CLI at it via
+# ANTHROPIC_BASE_URL, so all agent Claude traffic is context-compressed. The
+# [proxy] extra is the lightweight path (structural JSON/code/log compression);
+# it deliberately omits the heavy [ml] extra (torch) used for prose compression.
+RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install "headroom-ai[proxy]"
 
 # Copy application code
 COPY *.py VERSION ./

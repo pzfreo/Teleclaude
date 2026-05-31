@@ -49,6 +49,21 @@ services:
           claude mcp remove boo-cloud 2>/dev/null
           claude mcp add -s user boo-cloud -- boocloud-mcp
         '
+        # Headroom context compression ("headroom wrap claude", full parity):
+        #  1. Register rtk's PreToolUse hook in ~/.claude (compresses Bash output).
+        #     Runs after the CLAUDE.md install above so its @RTK.md reference sticks.
+        #  2. Start the Headroom proxy and route the Claude CLI through it via
+        #     ANTHROPIC_BASE_URL (inherited by every claude subprocess bot_agent
+        #     spawns). One shared, entrypoint-owned proxy — never recycled with a
+        #     per-chat claude process. Both steps are best-effort: a failure must
+        #     not stop the bot from starting.
+        runuser -u teleclaude -- rtk init --global --auto-patch || true
+        runuser -u teleclaude -- sh -c '
+          mkdir -p /home/teleclaude/.headroom/logs
+          nohup headroom proxy --host 127.0.0.1 --port 8787 \
+            > /home/teleclaude/.headroom/logs/proxy.boot.log 2>&1 &
+        ' || true
+        export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
         exec runuser -u teleclaude -- python bot_agent.py
     volumes:
       - teleclaude-agent-data:/app/data
