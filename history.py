@@ -50,19 +50,25 @@ def _trim_content(content, keep_images: bool = True) -> Any:
     return content
 
 
-def _sanitize_history(history: list[dict]) -> list[dict]:
+def _sanitize_history(history: list[dict], keep_thinking: bool = False) -> list[dict]:
     """Ensure history is valid for the Anthropic API.
 
     - Every tool_use block must have a matching tool_result in the next message.
     - History must start with a user message.
-    - Remove thinking blocks (they cause issues when sent back).
+    - Remove thinking/redacted_thinking blocks unless keep_thinking is True.
+
+    When keep_thinking is True (the current request has extended thinking enabled),
+    thinking blocks are preserved verbatim — including their signature — because the
+    API requires the thinking blocks in the latest assistant message to be replayed
+    unmodified during a tool-use loop. When thinking is disabled they are stripped,
+    as they can't be replayed without an active thinking request.
     """
     if not history:
         return history
 
     # Clean assistant content blocks:
     # - Convert SDK objects to plain dicts (SDK objects bypass isinstance(b, dict) checks below)
-    # - Strip thinking blocks (they can't be replayed)
+    # - Strip thinking blocks (they can't be replayed) unless keep_thinking is True
     # - Remove SDK-internal fields like parsed_output that the API rejects
     _KNOWN_TEXT_KEYS = {"type", "text"}
     _KNOWN_TOOL_USE_KEYS = {"type", "id", "name", "input"}
@@ -77,7 +83,10 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
                     b = dict(b.__dict__)
                 if not isinstance(b, dict):
                     continue  # Skip non-dict, non-SDK items we can't process
-                if b.get("type") == "thinking":
+                if b.get("type") in ("thinking", "redacted_thinking"):
+                    if keep_thinking:
+                        # Preserve verbatim — signature must remain unmodified
+                        cleaned.append(b)
                     continue
                 if b.get("type") == "text":
                     cleaned.append({k: v for k, v in b.items() if k in _KNOWN_TEXT_KEYS})
@@ -188,7 +197,7 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
     # Removing orphans can create new orphans (e.g. a tool_result whose tool_use
     # was inside a dropped pair). Re-run until stable.
     if len(sanitized) < len(history):
-        return _sanitize_history(sanitized)
+        return _sanitize_history(sanitized, keep_thinking=keep_thinking)
 
     return sanitized
 
