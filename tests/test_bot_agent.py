@@ -704,6 +704,53 @@ class TestStreamEventHandler:
             await handler({"type": "system", "subtype": "init", "model": "claude-opus-4-7"})
         mock_send.assert_not_called()
 
+    async def test_assistant_text_sent_silently(self):
+        """Progress text/reasoning must not buzz the phone."""
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send:
+            handler = _make_stream_event_handler(7005, bot)
+            await handler({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}})
+        assert mock_send.call_args.kwargs.get("disable_notification") is True
+
+    async def test_tool_use_sent_silently(self):
+        """Tool-use progress lines must not buzz the phone."""
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send:
+            handler = _make_stream_event_handler(7006, bot)
+            await handler(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/x/y.py"}}]},
+                }
+            )
+        assert mock_send.call_args.kwargs.get("disable_notification") is True
+
+    async def test_system_event_sent_silently(self):
+        """Non-init system events (e.g. compaction) must not buzz the phone."""
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send:
+            handler = _make_stream_event_handler(7007, bot)
+            await handler({"type": "system", "subtype": "compact_boundary"})
+        mock_send.assert_awaited()
+        assert mock_send.call_args.kwargs.get("disable_notification") is True
+
+    async def test_result_stats_notifies(self):
+        """The end-of-stream stats line is the single 'your turn' ping — it must notify."""
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send:
+            handler = _make_stream_event_handler(7008, bot)
+            await handler({"type": "result", "num_turns": 3, "usage": {"input_tokens": 100}})
+        mock_send.assert_awaited()
+        assert mock_send.call_args.kwargs.get("disable_notification") in (False, None)
+
 
 class TestRestartCommand:
     """Tests for /restart — kill CC, npm update, relaunch with --resume."""

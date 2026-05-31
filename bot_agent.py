@@ -723,7 +723,9 @@ def _make_stream_event_handler(chat_id: int, bot):
                                     line = await _parse_and_send_markers(chat_id, line, active_repos.get(chat_id), bot)
                                 if line:
                                     pm = "HTML" if btype == "text" else None
-                                    await send_long_message(chat_id, line, bot, parse_mode=pm)
+                                    await send_long_message(
+                                        chat_id, line, bot, parse_mode=pm, disable_notification=True
+                                    )
                             except TelegramError:
                                 pass
             return
@@ -746,7 +748,7 @@ def _make_stream_event_handler(chat_id: int, bot):
                 line = _format_tool_progress({"_type": "system_event", "subtype": subtype})
                 if line:
                     try:
-                        await send_long_message(chat_id, line, bot)
+                        await send_long_message(chat_id, line, bot, disable_notification=True)
                     except TelegramError:
                         pass
             return
