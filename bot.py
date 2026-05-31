@@ -1560,6 +1560,12 @@ async def _process_message(
 
     max_rounds = MAX_TOOL_ROUNDS
 
+    # Extended thinking, if requested, must stay enabled for every round of the tool
+    # loop: the signed thinking blocks in each assistant turn have to be replayed
+    # unmodified alongside the following tool_results, which only the API permits while
+    # thinking is active.
+    use_thinking = _wants_extended_thinking(user_content)
+
     # Shared progress status — the tool loop writes, keep_typing reads
     progress: dict[str, Any] = {"round": 0, "max": max_rounds, "tools": [], "last_update_round": -1}
 
@@ -1583,7 +1589,7 @@ async def _process_message(
 
             # Sanitize before each API call to catch any mid-session corruption
             # (e.g. orphaned tool_use/tool_result from errors in previous rounds)
-            sanitized_messages = _sanitize_history(history)
+            sanitized_messages = _sanitize_history(history, keep_thinking=use_thinking)
             if len(sanitized_messages) != len(history):
                 logger.warning(
                     "Pre-call sanitization fixed history: %d -> %d messages",
@@ -1601,8 +1607,9 @@ async def _process_message(
             }
             if tools:
                 kwargs["tools"] = tools
-            # Enable extended thinking on first round if user requested it
-            if round_num == 0 and _wants_extended_thinking(user_content):
+            # Keep extended thinking enabled for every round once requested, so the
+            # signed thinking blocks preserved in history remain valid to replay.
+            if use_thinking:
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
                 kwargs["max_tokens"] = 16000
 

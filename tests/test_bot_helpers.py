@@ -111,6 +111,47 @@ class TestSanitizeHistory:
         assistant_content = result[1]["content"]
         assert all(b.get("type") != "thinking" for b in assistant_content)
 
+    def test_keeps_thinking_blocks_when_requested(self):
+        from bot import _sanitize_history
+
+        history = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "let me think...", "signature": "sig123"},
+                    {"type": "text", "text": "hi"},
+                ],
+            },
+        ]
+        result = _sanitize_history(history, keep_thinking=True)
+        assistant_content = result[1]["content"]
+        thinking = [b for b in assistant_content if b.get("type") == "thinking"]
+        # The block must be preserved verbatim, signature intact (required for replay)
+        assert len(thinking) == 1
+        assert thinking[0]["signature"] == "sig123"
+        assert thinking[0]["thinking"] == "let me think..."
+
+    def test_keeps_thinking_with_tool_use_pair(self):
+        from bot import _sanitize_history
+
+        history = [
+            {"role": "user", "content": "do X"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                    {"type": "tool_use", "id": "t1", "name": "web_search", "input": {"q": "x"}},
+                ],
+            },
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+        ]
+        result = _sanitize_history(history, keep_thinking=True)
+        # Pair preserved and thinking block still leads the assistant message
+        assert len(result) == 3
+        assert result[1]["content"][0]["type"] == "thinking"
+        assert result[1]["content"][0]["signature"] == "sig"
+
     def test_keeps_complete_tool_pairs(self):
         from bot import _sanitize_history
 
