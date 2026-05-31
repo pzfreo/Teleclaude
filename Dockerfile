@@ -43,6 +43,15 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN curl -fsSL https://github.com/estampo/boo-cloud/releases/latest/download/install.sh \
     | BOO_CLOUD_INSTALL_DIR=/usr/local/bin sh
 
+# Install rtk (Rust Token Killer) — Headroom's CLI "context tool". The agent
+# entrypoint registers an rtk PreToolUse hook in ~/.claude/settings.json that
+# transparently compresses Bash command output before it enters the model's
+# context. Pinned to the version Headroom's `wrap` targets. Needs jq (above).
+ENV RTK_VERSION=v0.28.2
+RUN curl -fsSL "https://github.com/rtk-ai/rtk/releases/download/${RTK_VERSION}/rtk-x86_64-unknown-linux-musl.tar.gz" \
+    | tar -xz -C /usr/local/bin rtk \
+    && chmod +x /usr/local/bin/rtk
+
 # Install agent-browser (Vercel) + its MCP wrapper and Playwright/Chromium.
 # Browsers are installed to /opt/playwright-browsers so the non-root user can read them.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
@@ -76,6 +85,40 @@ RUN uv sync --frozen --no-dev --no-editable
 RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install black \
     && UV_TOOL_BIN_DIR=/usr/local/bin uv tool install ruff \
     && UV_TOOL_BIN_DIR=/usr/local/bin uv tool install mypy
+
+# Install Headroom as an isolated uv tool — provides the `headroom` CLI. The
+# agent entrypoint starts `headroom proxy` and routes the Claude CLI through it
+# via ANTHROPIC_BASE_URL, but ONLY after confirming the proxy is reachable; if
+# it isn't, the entrypoint falls back to the Anthropic API directly (see
+# docker-compose.yml). The [proxy] extra is the lightweight path (structural
+# JSON/code/log compression); it omits the heavy [ml] extra (torch).
+RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install "headroom-ai[proxy]"
+
+# Pre-load Headroom's compression models (kompress ONNX + ModernBERT tokenizer,
+# ~150MB) into the image so the proxy starts fast and OFFLINE at runtime. The
+# original integration broke because the proxy downloaded these from HuggingFace
+# on first boot (~10-30s+), and Claude was pointed at it before it finished →
+# ConnectionRefused. Here we warm the HF cache at build time by briefly running
+# the proxy, verify the model landed, then force offline mode at runtime below.
+ENV HF_HOME=/opt/hf-cache
+RUN set -eu; mkdir -p /opt/hf-cache; \
+    headroom proxy --host 127.0.0.1 --port 8799 > /tmp/preload.log 2>&1 & \
+    PROXY=$!; \
+    for _ in $(seq 1 180); do \
+        if find /opt/hf-cache -name 'kompress-int8.onnx' 2>/dev/null | grep -q .; then break; fi; \
+        if ! kill -0 "$PROXY" 2>/dev/null; then break; fi; \
+        sleep 1; \
+    done; \
+    sleep 2; \
+    kill "$PROXY" 2>/dev/null || true; \
+    if ! find /opt/hf-cache -name 'kompress-int8.onnx' 2>/dev/null | grep -q .; then \
+        echo "Headroom model preload FAILED — boot log:"; cat /tmp/preload.log; exit 1; \
+    fi; \
+    rm -f /tmp/preload.log; \
+    chown -R teleclaude:teleclaude /opt/hf-cache
+# Force offline so the runtime proxy never touches the network for models —
+# fast, deterministic startup that doesn't depend on HuggingFace reachability.
+ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 
 # Copy application code
 COPY *.py VERSION ./
