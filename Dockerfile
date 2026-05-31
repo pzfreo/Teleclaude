@@ -94,6 +94,32 @@ RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install black \
 # JSON/code/log compression); it omits the heavy [ml] extra (torch).
 RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install "headroom-ai[proxy]"
 
+# Pre-load Headroom's compression models (kompress ONNX + ModernBERT tokenizer,
+# ~150MB) into the image so the proxy starts fast and OFFLINE at runtime. The
+# original integration broke because the proxy downloaded these from HuggingFace
+# on first boot (~10-30s+), and Claude was pointed at it before it finished →
+# ConnectionRefused. Here we warm the HF cache at build time by briefly running
+# the proxy, verify the model landed, then force offline mode at runtime below.
+ENV HF_HOME=/opt/hf-cache
+RUN set -eu; mkdir -p /opt/hf-cache; \
+    headroom proxy --host 127.0.0.1 --port 8799 > /tmp/preload.log 2>&1 & \
+    PROXY=$!; \
+    for _ in $(seq 1 180); do \
+        if find /opt/hf-cache -name 'kompress-int8.onnx' 2>/dev/null | grep -q .; then break; fi; \
+        if ! kill -0 "$PROXY" 2>/dev/null; then break; fi; \
+        sleep 1; \
+    done; \
+    sleep 2; \
+    kill "$PROXY" 2>/dev/null || true; \
+    if ! find /opt/hf-cache -name 'kompress-int8.onnx' 2>/dev/null | grep -q .; then \
+        echo "Headroom model preload FAILED — boot log:"; cat /tmp/preload.log; exit 1; \
+    fi; \
+    rm -f /tmp/preload.log; \
+    chown -R teleclaude:teleclaude /opt/hf-cache
+# Force offline so the runtime proxy never touches the network for models —
+# fast, deterministic startup that doesn't depend on HuggingFace reachability.
+ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+
 # Copy application code
 COPY *.py VERSION ./
 
