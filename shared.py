@@ -242,10 +242,13 @@ def _md_render_table(tokens: list) -> str:
 MAX_TELEGRAM_LENGTH = 4096
 
 
-async def send_long_message(chat_id: int, text: str, bot, *, parse_mode: str | None = None) -> None:
+async def send_long_message(
+    chat_id: int, text: str, bot, *, parse_mode: str | None = None, disable_notification: bool = False
+) -> None:
     """Send a message, splitting at line boundaries to respect Telegram's 4096-char limit.
 
     If parse_mode='HTML', text is converted from Markdown to Telegram HTML first.
+    If disable_notification=True, chunks are sent silently (no push notification).
     """
     if not text:
         return
@@ -270,7 +273,9 @@ async def send_long_message(chat_id: int, text: str, bot, *, parse_mode: str | N
         chunks.append("".join(current_parts))
     for chunk in chunks:
         try:
-            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode)
+            await bot.send_message(
+                chat_id=chat_id, text=chunk, parse_mode=parse_mode, disable_notification=disable_notification
+            )
         except TelegramError as e:
             logger.warning("Failed to send message chunk to %d: %s", chat_id, e)
 
