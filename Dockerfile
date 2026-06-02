@@ -92,7 +92,10 @@ RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install black \
 # it isn't, the entrypoint falls back to the Anthropic API directly (see
 # docker-compose.yml). The [proxy] extra is the lightweight path (structural
 # JSON/code/log compression); it omits the heavy [ml] extra (torch).
-RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install "headroom-ai[proxy]"
+# UV_TOOL_DIR is set to /opt/uv-tools so the install lands outside /root/.local/,
+# which the non-root teleclaude user cannot traverse at runtime.
+RUN UV_TOOL_BIN_DIR=/usr/local/bin UV_TOOL_DIR=/opt/uv-tools uv tool install "headroom-ai[proxy]" \
+    && chmod -R a+rX /opt/uv-tools
 
 # Pre-load Headroom's compression models (kompress ONNX + ModernBERT tokenizer,
 # ~150MB) into the image so the proxy starts fast and OFFLINE at runtime. The
