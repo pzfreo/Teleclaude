@@ -151,10 +151,10 @@ CACHE_DIR_NAMES = frozenset(
 
 _files_cache: dict[int, list[Path]] = {}  # chat_id -> file list for inline keyboard
 _ask_options: dict[int, list[str]] = {}  # chat_id -> options for current [ASK:] question
-_last_ctx_tokens: dict[int, int] = {}  # chat_id -> context tokens from last result event
+_compacting: set[int] = set()  # chat IDs with a /compact in flight
 
-# Auto-compact when context approaches the 200K standard window limit.
-# Set lower than 200K to leave headroom for the next turn's prompt + response.
+# Auto-compact when context hits the 200K standard window limit.
+# Overridable via AUTO_COMPACT_THRESHOLD env var (tokens).
 AUTO_COMPACT_THRESHOLD = int(os.getenv("AUTO_COMPACT_THRESHOLD", "200000"))
 
 
@@ -752,8 +752,8 @@ def _make_stream_event_handler(chat_id: int, bot):
                 + usage.get("cache_read_input_tokens", 0)
                 + usage.get("cache_creation_input_tokens", 0)
             )
-            _last_ctx_tokens[chat_id] = ctx_tokens
-            if ctx_tokens >= AUTO_COMPACT_THRESHOLD and claude_code_mgr:
+            if ctx_tokens >= AUTO_COMPACT_THRESHOLD and claude_code_mgr and chat_id not in _compacting:
+                _compacting.add(chat_id)
                 try:
                     await send_long_message(
                         chat_id,
@@ -762,12 +762,14 @@ def _make_stream_event_handler(chat_id: int, bot):
                     )
                     await claude_code_mgr.feed(chat_id, "/compact")
                 except TelegramError:
-                    pass
+                    _compacting.discard(chat_id)
             return
 
         if event_type == "system":
             subtype = event.get("subtype")
             if subtype and subtype != "init":
+                if "compact" in subtype.lower():
+                    _compacting.discard(chat_id)
                 line = _format_tool_progress({"_type": "system_event", "subtype": subtype})
                 if line:
                     try:
@@ -807,7 +809,7 @@ async def new_stream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Clear ONLY this repo's session. Other repos in this chat keep their memory.
     claude_code_mgr.new_session(chat_id, repo)
     save_session_id(chat_id, repo, None)
-    _last_ctx_tokens.pop(chat_id, None)
+    _compacting.discard(chat_id)
 
     await update.message.reply_text("Updating Claude CLI…")
     await _report_cli_update_status(update)
@@ -850,6 +852,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Tear down stream + proc, but DON'T clear the session — we want to resume.
     _stream_mode.discard(chat_id)
+    _compacting.discard(chat_id)
     await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
     await claude_code_mgr.abort(chat_id)
 
