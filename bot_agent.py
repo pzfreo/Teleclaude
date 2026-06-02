@@ -151,6 +151,11 @@ CACHE_DIR_NAMES = frozenset(
 
 _files_cache: dict[int, list[Path]] = {}  # chat_id -> file list for inline keyboard
 _ask_options: dict[int, list[str]] = {}  # chat_id -> options for current [ASK:] question
+_last_ctx_tokens: dict[int, int] = {}  # chat_id -> context tokens from last result event
+
+# Auto-compact when context approaches the 200K standard window limit.
+# Set lower than 200K to leave headroom for the next turn's prompt + response.
+AUTO_COMPACT_THRESHOLD = int(os.getenv("AUTO_COMPACT_THRESHOLD", "200000"))
 
 
 def is_authorized(user_id: int) -> bool:
@@ -740,6 +745,24 @@ def _make_stream_event_handler(chat_id: int, bot):
                         await send_long_message(chat_id, line, bot)
                     except TelegramError:
                         pass
+
+            usage = event.get("usage") or {}
+            ctx_tokens = (
+                usage.get("input_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0)
+            )
+            _last_ctx_tokens[chat_id] = ctx_tokens
+            if ctx_tokens >= AUTO_COMPACT_THRESHOLD and claude_code_mgr:
+                try:
+                    await send_long_message(
+                        chat_id,
+                        f"Context at {ctx_tokens:,} tokens — auto-compacting to stay within standard limit…",
+                        bot,
+                    )
+                    await claude_code_mgr.feed(chat_id, "/compact")
+                except TelegramError:
+                    pass
             return
 
         if event_type == "system":
@@ -784,6 +807,7 @@ async def new_stream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # Clear ONLY this repo's session. Other repos in this chat keep their memory.
     claude_code_mgr.new_session(chat_id, repo)
     save_session_id(chat_id, repo, None)
+    _last_ctx_tokens.pop(chat_id, None)
 
     await update.message.reply_text("Updating Claude CLI…")
     await _report_cli_update_status(update)
