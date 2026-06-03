@@ -152,6 +152,7 @@ CACHE_DIR_NAMES = frozenset(
 _files_cache: dict[int, list[Path]] = {}  # chat_id -> file list for inline keyboard
 _ask_options: dict[int, list[str]] = {}  # chat_id -> options for current [ASK:] question
 _compacting: set[int] = set()  # chat IDs with a /compact in flight
+_last_ctx_tokens: dict[int, int] = {}  # per-call context size from last assistant event
 
 # Auto-compact when context hits the 200K standard window limit.
 # Overridable via AUTO_COMPACT_THRESHOLD env var (tokens).
@@ -714,6 +715,15 @@ def _make_stream_event_handler(chat_id: int, bot):
 
         if event_type == "assistant":
             message = event.get("message", {})
+            # Track per-call context size (not cumulative — that's in the result event).
+            usage = message.get("usage") or {}
+            ctx = (
+                usage.get("input_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0)
+            )
+            if ctx:
+                _last_ctx_tokens[chat_id] = ctx
             content = message.get("content", [])
             if isinstance(content, list):
                 for block in content:
@@ -746,12 +756,7 @@ def _make_stream_event_handler(chat_id: int, bot):
                     except TelegramError:
                         pass
 
-            usage = event.get("usage") or {}
-            ctx_tokens = (
-                usage.get("input_tokens", 0)
-                + usage.get("cache_read_input_tokens", 0)
-                + usage.get("cache_creation_input_tokens", 0)
-            )
+            ctx_tokens = _last_ctx_tokens.get(chat_id, 0)
             if ctx_tokens >= AUTO_COMPACT_THRESHOLD and claude_code_mgr and chat_id not in _compacting:
                 _compacting.add(chat_id)
                 try:
@@ -810,6 +815,7 @@ async def new_stream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     claude_code_mgr.new_session(chat_id, repo)
     save_session_id(chat_id, repo, None)
     _compacting.discard(chat_id)
+    _last_ctx_tokens.pop(chat_id, None)
 
     await update.message.reply_text("Updating Claude CLI…")
     await _report_cli_update_status(update)
@@ -853,6 +859,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     # Tear down stream + proc, but DON'T clear the session — we want to resume.
     _stream_mode.discard(chat_id)
     _compacting.discard(chat_id)
+    _last_ctx_tokens.pop(chat_id, None)
     await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
     await claude_code_mgr.abort(chat_id)
 
