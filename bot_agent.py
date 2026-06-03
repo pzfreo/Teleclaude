@@ -153,6 +153,7 @@ _files_cache: dict[int, list[Path]] = {}  # chat_id -> file list for inline keyb
 _ask_options: dict[int, list[str]] = {}  # chat_id -> options for current [ASK:] question
 _compacting: set[int] = set()  # chat IDs with a /compact in flight
 _last_ctx_tokens: dict[int, int] = {}  # per-call context size from last assistant event
+_autocompact_disabled: set[int] = set()  # chat IDs with auto-compact turned off
 
 # Auto-compact when context hits the 200K standard window limit.
 # Overridable via AUTO_COMPACT_THRESHOLD env var (tokens).
@@ -757,7 +758,12 @@ def _make_stream_event_handler(chat_id: int, bot):
                         pass
 
             ctx_tokens = _last_ctx_tokens.get(chat_id, 0)
-            if ctx_tokens >= AUTO_COMPACT_THRESHOLD and claude_code_mgr and chat_id not in _compacting:
+            if (
+                ctx_tokens >= AUTO_COMPACT_THRESHOLD
+                and claude_code_mgr
+                and chat_id not in _compacting
+                and chat_id not in _autocompact_disabled
+            ):
                 _compacting.add(chat_id)
                 try:
                     await send_long_message(
@@ -1293,6 +1299,19 @@ async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Already in work mode.")
 
 
+async def autocompact_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /autocompact — toggle or show auto-compact status."""
+    if not update.message or not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    if chat_id in _autocompact_disabled:
+        _autocompact_disabled.discard(chat_id)
+        await update.message.reply_text(f"Auto-compact ON (threshold: {AUTO_COMPACT_THRESHOLD:,} tokens)")
+    else:
+        _autocompact_disabled.add(chat_id)
+        await update.message.reply_text("Auto-compact OFF")
+
+
 async def btw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /btw — send a side question to the running process."""
     if not update.message or not is_authorized(update.effective_user.id):
@@ -1522,6 +1541,7 @@ async def notify_startup(app: Application) -> None:
             ("newstream", "Wipe this repo's session and restart fresh"),
             ("restart", "Update Claude CLI and resume this repo's session"),
             ("model", "Show or change AI model"),
+            ("autocompact", "Toggle auto-compact on/off"),
             ("plan", "Toggle plan mode / plan a task"),
             ("branch", "Set active branch"),
             ("work", "Exit plan mode"),
@@ -1607,6 +1627,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cleanup", cleanup_command))
     app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(CommandHandler("work", work_command))
+    app.add_handler(CommandHandler("autocompact", autocompact_command))
     app.add_handler(CommandHandler("btw", btw_command))
     app.add_handler(CommandHandler([str(i) for i in range(1, 6)], repo_shortcut))
     app.add_handler(CallbackQueryHandler(inline_callback))
