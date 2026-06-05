@@ -14,6 +14,7 @@ import re
 import shutil
 import sys
 import time
+from html import escape as _html_escape
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -741,13 +742,11 @@ def _format_review_findings(text: str) -> tuple[str, str, str] | None:
     if not all(isinstance(f, dict) and required <= f.keys() for f in findings):
         return None
 
-    from html import escape
-
     rows: list[str] = []
     for i, f in enumerate(findings, 1):
-        loc = f"{escape(f['file'])}:{f['line']}"
-        summary = escape(f["summary"])
-        scenario = escape(f.get("failure_scenario", ""))
+        loc = f"{_html_escape(f['file'])}:{_html_escape(str(f['line']))}"
+        summary = _html_escape(f["summary"])
+        scenario = _html_escape(f.get("failure_scenario", ""))
         rows.append(f"<b>{i}.</b> <code>{loc}</code>\n{summary}")
         if scenario:
             rows.append(f"<i>{scenario}</i>")
@@ -865,8 +864,8 @@ def _make_stream_event_handler(chat_id: int, bot):
                                 else:
                                     # Tool use = transient progress → edit-in-place
                                     await _update_progress(chat_id, line, bot)
-                            except TelegramError:
-                                pass
+                            except TelegramError as exc:
+                                logger.warning("Failed to send content to %d: %s", chat_id, exc)
             return
 
         if event_type == "result":

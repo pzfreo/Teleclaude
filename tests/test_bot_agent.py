@@ -966,6 +966,19 @@ class TestFormatReviewFindings:
         assert "<b>1.</b>" in html_table
         assert "<i>" not in html_table
 
+    def test_line_field_is_html_escaped(self):
+        import json
+
+        from bot_agent import _format_review_findings
+
+        findings = [{"file": "a.py", "line": '<script>"xss"</script>', "summary": "Bug"}]
+        text = _wrap_findings(json.dumps(findings))
+        result = _format_review_findings(text)
+        assert result is not None
+        html_table, _, _ = result
+        assert "<script>" not in html_table
+        assert "&lt;script&gt;" in html_table
+
 
 class TestRestartCommand:
     """Tests for /restart — kill CC, npm update, relaunch with --resume."""
