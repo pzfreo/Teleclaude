@@ -497,6 +497,7 @@ class TestNewStream:
             patch("bot_agent.save_session_id") as mock_save_session,
             patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
             patch("bot_agent.claude_code_mgr") as mock_mgr,
+            patch("bot_agent._clear_progress", new_callable=AsyncMock) as mock_clear,
         ):
             mock_mgr.stop_stream = AsyncMock()
             mock_mgr.abort = AsyncMock(return_value=False)
@@ -505,6 +506,7 @@ class TestNewStream:
             bot_agent._stream_mode.discard(6002)
             await new_stream(update, ctx)
         assert 6002 in bot_agent._stream_mode
+        mock_clear.assert_awaited_once_with(6002, ctx.bot)
         mock_mgr.start_stream.assert_awaited_once()
         # /newstream clears only THIS repo's session
         mock_mgr.new_session.assert_called_once_with(6002, "owner/repo")
@@ -640,10 +642,12 @@ class TestNewStream:
             with (
                 patch("bot_agent.is_authorized", return_value=True),
                 patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("bot_agent._clear_progress", new_callable=AsyncMock) as mock_clear,
             ):
                 mock_mgr.abort = AsyncMock(return_value=False)
                 await stop_work(update, ctx)
             assert 6006 not in bot_agent._stream_mode
+            mock_clear.assert_awaited_once_with(6006, ctx.bot)
             text = update.message.reply_text.call_args[0][0]
             assert "Stream stopped" in text
         finally:
@@ -885,6 +889,7 @@ class TestRestartCommand:
                 patch("bot_agent.load_session_id", return_value=None),
                 patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
                 patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("bot_agent._clear_progress", new_callable=AsyncMock) as mock_clear,
             ):
                 # Existing in-memory session
                 mock_mgr.get_session_id = MagicMock(return_value="resume-me-1234")
@@ -894,6 +899,7 @@ class TestRestartCommand:
                 mock_mgr.start_stream = AsyncMock()
                 await restart_command(update, ctx)
 
+            mock_clear.assert_awaited_once_with(8102, ctx.bot)
             # Session must NOT be cleared by /restart
             mock_mgr.new_session.assert_not_called()
             # Stream is relaunched
@@ -994,11 +1000,13 @@ class TestCancelCommand:
         with (
             patch("bot_agent.is_authorized", return_value=True),
             patch("bot_agent.claude_code_mgr") as mock_mgr,
+            patch("bot_agent._clear_progress", new_callable=AsyncMock) as mock_clear,
         ):
             mock_mgr.has_running_proc = MagicMock(return_value=True)
             mock_mgr.interrupt = AsyncMock(return_value=True)
             await cancel_work(update, ctx)
         mock_mgr.interrupt.assert_awaited_once_with(8002)
+        mock_clear.assert_awaited_once_with(8002, ctx.bot)
         text = update.message.reply_text.call_args[0][0]
         assert "interrupt" in text.lower()
         assert "preserved" in text.lower()

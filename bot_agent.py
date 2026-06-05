@@ -659,6 +659,7 @@ async def cancel_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     sent = await claude_code_mgr.interrupt(chat_id)
     if sent:
         _stop_stream_typing(chat_id)
+        await _clear_progress(chat_id, context.bot)
         await update.message.reply_text("Interrupt sent. Session preserved — send a new message to continue.")
     else:
         await update.message.reply_text(
@@ -673,6 +674,7 @@ async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     was_streaming = chat_id in _stream_mode
     _stream_mode.discard(chat_id)
     _stop_stream_typing(chat_id)
+    await _clear_progress(chat_id, context.bot)
     was_running = await claude_code_mgr.abort(chat_id)
     if was_streaming:
         await update.message.reply_text("Stream stopped.")
@@ -864,6 +866,7 @@ async def new_stream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     # Tear down any existing stream / process for this chat.
     _stream_mode.discard(chat_id)
+    await _clear_progress(chat_id, context.bot)
     await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
     await claude_code_mgr.abort(chat_id)
 
@@ -916,6 +919,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     _stream_mode.discard(chat_id)
     _compacting.discard(chat_id)
     _last_ctx_tokens.pop(chat_id, None)
+    await _clear_progress(chat_id, context.bot)
     await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
     await claude_code_mgr.abort(chat_id)
 
