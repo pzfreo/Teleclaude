@@ -16,7 +16,7 @@ import time
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -733,8 +733,12 @@ async def _update_progress(chat_id: int, line: str, bot) -> None:
         try:
             await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
             return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+            _progress_msg_ids.pop(chat_id, None)
         except TelegramError:
-            # Message may have been deleted or text unchanged — send a new one
+            # Message may have been deleted — send a new one
             _progress_msg_ids.pop(chat_id, None)
     try:
         msg = await bot.send_message(chat_id=chat_id, text=text, disable_notification=True)
