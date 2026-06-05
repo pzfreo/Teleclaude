@@ -127,6 +127,11 @@ _stream_mode: set[int] = set()  # chat IDs with /newstream continuous mode
 _typing_tasks: dict[int, asyncio.Task] = {}
 _frag_buffers: dict[int, str] = {}  # chat_id -> buffered text from split pastes
 _frag_tasks: dict[int, asyncio.Task] = {}  # chat_id -> pending flush task
+# Per-chat ephemeral progress message: chat_id -> message_id of the live status line
+_progress_msg_ids: dict[int, int] = {}
+# Accumulated progress lines for the current turn (displayed as a single edited message)
+_progress_lines: dict[int, list[str]] = {}
+MAX_PROGRESS_LINES = 6  # keep last N lines in the progress message
 
 _MIME_TO_EXT = {
     "image/jpeg": ".jpg",
@@ -708,6 +713,45 @@ async def _report_cli_update_status(update: Update) -> None:
             await update.message.reply_text(f"Claude CLI version: {version}")
 
 
+async def _update_progress(chat_id: int, line: str, bot) -> None:
+    """Append a line to the ephemeral progress message (edit-in-place).
+
+    Sends a new silent message on the first call per turn; subsequent calls
+    edit it. Keeps only the last MAX_PROGRESS_LINES lines so the message
+    stays compact.
+    """
+    lines = _progress_lines.setdefault(chat_id, [])
+    lines.append(line)
+    if len(lines) > MAX_PROGRESS_LINES:
+        del lines[: len(lines) - MAX_PROGRESS_LINES]
+    text = "\n".join(lines)
+
+    msg_id = _progress_msg_ids.get(chat_id)
+    if msg_id:
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
+            return
+        except TelegramError:
+            # Message may have been deleted or text unchanged — send a new one
+            _progress_msg_ids.pop(chat_id, None)
+    try:
+        msg = await bot.send_message(chat_id=chat_id, text=text, disable_notification=True)
+        _progress_msg_ids[chat_id] = msg.message_id
+    except TelegramError:
+        pass
+
+
+async def _clear_progress(chat_id: int, bot) -> None:
+    """Delete the ephemeral progress message and reset state."""
+    msg_id = _progress_msg_ids.pop(chat_id, None)
+    _progress_lines.pop(chat_id, None)
+    if msg_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except TelegramError:
+            pass
+
+
 def _make_stream_event_handler(chat_id: int, bot):
     """Build an on_event callback that renders CC stream-json events into Telegram."""
 
@@ -736,18 +780,23 @@ def _make_stream_event_handler(chat_id: int, bot):
                         if line:
                             try:
                                 if btype == "text":
+                                    # Text = actual Claude response → clear progress, send permanently
+                                    await _clear_progress(chat_id, bot)
                                     line = await _parse_and_send_markers(chat_id, line, active_repos.get(chat_id), bot)
-                                if line:
-                                    pm = "HTML" if btype == "text" else None
-                                    await send_long_message(
-                                        chat_id, line, bot, parse_mode=pm, disable_notification=True
-                                    )
+                                    if line:
+                                        await send_long_message(
+                                            chat_id, line, bot, parse_mode="HTML", disable_notification=True
+                                        )
+                                else:
+                                    # Tool use = transient progress → edit-in-place
+                                    await _update_progress(chat_id, line, bot)
                             except TelegramError:
                                 pass
             return
 
         if event_type == "result":
             _stop_stream_typing(chat_id)
+            await _clear_progress(chat_id, bot)
             stats = {k: event[k] for k in ("cost_usd", "num_turns", "usage") if k in event}
             if stats:
                 line = _format_tool_progress({"_type": "stats", **stats})
@@ -784,7 +833,7 @@ def _make_stream_event_handler(chat_id: int, bot):
                 line = _format_tool_progress({"_type": "system_event", "subtype": subtype})
                 if line:
                     try:
-                        await send_long_message(chat_id, line, bot, disable_notification=True)
+                        await _update_progress(chat_id, line, bot)
                     except TelegramError:
                         pass
             return
@@ -792,6 +841,7 @@ def _make_stream_event_handler(chat_id: int, bot):
         # Synthetic stream-end signal emitted by ClaudeCodeManager._stream_forever
         if event.get("_type") == "stream_end":
             _stop_stream_typing(chat_id)
+            await _clear_progress(chat_id, bot)
             _stream_mode.discard(chat_id)
             try:
                 await send_long_message(chat_id, "Stream ended — send a message to continue.", bot)

@@ -523,6 +523,8 @@ chat_plan_mode: dict[int, bool] = {}
 _chat_locks: dict[int, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
 # Per-chat cancel events for ! interrupt
 _cancel_events: dict[int, asyncio.Event] = {}
+# Per-chat ephemeral progress message for keep_typing
+_progress_msg_ids: dict[int, int] = {}
 # Per-chat rate limiting: chat_id -> list of message timestamps
 RATE_LIMIT_MESSAGES = 10  # max messages per window
 RATE_LIMIT_WINDOW = 60  # window in seconds
@@ -693,42 +695,60 @@ def _wants_extended_thinking(user_content) -> bool:
 
 
 async def keep_typing(chat, stop_event: asyncio.Event, start_time: float, bot, status: dict):
-    """Keep the typing indicator alive and send progress updates.
+    """Keep the typing indicator alive and update an ephemeral progress message.
 
     status dict is shared with the tool loop:
       - status["round"]: current tool round number
       - status["max"]: max tool rounds
       - status["tools"]: list of tool names called so far
       - status["last_update_round"]: last round we sent a progress message for
+
+    Progress is shown as a single message that's edited in-place and deleted
+    when the response is ready, keeping the chat history clean.
     """
     last_update_round = -1
+    chat_id = chat.id
     while not stop_event.is_set():
         try:
             await chat.send_action("typing")
         except TelegramError:
-            pass  # chat may have been deleted or bot blocked
+            pass
         elapsed = time.time() - start_time
         current_round = status.get("round", 0)
-        # Send a progress update when: enough time has passed AND there's new tool activity
         if elapsed > PROGRESS_INTERVAL and current_round > last_update_round:
             tools_used = status.get("tools", [])
             max_rounds = status.get("max", 15)
             if tools_used:
-                recent = tools_used[-3:]  # last 3 tools
+                recent = tools_used[-3:]
                 tool_summary = ", ".join(recent)
-                msg = f"[{current_round}/{max_rounds}] {tool_summary}"
+                text = f"[{current_round}/{max_rounds}] {tool_summary}"
             else:
-                msg = "Thinking..."
-            try:
-                await bot.send_message(chat_id=chat.id, text=msg)
-            except TelegramError:
-                pass
+                text = "Thinking..."
+            msg_id = _progress_msg_ids.get(chat_id)
+            if msg_id:
+                try:
+                    await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
+                except TelegramError:
+                    _progress_msg_ids.pop(chat_id, None)
+            if chat_id not in _progress_msg_ids:
+                try:
+                    msg = await bot.send_message(chat_id=chat_id, text=text, disable_notification=True)
+                    _progress_msg_ids[chat_id] = msg.message_id
+                except TelegramError:
+                    pass
             last_update_round = current_round
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=TYPING_INTERVAL)
             break
         except TimeoutError:
             continue
+    # Clean up the ephemeral progress message
+    msg_id = _progress_msg_ids.pop(chat_id, None)
+    if msg_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except TelegramError:
+            pass
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
