@@ -7,6 +7,7 @@ VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 import asyncio
 import datetime
 import io
+import json
 import logging
 import os
 import re
@@ -715,6 +716,49 @@ async def _report_cli_update_status(update: Update) -> None:
             await update.message.reply_text(f"Claude CLI version: {version}")
 
 
+_FINDINGS_RE = re.compile(
+    r"```(?:json)?\s*\n(\[\s*\{.*?\}\s*\])\s*\n```",
+    re.DOTALL,
+)
+
+
+def _format_review_findings(text: str) -> tuple[str, str, str] | None:
+    """Detect a JSON array of code-review findings in *text*.
+
+    Returns ``(html_table, pretty_json, remaining_text)`` or ``None``.
+    *remaining_text* is the original markdown with the JSON code-block removed.
+    """
+    m = _FINDINGS_RE.search(text)
+    if not m:
+        return None
+    try:
+        findings = json.loads(m.group(1))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(findings, list) or not findings:
+        return None
+    required = {"file", "line", "summary"}
+    if not all(isinstance(f, dict) and required <= f.keys() for f in findings):
+        return None
+
+    from html import escape
+
+    rows: list[str] = []
+    for i, f in enumerate(findings, 1):
+        loc = f"{escape(f['file'])}:{f['line']}"
+        summary = escape(f["summary"])
+        scenario = escape(f.get("failure_scenario", ""))
+        rows.append(f"<b>{i}.</b> <code>{loc}</code>\n{summary}")
+        if scenario:
+            rows.append(f"<i>{scenario}</i>")
+
+    html_table = "\n\n".join(rows)
+    pretty_json = json.dumps(findings, indent=2)
+    remaining = text[: m.start()] + text[m.end() :]
+    remaining = re.sub(r"\n{3,}", "\n\n", remaining).strip()
+    return html_table, pretty_json, remaining
+
+
 async def _update_progress(chat_id: int, line: str, bot) -> None:
     """Append a line to the ephemeral progress message (edit-in-place).
 
@@ -790,9 +834,34 @@ def _make_stream_event_handler(chat_id: int, bot):
                                     await _clear_progress(chat_id, bot)
                                     line = await _parse_and_send_markers(chat_id, line, active_repos.get(chat_id), bot)
                                     if line:
-                                        await send_long_message(
-                                            chat_id, line, bot, parse_mode="HTML", disable_notification=True
-                                        )
+                                        findings = _format_review_findings(line)
+                                        if findings:
+                                            html_table, pretty_json, remaining = findings
+                                            if remaining:
+                                                await send_long_message(
+                                                    chat_id,
+                                                    remaining,
+                                                    bot,
+                                                    parse_mode="HTML",
+                                                    disable_notification=True,
+                                                )
+                                            await send_long_message(
+                                                chat_id,
+                                                html_table,
+                                                bot,
+                                                parse_mode="HTML",
+                                                raw=True,
+                                                disable_notification=True,
+                                            )
+                                            doc = io.BytesIO(pretty_json.encode())
+                                            doc.name = "findings.json"
+                                            await bot.send_document(
+                                                chat_id=chat_id, document=doc, disable_notification=True
+                                            )
+                                        else:
+                                            await send_long_message(
+                                                chat_id, line, bot, parse_mode="HTML", disable_notification=True
+                                            )
                                 else:
                                     # Tool use = transient progress → edit-in-place
                                     await _update_progress(chat_id, line, bot)
