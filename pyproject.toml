@@ -13,7 +13,7 @@ dependencies = [
     "google-api-python-client>=2.100.0",
     "google-auth>=2.23.0",
     "google-auth-oauthlib>=1.1.0",
-    "aiohttp>=3.9.0",
+    "aiohttp>=3.14.0",
     "openai>=1.0.0",
     "mcp>=1.0.0",
     "zeep>=4.2.0",
@@ -157,3 +157,4 @@ omit = [
 show_missing = true
 skip_empty = true
 fail_under = 55
+
