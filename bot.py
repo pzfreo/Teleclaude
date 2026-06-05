@@ -21,7 +21,7 @@ from typing import Any
 import anthropic
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -728,6 +728,9 @@ async def keep_typing(chat, stop_event: asyncio.Event, start_time: float, bot, s
             if msg_id:
                 try:
                     await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
+                except BadRequest as e:
+                    if "not modified" not in str(e).lower():
+                        _progress_msg_ids.pop(chat_id, None)
                 except TelegramError:
                     _progress_msg_ids.pop(chat_id, None)
             if chat_id not in _progress_msg_ids:
