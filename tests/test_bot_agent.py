@@ -772,6 +772,36 @@ class TestStreamEventHandler:
         mock_send.assert_awaited()
         assert mock_send.call_args.kwargs.get("disable_notification") in (False, None)
 
+    async def test_findings_sends_table_and_json_file(self):
+        """When text contains review findings JSON, send HTML table + .json file."""
+        import json
+
+        from bot_agent import _make_stream_event_handler
+
+        findings = [{"file": "a.py", "line": 1, "summary": "Bug", "failure_scenario": "Crash"}]
+        text = f"Review:\n\n```json\n{json.dumps(findings)}\n```\n\nDone."
+        bot = AsyncMock()
+        bot.send_document = AsyncMock()
+        with (
+            patch("bot_agent._clear_progress", new_callable=AsyncMock),
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            handler = _make_stream_event_handler(7009, bot)
+            await handler({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+        # Should have sent: (1) remaining prose, (2) HTML table
+        assert mock_send.await_count == 2
+        # First call: remaining prose (markdown → HTML)
+        first_call = mock_send.call_args_list[0]
+        assert first_call.kwargs.get("raw") in (False, None)
+        # Second call: HTML table (raw=True)
+        second_call = mock_send.call_args_list[1]
+        assert second_call.kwargs.get("raw") is True
+        # JSON file attachment
+        bot.send_document.assert_awaited_once()
+        doc_arg = bot.send_document.call_args.kwargs.get("document")
+        content = json.loads(doc_arg.read())
+        assert content[0]["file"] == "a.py"
+
 
 class TestEphemeralProgress:
     """Test _update_progress and _clear_progress ephemeral message helpers."""
@@ -855,6 +885,99 @@ class TestEphemeralProgress:
         bot_agent._progress_msg_ids.pop(5005, None)
         await _clear_progress(5005, bot)
         bot.delete_message.assert_not_called()
+
+
+_SAMPLE_FINDINGS = [
+    {
+        "file": "src/main.py",
+        "line": 42,
+        "summary": "Off-by-one in loop",
+        "failure_scenario": "Array index out of bounds on empty input",
+    },
+    {
+        "file": "src/utils.py",
+        "line": 10,
+        "summary": "Missing null check",
+        "failure_scenario": "Crashes when config is absent",
+    },
+]
+
+
+def _wrap_findings(findings_json: str) -> str:
+    return f"Here are the findings:\n\n```json\n{findings_json}\n```\n\nPlease review."
+
+
+class TestFormatReviewFindings:
+    """Test _format_review_findings JSON detection and HTML formatting."""
+
+    def test_detects_and_formats_findings(self):
+        import json
+
+        from bot_agent import _format_review_findings
+
+        text = _wrap_findings(json.dumps(_SAMPLE_FINDINGS))
+        result = _format_review_findings(text)
+        assert result is not None
+        html_table, pretty_json, remaining = result
+        assert "<b>1.</b>" in html_table
+        assert "src/main.py:42" in html_table
+        assert "Off-by-one" in html_table
+        assert "<i>Array index out of bounds" in html_table
+        assert "<b>2.</b>" in html_table
+        parsed = json.loads(pretty_json)
+        assert len(parsed) == 2
+        assert "Please review" in remaining
+        assert "```" not in remaining
+
+    def test_returns_none_for_non_json(self):
+        from bot_agent import _format_review_findings
+
+        assert _format_review_findings("Just a normal message") is None
+
+    def test_returns_none_for_non_findings_json(self):
+        from bot_agent import _format_review_findings
+
+        text = '```json\n{"key": "value"}\n```'
+        assert _format_review_findings(text) is None
+
+    def test_returns_none_for_missing_required_keys(self):
+        import json
+
+        from bot_agent import _format_review_findings
+
+        text = _wrap_findings(json.dumps([{"file": "a.py", "summary": "x"}]))
+        assert _format_review_findings(text) is None
+
+    def test_empty_array_returns_none(self):
+        from bot_agent import _format_review_findings
+
+        assert _format_review_findings("```json\n[]\n```") is None
+
+    def test_finding_without_failure_scenario(self):
+        import json
+
+        from bot_agent import _format_review_findings
+
+        findings = [{"file": "a.py", "line": 1, "summary": "Bug"}]
+        text = _wrap_findings(json.dumps(findings))
+        result = _format_review_findings(text)
+        assert result is not None
+        html_table, _, _ = result
+        assert "<b>1.</b>" in html_table
+        assert "<i>" not in html_table
+
+    def test_line_field_is_html_escaped(self):
+        import json
+
+        from bot_agent import _format_review_findings
+
+        findings = [{"file": "a.py", "line": '<script>"xss"</script>', "summary": "Bug"}]
+        text = _wrap_findings(json.dumps(findings))
+        result = _format_review_findings(text)
+        assert result is not None
+        html_table, _, _ = result
+        assert "<script>" not in html_table
+        assert "&lt;script&gt;" in html_table
 
 
 class TestRestartCommand:
