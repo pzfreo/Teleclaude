@@ -65,8 +65,13 @@ services:
         else
           runuser -u teleclaude -- sh -c "
             mkdir -p /home/teleclaude/.headroom/logs
-            nohup headroom proxy --host 127.0.0.1 --port $${HEADROOM_PORT} \
-              > /home/teleclaude/.headroom/logs/proxy.boot.log 2>&1 &
+            while true; do
+              headroom proxy --host 127.0.0.1 --port $${HEADROOM_PORT} \
+                >> /home/teleclaude/.headroom/logs/proxy.boot.log 2>&1
+              echo \"[headroom] proxy exited at \$$(date -Iseconds), restarting in 5s...\" \
+                >> /home/teleclaude/.headroom/logs/proxy.boot.log
+              sleep 5
+            done &
           " || true
           # Cold start is slow: ~7s for imports plus a one-time HuggingFace
           # model download (kompress + ModernBERT) on a fresh container, so we
