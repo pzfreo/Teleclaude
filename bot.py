@@ -84,6 +84,7 @@ CLAUDE_SESSION_KEY = os.getenv("CLAUDE_SESSION_KEY", "")
 CLAUDE_ORG_ID = os.getenv("CLAUDE_ORG_ID", "")
 
 AVAILABLE_MODELS = {
+    "fable": "claude-fable-5",
     "opus": "claude-opus-4-6",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
@@ -100,7 +101,7 @@ def _resolve_latest_models(fallback: dict[str, str]) -> dict[str, str]:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
         models = list(client.models.list(limit=50).data)
         result = dict(fallback)
-        for family in ("opus", "sonnet", "haiku"):
+        for family in ("fable", "opus", "sonnet", "haiku"):
             candidates = [m for m in models if f"claude-{family}-" in m.id]
             if candidates:
                 candidates.sort(key=lambda m: m.created_at, reverse=True)

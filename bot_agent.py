@@ -67,6 +67,7 @@ CREDENTIALS_PORT = int(os.getenv("CREDENTIALS_PORT", "0"))
 # Use Claude Code CLI aliases — the CLI resolves these to the latest version
 # per family, so new model releases don't require a bot redeploy.
 AVAILABLE_MODELS = {
+    "fable": "fable",
     "opus": "opus",
     "sonnet": "sonnet",
     "haiku": "haiku",
