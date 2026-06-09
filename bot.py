@@ -101,7 +101,7 @@ def _resolve_latest_models(fallback: dict[str, str]) -> dict[str, str]:
         client = Anthropic(api_key=ANTHROPIC_API_KEY)
         models = list(client.models.list(limit=50).data)
         result = dict(fallback)
-        for family in ("fable", "opus", "sonnet", "haiku"):
+        for family in fallback:
             candidates = [m for m in models if f"claude-{family}-" in m.id]
             if candidates:
                 candidates.sort(key=lambda m: m.created_at, reverse=True)
@@ -752,7 +752,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/repo - Show current repo and branch\n"
         "/branch name - Set active branch (/branch clear to reset)\n"
         "/new - Start a fresh conversation\n"
-        "/model - Show or switch Claude model (opus/sonnet/haiku)\n"
+        "/model - Show or switch Claude model (fable/opus/sonnet/haiku)\n"
         "/plan - Toggle plan mode (outline before executing)\n"
         "/todo - Show current task list (/todo clear to reset)\n"
         "/pulse - Autonomous agent status and config\n"

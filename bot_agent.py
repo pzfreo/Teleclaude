@@ -15,7 +15,7 @@ import sys
 import time
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -420,7 +420,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/newstream - Wipe this repo's session and restart fresh (updates CLI)\n"
         "/restart - Restart CC and resume this repo's last session (updates CLI)\n"
         "/update - Update Claude CLI to latest version\n"
-        "/model - Show or switch model (opus/sonnet/haiku)\n"
+        "/model - Show or switch model (fable/opus/sonnet/haiku)\n"
         "/logs [min] - Download recent logs\n"
         "/version - Show bot version\n"
         "/df - Show free disk space and workspace sizes\n"
@@ -853,6 +853,22 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(usage)
 
 
+async def _warn_if_model_unresolvable(chat_id: int, model_id: str, bot: Bot) -> None:
+    """Warn the user if the CLI can't resolve a newly selected model.
+
+    An outdated CLI fails silently on unknown aliases (the init event never
+    arrives and runs just hang), so surface it explicitly at switch time.
+    """
+    try:
+        if await claude_code_mgr.probe_resolved_model(model_id) is None:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Claude CLI could not resolve '{model_id}' — the CLI may be outdated. Try /update.",
+            )
+    except Exception as e:
+        logger.warning("Model resolution check for %s failed: %s", model_id, e)
+
+
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
@@ -890,6 +906,7 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     save_model(chat_id, model_id)
     claude_code_mgr.clear_last_model(chat_id)
     await update.message.reply_text(f"Model switched to: {model_id}")
+    await _warn_if_model_unresolvable(chat_id, model_id, context.bot)
 
 
 async def send_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1014,6 +1031,7 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         save_model(chat_id, model_id)
         claude_code_mgr.clear_last_model(chat_id)
         await query.edit_message_text(f"Model switched to: {model_id}")
+        await _warn_if_model_unresolvable(chat_id, model_id, context.bot)
 
     elif data.startswith("ask_agent:"):
         parts = data.split(":")
