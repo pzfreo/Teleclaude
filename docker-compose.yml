@@ -32,6 +32,14 @@ services:
             /opt/teleclaude-agent/CLAUDE.md \
             /home/teleclaude/.claude/CLAUDE.md
         fi
+        # Write boo-cloud credentials from env to the default config path so
+        # boocloud-mcp finds them without needing any env var at runtime.
+        if [ -n "$BOO_CLOUD_CREDENTIALS_TOML" ]; then
+          mkdir -p /home/teleclaude/.config/boo-cloud
+          printf '%s' "$BOO_CLOUD_CREDENTIALS_TOML" > /home/teleclaude/.config/boo-cloud/credentials.toml
+          chmod 600 /home/teleclaude/.config/boo-cloud/credentials.toml
+          chown -R teleclaude:teleclaude /home/teleclaude/.config/boo-cloud
+        fi
         # Register build123d-mcp globally (user scope). Remove first so this is
         # idempotent across restarts. uvx --refresh fetches the latest PyPI
         # release on each session start, providing automatic updates.
@@ -41,6 +49,52 @@ services:
           claude mcp remove boo-cloud 2>/dev/null
           claude mcp add -s user boo-cloud -- boocloud-mcp
         '
+        # ── Headroom context compression (fail-safe) ─────────────────────
+        # Start the Headroom proxy and route the Claude CLI through it via
+        # ANTHROPIC_BASE_URL, but ONLY after confirming the proxy actually
+        # accepts connections. If it never comes up, fall back to the Anthropic
+        # API directly so the bot still works — exporting ANTHROPIC_BASE_URL to
+        # a dead port is what previously broke the agent ("ConnectionRefused"
+        # on the first message). Every branch logs which path it took, visible
+        # via `docker compose logs teleclaude-agent`. Set HEADROOM_ENABLED=0 in
+        # .env.agent to skip Headroom entirely without a rebuild.
+        HEADROOM_PORT=8787
+        if [ "$${HEADROOM_ENABLED:-1}" = "0" ] || [ "$${HEADROOM_ENABLED:-1}" = "false" ]; then
+          echo "[headroom] disabled by HEADROOM_ENABLED — Claude uses the Anthropic API directly."
+          timeout 10 runuser -u teleclaude -- rtk init --global --uninstall < /dev/null > /dev/null 2>&1 || true
+        else
+          runuser -u teleclaude -- sh -c "
+            mkdir -p /home/teleclaude/.headroom/logs
+            while true; do
+              headroom proxy --host 127.0.0.1 --port $${HEADROOM_PORT} \
+                >> /home/teleclaude/.headroom/logs/proxy.boot.log 2>&1
+              echo \"[headroom] proxy exited at \$$(date -Iseconds), restarting in 5s...\" \
+                >> /home/teleclaude/.headroom/logs/proxy.boot.log
+              sleep 5
+            done &
+          " || true
+          # Cold start is slow: ~7s for imports plus a one-time HuggingFace
+          # model download (kompress + ModernBERT) on a fresh container, so we
+          # wait up to ~60s for the port to accept connections.
+          HEADROOM_UP=0
+          for i in $$(seq 1 120); do
+            if (exec 3<>/dev/tcp/127.0.0.1/$${HEADROOM_PORT}) 2>/dev/null; then
+              HEADROOM_UP=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$$HEADROOM_UP" = "1" ]; then
+            export ANTHROPIC_BASE_URL=http://127.0.0.1:$${HEADROOM_PORT}
+            echo "[headroom] proxy UP on 127.0.0.1:$${HEADROOM_PORT} after ~$$((i / 2))s — routing Claude through it (ANTHROPIC_BASE_URL set)."
+            timeout 20 runuser -u teleclaude -- rtk init --global --auto-patch < /dev/null || true
+          else
+            unset ANTHROPIC_BASE_URL
+            echo "[headroom] WARNING: proxy did NOT come up on 127.0.0.1:$${HEADROOM_PORT} within ~60s — DISABLING Headroom; Claude will use the Anthropic API directly. Proxy boot log follows:" >&2
+            tail -n 30 /home/teleclaude/.headroom/logs/proxy.boot.log 2>/dev/null >&2 || true
+            timeout 10 runuser -u teleclaude -- rtk init --global --uninstall < /dev/null > /dev/null 2>&1 || true
+          fi
+        fi
         exec runuser -u teleclaude -- python bot_agent.py
     volumes:
       - teleclaude-agent-data:/app/data

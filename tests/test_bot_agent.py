@@ -497,6 +497,7 @@ class TestNewStream:
             patch("bot_agent.save_session_id") as mock_save_session,
             patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
             patch("bot_agent.claude_code_mgr") as mock_mgr,
+            patch("bot_agent._clear_progress", new_callable=AsyncMock) as mock_clear,
         ):
             mock_mgr.stop_stream = AsyncMock()
             mock_mgr.abort = AsyncMock(return_value=False)
@@ -505,6 +506,7 @@ class TestNewStream:
             bot_agent._stream_mode.discard(6002)
             await new_stream(update, ctx)
         assert 6002 in bot_agent._stream_mode
+        mock_clear.assert_awaited_once_with(6002, ctx.bot)
         mock_mgr.start_stream.assert_awaited_once()
         # /newstream clears only THIS repo's session
         mock_mgr.new_session.assert_called_once_with(6002, "owner/repo")
@@ -640,10 +642,12 @@ class TestNewStream:
             with (
                 patch("bot_agent.is_authorized", return_value=True),
                 patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("bot_agent._clear_progress", new_callable=AsyncMock) as mock_clear,
             ):
                 mock_mgr.abort = AsyncMock(return_value=False)
                 await stop_work(update, ctx)
             assert 6006 not in bot_agent._stream_mode
+            mock_clear.assert_awaited_once_with(6006, ctx.bot)
             text = update.message.reply_text.call_args[0][0]
             assert "Stream stopped" in text
         finally:
@@ -653,22 +657,25 @@ class TestNewStream:
 class TestStreamEventHandler:
     """Test the on_event callback built by _make_stream_event_handler."""
 
-    async def test_assistant_text_posts_to_chat(self):
+    async def test_assistant_text_clears_progress_and_posts(self):
         from bot_agent import _make_stream_event_handler
 
         bot = AsyncMock()
-        with patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send:
+        with (
+            patch("bot_agent._clear_progress", new_callable=AsyncMock) as mock_clear,
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
             handler = _make_stream_event_handler(7001, bot)
             await handler({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}})
+        mock_clear.assert_awaited_once()
         mock_send.assert_awaited()
-        # chat_id argument passed through
         assert mock_send.call_args[0][0] == 7001
 
-    async def test_tool_use_block_posts_formatted_line(self):
+    async def test_tool_use_block_updates_progress(self):
         from bot_agent import _make_stream_event_handler
 
         bot = AsyncMock()
-        with patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send:
+        with patch("bot_agent._update_progress", new_callable=AsyncMock) as mock_progress:
             handler = _make_stream_event_handler(7002, bot)
             await handler(
                 {
@@ -676,20 +683,24 @@ class TestStreamEventHandler:
                     "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/x/y/z.py"}}]},
                 }
             )
-        mock_send.assert_awaited()
-        text = mock_send.call_args[0][1]
+        mock_progress.assert_awaited()
+        text = mock_progress.call_args[0][1]
         assert "Reading" in text
 
-    async def test_stream_end_clears_mode(self):
+    async def test_stream_end_clears_progress_and_mode(self):
         import bot_agent
         from bot_agent import _make_stream_event_handler
 
         bot_agent._stream_mode.add(7003)
         try:
             bot = AsyncMock()
-            with patch("bot_agent.send_long_message", new_callable=AsyncMock):
+            with (
+                patch("bot_agent._clear_progress", new_callable=AsyncMock) as mock_clear,
+                patch("bot_agent.send_long_message", new_callable=AsyncMock),
+            ):
                 handler = _make_stream_event_handler(7003, bot)
                 await handler({"_type": "stream_end", "reason": "eof"})
+            mock_clear.assert_awaited_once()
             assert 7003 not in bot_agent._stream_mode
         finally:
             bot_agent._stream_mode.discard(7003)
@@ -703,6 +714,270 @@ class TestStreamEventHandler:
             handler = _make_stream_event_handler(7004, bot)
             await handler({"type": "system", "subtype": "init", "model": "claude-opus-4-7"})
         mock_send.assert_not_called()
+
+    async def test_assistant_text_sent_silently(self):
+        """Progress text/reasoning must not buzz the phone."""
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with (
+            patch("bot_agent._clear_progress", new_callable=AsyncMock),
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            handler = _make_stream_event_handler(7005, bot)
+            await handler({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}})
+        assert mock_send.call_args.kwargs.get("disable_notification") is True
+
+    async def test_tool_use_uses_ephemeral_progress(self):
+        """Tool-use progress lines go through _update_progress (ephemeral), not send_long_message."""
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with (
+            patch("bot_agent._update_progress", new_callable=AsyncMock) as mock_progress,
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            handler = _make_stream_event_handler(7006, bot)
+            await handler(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "/x/y.py"}}]},
+                }
+            )
+        mock_progress.assert_awaited()
+        mock_send.assert_not_awaited()
+
+    async def test_system_event_uses_ephemeral_progress(self):
+        """Non-init system events (e.g. compaction) go through _update_progress (ephemeral)."""
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with patch("bot_agent._update_progress", new_callable=AsyncMock) as mock_progress:
+            handler = _make_stream_event_handler(7007, bot)
+            await handler({"type": "system", "subtype": "compact_boundary"})
+        mock_progress.assert_awaited()
+
+    async def test_result_clears_progress_and_notifies(self):
+        """Result event clears ephemeral progress then sends stats with notification."""
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with (
+            patch("bot_agent._clear_progress", new_callable=AsyncMock) as mock_clear,
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            handler = _make_stream_event_handler(7008, bot)
+            await handler({"type": "result", "num_turns": 3, "usage": {"input_tokens": 100}})
+        mock_clear.assert_awaited_once()
+        mock_send.assert_awaited()
+        assert mock_send.call_args.kwargs.get("disable_notification") in (False, None)
+
+    async def test_findings_sends_table_and_json_file(self):
+        """When text contains review findings JSON, send HTML table + .json file."""
+        import json
+
+        from bot_agent import _make_stream_event_handler
+
+        findings = [{"file": "a.py", "line": 1, "summary": "Bug", "failure_scenario": "Crash"}]
+        text = f"Review:\n\n```json\n{json.dumps(findings)}\n```\n\nDone."
+        bot = AsyncMock()
+        bot.send_document = AsyncMock()
+        with (
+            patch("bot_agent._clear_progress", new_callable=AsyncMock),
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            handler = _make_stream_event_handler(7009, bot)
+            await handler({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+        # Should have sent: (1) remaining prose, (2) HTML table
+        assert mock_send.await_count == 2
+        # First call: remaining prose (markdown → HTML)
+        first_call = mock_send.call_args_list[0]
+        assert first_call.kwargs.get("raw") in (False, None)
+        # Second call: HTML table (raw=True)
+        second_call = mock_send.call_args_list[1]
+        assert second_call.kwargs.get("raw") is True
+        # JSON file attachment
+        bot.send_document.assert_awaited_once()
+        doc_arg = bot.send_document.call_args.kwargs.get("document")
+        content = json.loads(doc_arg.read())
+        assert content[0]["file"] == "a.py"
+
+
+class TestEphemeralProgress:
+    """Test _update_progress and _clear_progress ephemeral message helpers."""
+
+    async def test_update_progress_sends_new_message(self):
+        import bot_agent
+        from bot_agent import _update_progress
+
+        bot = AsyncMock()
+        msg = MagicMock()
+        msg.message_id = 999
+        bot.send_message = AsyncMock(return_value=msg)
+        bot_agent._progress_msg_ids.pop(5001, None)
+        bot_agent._progress_lines.pop(5001, None)
+        try:
+            await _update_progress(5001, "Reading file.py", bot)
+            bot.send_message.assert_awaited_once()
+            assert bot_agent._progress_msg_ids[5001] == 999
+            assert bot_agent._progress_lines[5001] == ["Reading file.py"]
+        finally:
+            bot_agent._progress_msg_ids.pop(5001, None)
+            bot_agent._progress_lines.pop(5001, None)
+
+    async def test_update_progress_edits_existing(self):
+        import bot_agent
+        from bot_agent import _update_progress
+
+        bot = AsyncMock()
+        bot.edit_message_text = AsyncMock()
+        bot_agent._progress_msg_ids[5002] = 100
+        bot_agent._progress_lines[5002] = ["Line 1"]
+        try:
+            await _update_progress(5002, "Line 2", bot)
+            bot.edit_message_text.assert_awaited_once()
+            assert bot_agent._progress_lines[5002] == ["Line 1", "Line 2"]
+            # Should NOT send a new message
+            bot.send_message.assert_not_called()
+        finally:
+            bot_agent._progress_msg_ids.pop(5002, None)
+            bot_agent._progress_lines.pop(5002, None)
+
+    async def test_update_progress_caps_lines(self):
+        import bot_agent
+        from bot_agent import MAX_PROGRESS_LINES, _update_progress
+
+        bot = AsyncMock()
+        bot.edit_message_text = AsyncMock()
+        bot_agent._progress_msg_ids[5003] = 200
+        bot_agent._progress_lines[5003] = [f"Line {i}" for i in range(MAX_PROGRESS_LINES)]
+        try:
+            await _update_progress(5003, "New line", bot)
+            assert len(bot_agent._progress_lines[5003]) == MAX_PROGRESS_LINES
+            assert bot_agent._progress_lines[5003][-1] == "New line"
+            assert bot_agent._progress_lines[5003][0] == "Line 1"
+        finally:
+            bot_agent._progress_msg_ids.pop(5003, None)
+            bot_agent._progress_lines.pop(5003, None)
+
+    async def test_clear_progress_deletes_message(self):
+        import bot_agent
+        from bot_agent import _clear_progress
+
+        bot = AsyncMock()
+        bot.delete_message = AsyncMock()
+        bot_agent._progress_msg_ids[5004] = 300
+        bot_agent._progress_lines[5004] = ["some line"]
+        try:
+            await _clear_progress(5004, bot)
+            bot.delete_message.assert_awaited_once_with(chat_id=5004, message_id=300)
+            assert 5004 not in bot_agent._progress_msg_ids
+            assert 5004 not in bot_agent._progress_lines
+        finally:
+            bot_agent._progress_msg_ids.pop(5004, None)
+            bot_agent._progress_lines.pop(5004, None)
+
+    async def test_clear_progress_noop_when_no_message(self):
+        import bot_agent
+        from bot_agent import _clear_progress
+
+        bot = AsyncMock()
+        bot_agent._progress_msg_ids.pop(5005, None)
+        await _clear_progress(5005, bot)
+        bot.delete_message.assert_not_called()
+
+
+_SAMPLE_FINDINGS = [
+    {
+        "file": "src/main.py",
+        "line": 42,
+        "summary": "Off-by-one in loop",
+        "failure_scenario": "Array index out of bounds on empty input",
+    },
+    {
+        "file": "src/utils.py",
+        "line": 10,
+        "summary": "Missing null check",
+        "failure_scenario": "Crashes when config is absent",
+    },
+]
+
+
+def _wrap_findings(findings_json: str) -> str:
+    return f"Here are the findings:\n\n```json\n{findings_json}\n```\n\nPlease review."
+
+
+class TestFormatReviewFindings:
+    """Test _format_review_findings JSON detection and HTML formatting."""
+
+    def test_detects_and_formats_findings(self):
+        import json
+
+        from bot_agent import _format_review_findings
+
+        text = _wrap_findings(json.dumps(_SAMPLE_FINDINGS))
+        result = _format_review_findings(text)
+        assert result is not None
+        html_table, pretty_json, remaining = result
+        assert "<b>1.</b>" in html_table
+        assert "src/main.py:42" in html_table
+        assert "Off-by-one" in html_table
+        assert "<i>Array index out of bounds" in html_table
+        assert "<b>2.</b>" in html_table
+        parsed = json.loads(pretty_json)
+        assert len(parsed) == 2
+        assert "Please review" in remaining
+        assert "```" not in remaining
+
+    def test_returns_none_for_non_json(self):
+        from bot_agent import _format_review_findings
+
+        assert _format_review_findings("Just a normal message") is None
+
+    def test_returns_none_for_non_findings_json(self):
+        from bot_agent import _format_review_findings
+
+        text = '```json\n{"key": "value"}\n```'
+        assert _format_review_findings(text) is None
+
+    def test_returns_none_for_missing_required_keys(self):
+        import json
+
+        from bot_agent import _format_review_findings
+
+        text = _wrap_findings(json.dumps([{"file": "a.py", "summary": "x"}]))
+        assert _format_review_findings(text) is None
+
+    def test_empty_array_returns_none(self):
+        from bot_agent import _format_review_findings
+
+        assert _format_review_findings("```json\n[]\n```") is None
+
+    def test_finding_without_failure_scenario(self):
+        import json
+
+        from bot_agent import _format_review_findings
+
+        findings = [{"file": "a.py", "line": 1, "summary": "Bug"}]
+        text = _wrap_findings(json.dumps(findings))
+        result = _format_review_findings(text)
+        assert result is not None
+        html_table, _, _ = result
+        assert "<b>1.</b>" in html_table
+        assert "<i>" not in html_table
+
+    def test_line_field_is_html_escaped(self):
+        import json
+
+        from bot_agent import _format_review_findings
+
+        findings = [{"file": "a.py", "line": '<script>"xss"</script>', "summary": "Bug"}]
+        text = _wrap_findings(json.dumps(findings))
+        result = _format_review_findings(text)
+        assert result is not None
+        html_table, _, _ = result
+        assert "<script>" not in html_table
+        assert "&lt;script&gt;" in html_table
 
 
 class TestRestartCommand:
@@ -737,6 +1012,7 @@ class TestRestartCommand:
                 patch("bot_agent.load_session_id", return_value=None),
                 patch("bot_agent.update_claude_cli", new_callable=AsyncMock, return_value=(True, "Updated")),
                 patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("bot_agent._clear_progress", new_callable=AsyncMock) as mock_clear,
             ):
                 # Existing in-memory session
                 mock_mgr.get_session_id = MagicMock(return_value="resume-me-1234")
@@ -746,6 +1022,7 @@ class TestRestartCommand:
                 mock_mgr.start_stream = AsyncMock()
                 await restart_command(update, ctx)
 
+            mock_clear.assert_awaited_once_with(8102, ctx.bot)
             # Session must NOT be cleared by /restart
             mock_mgr.new_session.assert_not_called()
             # Stream is relaunched
@@ -846,11 +1123,13 @@ class TestCancelCommand:
         with (
             patch("bot_agent.is_authorized", return_value=True),
             patch("bot_agent.claude_code_mgr") as mock_mgr,
+            patch("bot_agent._clear_progress", new_callable=AsyncMock) as mock_clear,
         ):
             mock_mgr.has_running_proc = MagicMock(return_value=True)
             mock_mgr.interrupt = AsyncMock(return_value=True)
             await cancel_work(update, ctx)
         mock_mgr.interrupt.assert_awaited_once_with(8002)
+        mock_clear.assert_awaited_once_with(8002, ctx.bot)
         text = update.message.reply_text.call_args[0][0]
         assert "interrupt" in text.lower()
         assert "preserved" in text.lower()
@@ -1081,8 +1360,9 @@ class TestStreamTypingIndicator:
         task = bot_agent._typing_tasks.get(chat_id)
         assert task is not None and not task.done()
 
-        on_event = _make_stream_event_handler(chat_id, bot)
-        await on_event({"type": "result", "cost_usd": 0.01, "num_turns": 1})
+        with patch("bot_agent._clear_progress", new_callable=AsyncMock):
+            on_event = _make_stream_event_handler(chat_id, bot)
+            await on_event({"type": "result", "cost_usd": 0.01, "num_turns": 1})
 
         assert bot_agent._typing_tasks.get(chat_id) is None
 
@@ -1096,8 +1376,9 @@ class TestStreamTypingIndicator:
         task = bot_agent._typing_tasks.get(chat_id)
         assert task is not None and not task.done()
 
-        on_event = _make_stream_event_handler(chat_id, bot)
-        await on_event({"_type": "stream_end", "reason": "eof"})
+        with patch("bot_agent._clear_progress", new_callable=AsyncMock):
+            on_event = _make_stream_event_handler(chat_id, bot)
+            await on_event({"_type": "stream_end", "reason": "eof"})
 
         assert bot_agent._typing_tasks.get(chat_id) is None
 

@@ -7,16 +7,18 @@ VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 import asyncio
 import datetime
 import io
+import json
 import logging
 import os
 import re
 import shutil
 import sys
 import time
+from html import escape as _html_escape
 
 from dotenv import load_dotenv
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -128,6 +130,11 @@ _stream_mode: set[int] = set()  # chat IDs with /newstream continuous mode
 _typing_tasks: dict[int, asyncio.Task] = {}
 _frag_buffers: dict[int, str] = {}  # chat_id -> buffered text from split pastes
 _frag_tasks: dict[int, asyncio.Task] = {}  # chat_id -> pending flush task
+# Per-chat ephemeral progress message: chat_id -> message_id of the live status line
+_progress_msg_ids: dict[int, int] = {}
+# Accumulated progress lines for the current turn (displayed as a single edited message)
+_progress_lines: dict[int, list[str]] = {}
+MAX_PROGRESS_LINES = 6  # keep last N lines in the progress message
 
 _MIME_TO_EXT = {
     "image/jpeg": ".jpg",
@@ -152,6 +159,13 @@ CACHE_DIR_NAMES = frozenset(
 
 _files_cache: dict[int, list[Path]] = {}  # chat_id -> file list for inline keyboard
 _ask_options: dict[int, list[str]] = {}  # chat_id -> options for current [ASK:] question
+_compacting: set[int] = set()  # chat IDs with a /compact in flight
+_last_ctx_tokens: dict[int, int] = {}  # per-call context size from last assistant event
+_autocompact_disabled: set[int] = set()  # chat IDs with auto-compact turned off
+
+# Auto-compact when context hits the 200K standard window limit.
+# Overridable via AUTO_COMPACT_THRESHOLD env var (tokens).
+AUTO_COMPACT_THRESHOLD = int(os.getenv("AUTO_COMPACT_THRESHOLD", "200000"))
 
 
 def is_authorized(user_id: int) -> bool:
@@ -648,6 +662,7 @@ async def cancel_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     sent = await claude_code_mgr.interrupt(chat_id)
     if sent:
         _stop_stream_typing(chat_id)
+        await _clear_progress(chat_id, context.bot)
         await update.message.reply_text("Interrupt sent. Session preserved — send a new message to continue.")
     else:
         await update.message.reply_text(
@@ -662,6 +677,7 @@ async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     was_streaming = chat_id in _stream_mode
     _stream_mode.discard(chat_id)
     _stop_stream_typing(chat_id)
+    await _clear_progress(chat_id, context.bot)
     was_running = await claude_code_mgr.abort(chat_id)
     if was_streaming:
         await update.message.reply_text("Stream stopped.")
@@ -702,6 +718,90 @@ async def _report_cli_update_status(update: Update) -> None:
             await update.message.reply_text(f"Claude CLI version: {version}")
 
 
+_FINDINGS_RE = re.compile(
+    r"```(?:json)?\s*\n(\[\s*\{.*?\}\s*\])\s*\n```",
+    re.DOTALL,
+)
+
+
+def _format_review_findings(text: str) -> tuple[str, str, str] | None:
+    """Detect a JSON array of code-review findings in *text*.
+
+    Returns ``(html_table, pretty_json, remaining_text)`` or ``None``.
+    *remaining_text* is the original markdown with the JSON code-block removed.
+    """
+    m = _FINDINGS_RE.search(text)
+    if not m:
+        return None
+    try:
+        findings = json.loads(m.group(1))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(findings, list) or not findings:
+        return None
+    required = {"file", "line", "summary"}
+    if not all(isinstance(f, dict) and required <= f.keys() for f in findings):
+        return None
+
+    rows: list[str] = []
+    for i, f in enumerate(findings, 1):
+        loc = f"{_html_escape(f['file'])}:{_html_escape(str(f['line']))}"
+        summary = _html_escape(f["summary"])
+        scenario = _html_escape(f.get("failure_scenario", ""))
+        rows.append(f"<b>{i}.</b> <code>{loc}</code>\n{summary}")
+        if scenario:
+            rows.append(f"<i>{scenario}</i>")
+
+    html_table = "\n\n".join(rows)
+    pretty_json = json.dumps(findings, indent=2)
+    remaining = text[: m.start()] + text[m.end() :]
+    remaining = re.sub(r"\n{3,}", "\n\n", remaining).strip()
+    return html_table, pretty_json, remaining
+
+
+async def _update_progress(chat_id: int, line: str, bot) -> None:
+    """Append a line to the ephemeral progress message (edit-in-place).
+
+    Sends a new silent message on the first call per turn; subsequent calls
+    edit it. Keeps only the last MAX_PROGRESS_LINES lines so the message
+    stays compact.
+    """
+    lines = _progress_lines.setdefault(chat_id, [])
+    lines.append(line)
+    if len(lines) > MAX_PROGRESS_LINES:
+        del lines[: len(lines) - MAX_PROGRESS_LINES]
+    text = "\n".join(lines)
+
+    msg_id = _progress_msg_ids.get(chat_id)
+    if msg_id:
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
+            return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+            _progress_msg_ids.pop(chat_id, None)
+        except TelegramError:
+            # Message may have been deleted — send a new one
+            _progress_msg_ids.pop(chat_id, None)
+    try:
+        msg = await bot.send_message(chat_id=chat_id, text=text, disable_notification=True)
+        _progress_msg_ids[chat_id] = msg.message_id
+    except TelegramError:
+        pass
+
+
+async def _clear_progress(chat_id: int, bot) -> None:
+    """Delete the ephemeral progress message and reset state."""
+    msg_id = _progress_msg_ids.pop(chat_id, None)
+    _progress_lines.pop(chat_id, None)
+    if msg_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except TelegramError:
+            pass
+
+
 def _make_stream_event_handler(chat_id: int, bot):
     """Build an on_event callback that renders CC stream-json events into Telegram."""
 
@@ -710,6 +810,15 @@ def _make_stream_event_handler(chat_id: int, bot):
 
         if event_type == "assistant":
             message = event.get("message", {})
+            # Track per-call context size (not cumulative — that's in the result event).
+            usage = message.get("usage") or {}
+            ctx = (
+                usage.get("input_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0)
+            )
+            if ctx:
+                _last_ctx_tokens[chat_id] = ctx
             content = message.get("content", [])
             if isinstance(content, list):
                 for block in content:
@@ -721,16 +830,48 @@ def _make_stream_event_handler(chat_id: int, bot):
                         if line:
                             try:
                                 if btype == "text":
+                                    # Text = actual Claude response → clear progress, send permanently
+                                    await _clear_progress(chat_id, bot)
                                     line = await _parse_and_send_markers(chat_id, line, active_repos.get(chat_id), bot)
-                                if line:
-                                    pm = "HTML" if btype == "text" else None
-                                    await send_long_message(chat_id, line, bot, parse_mode=pm)
-                            except TelegramError:
-                                pass
+                                    if line:
+                                        findings = _format_review_findings(line)
+                                        if findings:
+                                            html_table, pretty_json, remaining = findings
+                                            if remaining:
+                                                await send_long_message(
+                                                    chat_id,
+                                                    remaining,
+                                                    bot,
+                                                    parse_mode="HTML",
+                                                    disable_notification=True,
+                                                )
+                                            await send_long_message(
+                                                chat_id,
+                                                html_table,
+                                                bot,
+                                                parse_mode="HTML",
+                                                raw=True,
+                                                disable_notification=True,
+                                            )
+                                            doc = io.BytesIO(pretty_json.encode())
+                                            doc.name = "findings.json"
+                                            await bot.send_document(
+                                                chat_id=chat_id, document=doc, disable_notification=True
+                                            )
+                                        else:
+                                            await send_long_message(
+                                                chat_id, line, bot, parse_mode="HTML", disable_notification=True
+                                            )
+                                else:
+                                    # Tool use = transient progress → edit-in-place
+                                    await _update_progress(chat_id, line, bot)
+                            except TelegramError as exc:
+                                logger.warning("Failed to send content to %d: %s", chat_id, exc)
             return
 
         if event_type == "result":
             _stop_stream_typing(chat_id)
+            await _clear_progress(chat_id, bot)
             stats = {k: event[k] for k in ("cost_usd", "num_turns", "usage") if k in event}
             if stats:
                 line = _format_tool_progress({"_type": "stats", **stats})
@@ -739,15 +880,35 @@ def _make_stream_event_handler(chat_id: int, bot):
                         await send_long_message(chat_id, line, bot)
                     except TelegramError:
                         pass
+
+            ctx_tokens = _last_ctx_tokens.get(chat_id, 0)
+            if (
+                ctx_tokens >= AUTO_COMPACT_THRESHOLD
+                and claude_code_mgr
+                and chat_id not in _compacting
+                and chat_id not in _autocompact_disabled
+            ):
+                _compacting.add(chat_id)
+                try:
+                    await send_long_message(
+                        chat_id,
+                        f"Context at {ctx_tokens:,} tokens — auto-compacting to stay within standard limit…",
+                        bot,
+                    )
+                    await claude_code_mgr.feed(chat_id, "/compact")
+                except TelegramError:
+                    _compacting.discard(chat_id)
             return
 
         if event_type == "system":
             subtype = event.get("subtype")
             if subtype and subtype != "init":
+                if "compact" in subtype.lower():
+                    _compacting.discard(chat_id)
                 line = _format_tool_progress({"_type": "system_event", "subtype": subtype})
                 if line:
                     try:
-                        await send_long_message(chat_id, line, bot)
+                        await _update_progress(chat_id, line, bot)
                     except TelegramError:
                         pass
             return
@@ -755,6 +916,7 @@ def _make_stream_event_handler(chat_id: int, bot):
         # Synthetic stream-end signal emitted by ClaudeCodeManager._stream_forever
         if event.get("_type") == "stream_end":
             _stop_stream_typing(chat_id)
+            await _clear_progress(chat_id, bot)
             _stream_mode.discard(chat_id)
             try:
                 await send_long_message(chat_id, "Stream ended — send a message to continue.", bot)
@@ -777,12 +939,15 @@ async def new_stream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     # Tear down any existing stream / process for this chat.
     _stream_mode.discard(chat_id)
+    await _clear_progress(chat_id, context.bot)
     await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
     await claude_code_mgr.abort(chat_id)
 
     # Clear ONLY this repo's session. Other repos in this chat keep their memory.
     claude_code_mgr.new_session(chat_id, repo)
     save_session_id(chat_id, repo, None)
+    _compacting.discard(chat_id)
+    _last_ctx_tokens.pop(chat_id, None)
 
     await update.message.reply_text("Updating Claude CLI…")
     await _report_cli_update_status(update)
@@ -825,6 +990,9 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # Tear down stream + proc, but DON'T clear the session — we want to resume.
     _stream_mode.discard(chat_id)
+    _compacting.discard(chat_id)
+    _last_ctx_tokens.pop(chat_id, None)
+    await _clear_progress(chat_id, context.bot)
     await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
     await claude_code_mgr.abort(chat_id)
 
@@ -1276,6 +1444,19 @@ async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Already in work mode.")
 
 
+async def autocompact_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /autocompact — toggle or show auto-compact status."""
+    if not update.message or not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    if chat_id in _autocompact_disabled:
+        _autocompact_disabled.discard(chat_id)
+        await update.message.reply_text(f"Auto-compact ON (threshold: {AUTO_COMPACT_THRESHOLD:,} tokens)")
+    else:
+        _autocompact_disabled.add(chat_id)
+        await update.message.reply_text("Auto-compact OFF")
+
+
 async def btw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /btw — send a side question to the running process."""
     if not update.message or not is_authorized(update.effective_user.id):
@@ -1505,6 +1686,7 @@ async def notify_startup(app: Application) -> None:
             ("newstream", "Wipe this repo's session and restart fresh"),
             ("restart", "Update Claude CLI and resume this repo's session"),
             ("model", "Show or change AI model"),
+            ("autocompact", "Toggle auto-compact on/off"),
             ("plan", "Toggle plan mode / plan a task"),
             ("branch", "Set active branch"),
             ("work", "Exit plan mode"),
@@ -1590,6 +1772,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cleanup", cleanup_command))
     app.add_handler(CommandHandler("plan", plan_command))
     app.add_handler(CommandHandler("work", work_command))
+    app.add_handler(CommandHandler("autocompact", autocompact_command))
     app.add_handler(CommandHandler("btw", btw_command))
     app.add_handler(CommandHandler([str(i) for i in range(1, 6)], repo_shortcut))
     app.add_handler(CallbackQueryHandler(inline_callback))
