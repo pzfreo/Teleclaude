@@ -63,10 +63,38 @@ services:
           echo "[headroom] disabled by HEADROOM_ENABLED — Claude uses the Anthropic API directly."
           timeout 10 runuser -u teleclaude -- rtk init --global --uninstall < /dev/null > /dev/null 2>&1 || true
         else
+          # Never compress MCP tool results: the agent needs exact output
+          # (measurements, error messages, debug prints) for iterative MCP
+          # workflows — Headroom's CCR compression was replacing them with
+          # <<ccr:hash>> markers (issue #69). Headroom matches tool names
+          # exactly (no wildcards), so each tool is listed; update these lists
+          # when the MCP servers add tools. Extra names can be added via
+          # HEADROOM_EXCLUDE_TOOLS in .env.agent — Headroom merges both.
+          MCP_EXCLUDE=""
+          for t in align_check analyze_printability clearance cross_sections \
+                   diff_snapshot execute export health_check import_cad_file \
+                   inspect_drawing install_skill last_error lint_drawing \
+                   load_part measure render_drawing render_view repair_hints \
+                   reset resolve restore_snapshot save_drawing_annotations \
+                   save_snapshot script search_library session_state \
+                   shape_compare suggest_view_layout version view_axes \
+                   workflow_hints; do
+            MCP_EXCLUDE="$${MCP_EXCLUDE},mcp__build123d-mcp__$${t}"
+          done
+          for t in get_print_info get_status list_printers start_print \
+                   validate_3mf; do
+            MCP_EXCLUDE="$${MCP_EXCLUDE},mcp__boo-cloud__$${t}"
+          done
+          MCP_EXCLUDE="$${MCP_EXCLUDE#,}"
+          # The `headroom proxy` click CLI in 0.24.0 does not expose
+          # --exclude-tools (and ignores HEADROOM_EXCLUDE_TOOLS); only the
+          # module entry point wires it, so launch the proxy through that.
           runuser -u teleclaude -- sh -c "
             mkdir -p /home/teleclaude/.headroom/logs
             while true; do
-              headroom proxy --host 127.0.0.1 --port $${HEADROOM_PORT} \
+              /opt/uv-tools/headroom-ai/bin/python -m headroom.proxy.server \
+                --host 127.0.0.1 --port $${HEADROOM_PORT} \
+                --exclude-tools \"$${MCP_EXCLUDE}\" \
                 >> /home/teleclaude/.headroom/logs/proxy.boot.log 2>&1
               echo \"[headroom] proxy exited at \$$(date -Iseconds), restarting in 5s...\" \
                 >> /home/teleclaude/.headroom/logs/proxy.boot.log
