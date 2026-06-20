@@ -59,6 +59,30 @@ jobs:
             --exclude='*' \
             ./ root@${{ secrets.DROPLET_IP }}:/opt/teleclaude/
 
+      - name: Update droplet OS packages
+        run: |
+          ssh -i ~/.ssh/deploy_key root@${{ secrets.DROPLET_IP }} bash -seuo pipefail <<'REMOTE'
+          export DEBIAN_FRONTEND=noninteractive
+          echo "=== OS packages: checking for updates ==="
+          apt-get update
+          # Upgrade non-interactively, keeping existing config files on conflict
+          # so the deploy never blocks on a dpkg prompt.
+          apt-get -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            upgrade
+          # Reclaim space: drop obsolete packages and the apt cache. Also eases
+          # disk pressure for the image build that follows.
+          apt-get -y autoremove --purge
+          apt-get clean
+          # Kernel/library updates may need a reboot. Don't auto-reboot mid-deploy
+          # (it would kill this step) — surface a warning so it can be done safely.
+          if [ -f /var/run/reboot-required ]; then
+            echo "::warning::Droplet requires a reboot to finish applying OS updates (e.g. kernel). Reboot manually at a safe time."
+            cat /var/run/reboot-required.pkgs 2>/dev/null || true
+          fi
+          REMOTE
+
       - name: Build and restart
         run: |
           ssh -i ~/.ssh/deploy_key root@${{ secrets.DROPLET_IP }} bash -seuo pipefail <<'REMOTE'
