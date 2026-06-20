@@ -61,5 +61,35 @@ jobs:
 
       - name: Build and restart
         run: |
-          ssh -i ~/.ssh/deploy_key root@${{ secrets.DROPLET_IP }} \
-            'cd /opt/teleclaude && docker system prune -af && docker compose up -d --build && docker compose ps'
+          ssh -i ~/.ssh/deploy_key root@${{ secrets.DROPLET_IP }} bash -seuo pipefail <<'REMOTE'
+          cd /opt/teleclaude
+
+          echo "=== Disk before cleanup ==="
+          df -h /
+          docker system df || true
+
+          # Stop the stack first so the running images become unused and can be
+          # reclaimed BEFORE building new ones. Holding two copies of the large
+          # image at once is what exhausted the droplet's disk ("no space left on
+          # device" during layer export). Brief downtime is the cost of building
+          # on a disk-constrained host. Volumes are preserved throughout (no
+          # --volumes flag) so the SQLite DB and workspaces survive.
+          docker compose down --remove-orphans || true
+
+          # Reclaim all unused images, containers, networks, and build cache.
+          docker system prune -af
+          docker builder prune -af
+
+          echo "=== Disk after cleanup ==="
+          df -h /
+
+          docker compose up -d --build
+
+          # Drop the previous image layers, now dangling after the rebuild.
+          docker image prune -af || true
+
+          echo "=== Disk after build ==="
+          df -h /
+          docker compose ps
+          REMOTE
+
