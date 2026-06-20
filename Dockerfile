@@ -43,10 +43,10 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN curl -fsSL https://github.com/estampo/boo-cloud/releases/latest/download/install.sh \
     | BOO_CLOUD_INSTALL_DIR=/usr/local/bin sh
 
-# Install rtk (Rust Token Killer) — Headroom's CLI "context tool". The agent
-# entrypoint registers an rtk PreToolUse hook in ~/.claude/settings.json that
-# transparently compresses Bash command output before it enters the model's
-# context. Pinned to the version Headroom's `wrap` targets. Needs jq (above).
+# Install rtk (Rust Token Killer) — CLI "context tool". The agent entrypoint
+# registers an rtk PreToolUse hook in ~/.claude/settings.json that transparently
+# compresses Bash command output before it enters the model's context. Needs jq
+# (above).
 ENV RTK_VERSION=v0.28.2
 RUN curl -fsSL "https://github.com/rtk-ai/rtk/releases/download/${RTK_VERSION}/rtk-x86_64-unknown-linux-musl.tar.gz" \
     | tar -xz -C /usr/local/bin rtk \
@@ -85,13 +85,6 @@ RUN uv sync --frozen --no-dev --no-editable
 RUN UV_TOOL_BIN_DIR=/usr/local/bin uv tool install black \
     && UV_TOOL_BIN_DIR=/usr/local/bin uv tool install ruff \
     && UV_TOOL_BIN_DIR=/usr/local/bin uv tool install mypy
-
-# Install Headroom as an isolated uv tool — provides the `headroom` CLI used
-# by the agent entrypoint when HEADROOM_ENABLED=1. Disabled by default.
-# UV_TOOL_DIR is set to /opt/uv-tools so the install lands outside /root/.local/,
-# which the non-root teleclaude user cannot traverse at runtime.
-RUN UV_TOOL_BIN_DIR=/usr/local/bin UV_TOOL_DIR=/opt/uv-tools uv tool install "headroom-ai[proxy]" \
-    && chmod -R a+rX /opt/uv-tools
 
 # Copy application code
 COPY *.py VERSION ./
