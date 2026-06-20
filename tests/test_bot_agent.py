@@ -772,6 +772,88 @@ class TestStreamEventHandler:
         mock_send.assert_awaited()
         assert mock_send.call_args.kwargs.get("disable_notification") in (False, None)
 
+    async def test_result_error_401_sends_auth_help(self):
+        """An error result with a 401 surfaces actionable auth remediation."""
+        from bot_agent import _AUTH_ERROR_HELP, _make_stream_event_handler
+
+        bot = AsyncMock()
+        with (
+            patch("bot_agent._clear_progress", new_callable=AsyncMock),
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            handler = _make_stream_event_handler(7101, bot)
+            await handler(
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "subtype": "error_during_execution",
+                    "result": 'API Error: 401 {"type":"authentication_error"}',
+                }
+            )
+        mock_send.assert_awaited_once()
+        assert mock_send.call_args[0][1] == _AUTH_ERROR_HELP
+
+    async def test_result_generic_error_surfaced(self):
+        """A non-auth error result is surfaced to the user, not swallowed."""
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with (
+            patch("bot_agent._clear_progress", new_callable=AsyncMock),
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            handler = _make_stream_event_handler(7102, bot)
+            await handler({"type": "result", "is_error": True, "result": "something broke"})
+        mock_send.assert_awaited_once()
+        assert "something broke" in mock_send.call_args[0][1]
+
+    async def test_result_error_no_text_uses_subtype(self):
+        """An error result with no text falls back to the subtype."""
+        from bot_agent import _make_stream_event_handler
+
+        bot = AsyncMock()
+        with (
+            patch("bot_agent._clear_progress", new_callable=AsyncMock),
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            handler = _make_stream_event_handler(7103, bot)
+            await handler({"type": "result", "subtype": "error_max_turns"})
+        mock_send.assert_awaited_once()
+        assert "error_max_turns" in mock_send.call_args[0][1]
+
+    async def test_assistant_text_401_sends_auth_help(self):
+        """A raw 401 emitted as assistant text is replaced with auth remediation."""
+        from bot_agent import _AUTH_ERROR_HELP, _make_stream_event_handler
+
+        bot = AsyncMock()
+        with (
+            patch("bot_agent._clear_progress", new_callable=AsyncMock),
+            patch("bot_agent.send_long_message", new_callable=AsyncMock) as mock_send,
+        ):
+            handler = _make_stream_event_handler(7104, bot)
+            await handler(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "API Error: 401 Unauthorized"}]},
+                }
+            )
+        mock_send.assert_awaited_once()
+        assert mock_send.call_args[0][1] == _AUTH_ERROR_HELP
+
+    async def test_looks_like_auth_error(self):
+        """Auth-error detection matches 401/auth phrases, not incidental mentions."""
+        from bot_agent import _looks_like_auth_error
+
+        assert _looks_like_auth_error("API Error: 401 Unauthorized")
+        assert _looks_like_auth_error('{"type":"authentication_error"}')
+        assert _looks_like_auth_error("Invalid API key")
+        assert _looks_like_auth_error("OAuth token has expired")
+        # Negatives: a bare number or unrelated text must not trip detection.
+        assert not _looks_like_auth_error("HTTP 401 is the status for unauthorized in the spec")
+        assert not _looks_like_auth_error("the test on line 401 passed")
+        assert not _looks_like_auth_error("")
+        assert not _looks_like_auth_error(None)
+
     async def test_findings_sends_table_and_json_file(self):
         """When text contains review findings JSON, send HTML table + .json file."""
         import json
