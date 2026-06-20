@@ -802,6 +802,55 @@ async def _clear_progress(chat_id: int, bot) -> None:
             pass
 
 
+# ── Authentication (401) failure detection ───────────────────────────
+# A 401 from Anthropic means the agent's Claude CLI credentials have expired
+# or are invalid. It surfaces either as an error `result` event or as raw
+# "API Error: 401" text from the CLI. Detect it so we can give the user
+# actionable remediation instead of a cryptic error (or silence).
+
+# Specific phrases that unambiguously indicate an auth failure.
+_AUTH_ERROR_MARKERS = (
+    "authentication_error",
+    "invalid api key",
+    "invalid x-api-key",
+    "invalid bearer token",
+    "oauth token has expired",
+    "oauth token expired",
+    "please run /login",
+    "please run `claude login`",
+    "run `claude login`",
+)
+
+_AUTH_ERROR_HELP = (
+    "🔑 Claude authentication failed (401).\n\n"
+    "The agent's Claude CLI credentials have expired or are invalid, so it can't "
+    "reach Anthropic. Every message will fail until this is fixed.\n\n"
+    "To fix:\n"
+    "• Subscription login: re-authenticate the CLI (`claude /login` or "
+    "`claude setup-token`) and restart the agent so the refreshed token in the "
+    "mounted .claude volume is picked up.\n"
+    "• API key: set a valid ANTHROPIC_API_KEY in .env.agent and restart.\n\n"
+    "Then send your message again."
+)
+
+
+def _looks_like_auth_error(text: str | None) -> bool:
+    """True if CLI output text indicates an Anthropic authentication (401) failure.
+
+    Matches on specific auth phrases, plus a bare 401/Unauthorized only when it
+    appears in an API-error context — avoids false positives on normal messages
+    that merely mention the number 401.
+    """
+    if not text:
+        return False
+    low = text.lower()
+    if any(m in low for m in _AUTH_ERROR_MARKERS):
+        return True
+    has_401 = "401" in low or "unauthorized" in low
+    api_context = "api error" in low or "anthropic" in low or "x-api-key" in low
+    return has_401 and api_context
+
+
 def _make_stream_event_handler(chat_id: int, bot):
     """Build an on_event callback that renders CC stream-json events into Telegram."""
 
@@ -832,6 +881,12 @@ def _make_stream_event_handler(chat_id: int, bot):
                                 if btype == "text":
                                     # Text = actual Claude response → clear progress, send permanently
                                     await _clear_progress(chat_id, bot)
+                                    if _looks_like_auth_error(line):
+                                        # CLI emitted a raw 401/auth error as text — replace
+                                        # the cryptic message with actionable remediation.
+                                        logger.error("Claude CLI auth failure for chat %d: %s", chat_id, line)
+                                        await send_long_message(chat_id, _AUTH_ERROR_HELP, bot)
+                                        continue
                                     line = await _parse_and_send_markers(chat_id, line, active_repos.get(chat_id), bot)
                                     if line:
                                         findings = _format_review_findings(line)
@@ -872,6 +927,25 @@ def _make_stream_event_handler(chat_id: int, bot):
         if event_type == "result":
             _stop_stream_typing(chat_id)
             await _clear_progress(chat_id, bot)
+
+            # Surface error results instead of swallowing them. Previously a CLI
+            # failure (e.g. a 401 auth error) left the user with no reply at all.
+            subtype = event.get("subtype", "")
+            if event.get("is_error") or subtype.startswith("error"):
+                err_text = (event.get("result") or "").strip()
+                if _looks_like_auth_error(err_text) or _looks_like_auth_error(subtype):
+                    logger.error("Claude CLI auth failure (result) for chat %d: %s", chat_id, err_text or subtype)
+                    msg = _AUTH_ERROR_HELP
+                elif err_text:
+                    msg = f"Claude Code error: {err_text}"
+                else:
+                    msg = f"Claude Code stopped with an error ({subtype or 'unknown'})."
+                try:
+                    await send_long_message(chat_id, msg, bot)
+                except TelegramError:
+                    pass
+                return
+
             stats = {k: event[k] for k in ("cost_usd", "num_turns", "usage") if k in event}
             if stats:
                 line = _format_tool_progress({"_type": "stats", **stats})
