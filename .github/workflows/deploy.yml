@@ -59,6 +59,27 @@ jobs:
             --exclude='*' \
             ./ root@${{ secrets.DROPLET_IP }}:/opt/teleclaude/
 
+      - name: Update droplet OS packages
+        run: |
+          ssh -i ~/.ssh/deploy_key root@${{ secrets.DROPLET_IP }} bash -seuo pipefail <<'REMOTE'
+          export DEBIAN_FRONTEND=noninteractive
+          echo "=== OS packages: checking for updates ==="
+          apt-get update
+          # Upgrade non-interactively, keeping existing config files on conflict
+          # so the deploy never blocks on a dpkg prompt.
+          # Thorough upgrade: dist-upgrade handles dependency changes and kernel
+          # transitions that plain upgrade holds back. Non-interactive, keeping
+          # existing config files on conflict so the deploy never blocks.
+          apt-get -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            dist-upgrade
+          # Reclaim space: drop obsolete packages and the apt cache. Also eases
+          # disk pressure for the image build that follows.
+          apt-get -y autoremove --purge
+          apt-get clean
+          REMOTE
+
       - name: Build and restart
         run: |
           ssh -i ~/.ssh/deploy_key root@${{ secrets.DROPLET_IP }} bash -seuo pipefail <<'REMOTE'
@@ -92,4 +113,41 @@ jobs:
           df -h /
           docker compose ps
           REMOTE
+
+      - name: Reboot droplet if required
+        run: |
+          KEY=~/.ssh/deploy_key
+          HOST=root@${{ secrets.DROPLET_IP }}
+          SSH="ssh -i $KEY -o ConnectTimeout=10 -o BatchMode=yes $HOST"
+
+          if [ "$($SSH '[ -f /var/run/reboot-required ] && echo yes || echo no')" != "yes" ]; then
+            echo "No reboot required — OS updates applied without one."
+            exit 0
+          fi
+
+          echo "Reboot required to finish applying OS updates — rebooting droplet..."
+          # Schedule the reboot via a transient systemd timer so this SSH command
+          # returns cleanly BEFORE the box goes down (a direct 'reboot' would drop
+          # the connection mid-command). Containers come back on boot via their
+          # restart policy.
+          $SSH 'systemd-run --on-active=5s --timer-property=AccuracySec=1s systemctl reboot'
+
+          echo "Waiting for droplet to go down and come back..."
+          sleep 30
+          UP=0
+          for i in $(seq 1 60); do
+            if $SSH 'true' 2>/dev/null; then
+              UP=1
+              echo "Droplet reachable again after ~$((30 + i * 10))s."
+              break
+            fi
+            sleep 10
+          done
+          if [ "$UP" != "1" ]; then
+            echo "::error::Droplet did not come back within ~10 minutes after reboot."
+            exit 1
+          fi
+
+          # Ensure the stack is up post-reboot (idempotent) and report.
+          $SSH 'cd /opt/teleclaude && docker compose up -d && docker compose ps'
 
