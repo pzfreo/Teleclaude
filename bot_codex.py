@@ -21,9 +21,16 @@ import sys
 import time
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from codex_code import (
     CodexCodeManager,
@@ -106,6 +113,17 @@ if not GITHUB_TOKEN:
 codex_mgr = CodexCodeManager(GITHUB_TOKEN)
 if codex_mgr.available:
     logger.info("Codex CLI: enabled (path=%s)", codex_mgr.cli_path)
+
+# GitHub client (for /repo listing only)
+gh_client = None
+try:
+    from github_tools import GitHubClient
+
+    if GITHUB_TOKEN:
+        gh_client = GitHubClient(GITHUB_TOKEN)
+        logger.info("GitHub client: enabled (for /repo listing)")
+except Exception as e:
+    logger.warning("GitHub client: failed to load (%s)", e)
 
 # ── State ─────────────────────────────────────────────────────────────
 
@@ -328,8 +346,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"Teleclaude Codex (prototype) — Codex CLI on Telegram.{repo_line}\n\n"
         "Commands:\n"
-        "/repo owner/name - Set the active GitHub repo\n"
-        "/repo - Show current repo\n"
+        "/repo - Show current repo + recent repos to tap\n"
+        "/repo <number> - Pick from the recent list\n"
+        "/repo <name> - Search local clones + GitHub by substring\n"
+        "/repo owner/name - Set the active GitHub repo directly\n"
         "/branch name - Set active branch\n"
         "/newsession - Wipe this repo's session and start fresh\n"
         "/stop - Kill any in-flight Codex run\n"
@@ -341,27 +361,144 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _find_repo_candidates(name: str, limit: int = 5) -> list[str]:
+    """Resolve a bare repo name to up to `limit` 'owner/name' candidates.
+
+    Looks first at locally cloned repos under workspaces-codex/pzfreo/, then at
+    the GitHub user's most-recently-pushed repos. Case-insensitive substring
+    match. Local matches are preferred and listed first.
+    """
+    needle = name.lower()
+    seen: set[str] = set()
+    candidates: list[str] = []
+
+    local_root = codex_mgr.workspace_root / "pzfreo"
+    try:
+        local_dirs = sorted(p.name for p in local_root.iterdir() if p.is_dir())
+    except (FileNotFoundError, NotADirectoryError):
+        local_dirs = []
+    for d in local_dirs:
+        if needle in d.lower():
+            full = f"pzfreo/{d}"
+            if full not in seen:
+                seen.add(full)
+                candidates.append(full)
+                if len(candidates) >= limit:
+                    return candidates
+
+    if gh_client:
+        try:
+            repos = gh_client.list_user_repos(100)
+        except Exception as e:
+            logger.warning("list_user_repos failed during search: %s", e)
+            repos = []
+        for r in repos:
+            full = r["full_name"]
+            if needle in full.lower() and full not in seen:
+                seen.add(full)
+                candidates.append(full)
+                if len(candidates) >= limit:
+                    break
+
+    return candidates
+
+
+def _switch_repo(chat_id: int, repo: str) -> None:
+    """Set the active repo. Sessions are per-(chat, repo), so switching does
+    NOT clear the target repo's stored session — memory resumes if you switch
+    back to a repo you'd used before."""
+    set_active_repo(chat_id, repo)
+    set_active_branch(chat_id, None)
+
+
 async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
+
     if not context.args:
         repo = get_active_repo(chat_id)
+        header_lines = []
         if repo:
             branch = get_active_branch(chat_id)
-            await update.message.reply_text("Active repo: " + repo + (f" ({branch})" if branch else ""))
+            header_lines.append("Active repo: " + repo + (f" ({branch})" if branch else ""))
+
+        if gh_client:
+            try:
+                loop = asyncio.get_running_loop()
+                repos = await loop.run_in_executor(None, gh_client.list_user_repos, 5)
+                buttons = []
+                for r in repos:
+                    label = r["full_name"] + (" ✓" if r["full_name"] == repo else "")
+                    buttons.append([InlineKeyboardButton(label, callback_data=f"repo:{r['full_name']}")])
+                markup = InlineKeyboardMarkup(buttons)
+                header = "\n".join(header_lines) + ("\n\n" if header_lines else "") + "Tap a repo to switch:"
+                await update.message.reply_text(header, reply_markup=markup)
+            except Exception as e:
+                logger.warning("Failed to list repos: %s", e)
+                msg = "\n".join(header_lines) or "No repo set. Use: /repo owner/name"
+                await update.message.reply_text(msg)
         else:
-            await update.message.reply_text("No repo set. Use /repo owner/name.")
+            msg = "\n".join(header_lines) or "No repo set. Use: /repo owner/name"
+            await update.message.reply_text(msg)
         return
 
-    repo = context.args[0]
-    if "/" not in repo:
-        await update.message.reply_text("Usage: /repo owner/name")
-        return
-    set_active_repo(chat_id, repo)
-    codex_mgr.new_session(chat_id, repo)
-    save_codex_session_id(chat_id, repo, None)
+    arg = context.args[0]
+
+    if arg.isdigit() and gh_client:
+        try:
+            loop = asyncio.get_running_loop()
+            repos = await loop.run_in_executor(None, gh_client.list_user_repos, 5)
+            idx = int(arg) - 1
+            if 0 <= idx < len(repos):
+                repo = repos[idx]["full_name"]
+            else:
+                await update.message.reply_text(f"Invalid number. Use 1-{len(repos)}.")
+                return
+        except Exception as e:
+            await update.message.reply_text(f"Failed to list repos: {e}")
+            return
+    else:
+        repo = arg
+        if "/" not in repo or len(repo.split("/")) != 2:
+            loop = asyncio.get_running_loop()
+            matches = await loop.run_in_executor(None, _find_repo_candidates, arg)
+            if not matches:
+                await update.message.reply_text(f"No repo found matching '{arg}'. Use: /repo owner/name")
+                return
+            if len(matches) == 1:
+                repo = matches[0]
+                await update.message.reply_text(f"Matched: {repo}")
+            else:
+                buttons = [[InlineKeyboardButton(m, callback_data=f"repo:{m}")] for m in matches]
+                await update.message.reply_text(
+                    f"Multiple matches for '{arg}'. Tap one:",
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                )
+                return
+
+    _switch_repo(chat_id, repo)
     await update.message.reply_text(f"Active repo set to: {repo}")
+
+
+async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard callbacks: repo:"""
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    if not is_authorized(query.from_user.id):
+        await query.answer("Not authorized.")
+        return
+    await query.answer()
+    data = query.data or ""
+    chat_id = query.message.chat_id
+
+    if data.startswith("repo:"):
+        repo = data[5:]
+        if "/" not in repo:
+            return
+        _switch_repo(chat_id, repo)
+        await query.edit_message_text(f"Active repo set to: {repo}")
 
 
 async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -583,6 +720,22 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
             await send_long_message(chat_id, final_text, context.bot)
 
 
+async def notify_startup(app: Application) -> None:
+    await app.bot.set_my_commands(
+        [
+            ("repo", "Set active GitHub repo (list / number / name / owner/name)"),
+            ("branch", "Set active branch"),
+            ("newsession", "Wipe this repo's session and start fresh"),
+            ("stop", "Kill any in-flight Codex run"),
+            ("model", "Show or switch model"),
+            ("update", "Update Codex CLI to latest version"),
+            ("logs", "View recent bot logs"),
+            ("version", "Show bot version"),
+            ("help", "Show help message"),
+        ]
+    )
+
+
 def main() -> None:
     _check_required_config()
     init_db()
@@ -599,6 +752,7 @@ def main() -> None:
     app.add_handler(CommandHandler("update", update_cli))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CommandHandler("logs", send_logs))
+    app.add_handler(CallbackQueryHandler(inline_callback))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_handler(
         MessageHandler(
@@ -606,6 +760,8 @@ def main() -> None:
             handle_message,
         )
     )
+
+    app.post_init = notify_startup
 
     logger.info("Teleclaude Codex bot started — cli: %s", codex_mgr.cli_path)
     app.run_polling(allowed_updates=Update.ALL_TYPES)

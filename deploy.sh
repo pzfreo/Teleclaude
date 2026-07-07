@@ -227,13 +227,16 @@ case "$COMMAND" in
         ;;
 
     codex-login)
-        # Authenticate Codex CLI inside the container (prototype teleclaude-codex bot)
+        # Authenticate Codex CLI inside the container (prototype teleclaude-codex bot).
+        # --device-auth is required on a headless/remote box — the default flow starts
+        # a local callback server that an operator's browser on a different machine
+        # can never reach.
         HOST="${1:-$(get_ip)}"
         if [ -z "$HOST" ]; then echo "No droplet IP."; exit 1; fi
-        echo "==> Opening Codex login in container..."
-        echo "    A URL will appear — open it in your browser to authenticate."
+        echo "==> Opening Codex device-auth login in container..."
+        echo "    A URL + code will appear — open the URL on any device and enter the code."
         echo ""
-        ssh -t "${SSH_USER}@${HOST}" "cd ${REMOTE_DIR} && docker compose exec teleclaude-codex codex login"
+        ssh -t "${SSH_USER}@${HOST}" "cd ${REMOTE_DIR} && docker compose exec teleclaude-codex codex login --device-auth"
         ;;
 
     destroy)
