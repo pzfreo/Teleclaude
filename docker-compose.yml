@@ -60,8 +60,24 @@ services:
       - teleclaude-claude-config:/home/teleclaude/.claude
       - /var/run/docker.sock:/var/run/docker.sock
 
+  # Prototype: Codex CLI bot, parallel to teleclaude-agent but backed by
+  # OpenAI's Codex CLI instead of Claude Code. No rtk hook, no boo-cloud MCP
+  # registration, no docker socket access — those are Claude-Code-specific.
+  teleclaude-codex:
+    build: .
+    restart: unless-stopped
+    env_file: .env.codex
+    command: ["python", "bot_codex.py"]
+    volumes:
+      - teleclaude-codex-data:/app/data
+      - teleclaude-codex-workspaces:/app/workspaces-codex
+      - teleclaude-codex-config:/home/teleclaude/.codex
+
 volumes:
   teleclaude-data:
   teleclaude-agent-data:
   teleclaude-workspaces:
   teleclaude-claude-config:
+  teleclaude-codex-data:
+  teleclaude-codex-workspaces:
+  teleclaude-codex-config:

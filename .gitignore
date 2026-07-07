@@ -1,5 +1,6 @@
 .env
 .env.agent
+.env.codex
 __pycache__/
 *.pyc
 *.pyo
