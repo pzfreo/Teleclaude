@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from codex_code import CodexCodeManager, format_item_progress, looks_like_auth_error
+from codex_code import CodexCodeManager, format_agent_progress, format_item_progress, looks_like_auth_error
 
 
 class TestCodexCodeManager:
@@ -159,6 +159,24 @@ class TestFormatItemProgress:
         assert format_item_progress({"type": "reasoning", "text": "thinking..."}) is None
 
 
+class TestFormatAgentProgress:
+    def test_first_non_empty_line(self):
+        assert (
+            format_agent_progress("\nI will inspect the config first.\n\nMore detail.")
+            == "I will inspect the config first."
+        )
+
+    def test_empty_text_is_silent(self):
+        assert format_agent_progress("   \n") is None
+
+    def test_long_text_is_truncated(self):
+        text = "a" * 400
+        line = format_agent_progress(text)
+        assert line is not None
+        assert len(line) == 281
+        assert line.endswith("…")
+
+
 class TestLooksLikeAuthError:
     def test_none_is_false(self):
         assert looks_like_auth_error(None) is False
@@ -178,6 +196,23 @@ class TestRunTurn:
 
     @staticmethod
     def _fake_proc(stdout_lines: list[bytes], returncode: int = 0):
+        class _FakeStdin:
+            def __init__(self):
+                self.data = bytearray()
+                self.closed = False
+
+            def write(self, data):
+                self.data.extend(data)
+
+            async def drain(self):
+                pass
+
+            def close(self):
+                self.closed = True
+
+            async def wait_closed(self):
+                pass
+
         class _FakeStream:
             def __init__(self, lines):
                 self._lines = list(lines)
@@ -192,6 +227,7 @@ class TestRunTurn:
 
         class _FakeProc:
             def __init__(self):
+                self.stdin = _FakeStdin()
                 self.stdout = _FakeStream(stdout_lines)
                 self.stderr = _FakeStream([])
                 self.returncode = returncode
@@ -233,7 +269,10 @@ class TestRunTurn:
         assert "exec" in cmd
         assert "--dangerously-bypass-approvals-and-sandbox" in cmd
         assert "resume" not in cmd
-        assert cmd[-1] == "hello"
+        assert "hello" not in cmd
+        assert cmd[-1] == "-"
+        assert proc.stdin.data == b"hello"
+        assert proc.stdin.closed is True
         assert mgr.get_session_id(1001, "owner/repo") == "thread-123"
         assert len(received) == 3
 
@@ -259,7 +298,10 @@ class TestRunTurn:
         cmd = captured["cmd"]
         idx = cmd.index("resume")
         assert cmd[idx + 1] == "thread-existing"
-        assert cmd[idx + 2] == "follow up"
+        assert "follow up" not in cmd
+        assert cmd[idx + 2] == "-"
+        assert proc.stdin.data == b"follow up"
+        assert proc.stdin.closed is True
 
     async def test_nonzero_exit_emits_process_error_event(self, tmp_path):
         mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")

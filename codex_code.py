@@ -117,6 +117,20 @@ async def get_codex_cli_version() -> str | None:
 # ── Progress formatting ────────────────────────────────────────────────
 
 _SHORT_COMMAND_LEN = 120
+_SHORT_PROGRESS_TEXT_LEN = 280
+
+
+def format_agent_progress(text: str | None) -> str | None:
+    """Format a public assistant message into a compact progress line."""
+    if not text:
+        return None
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+    first_line = lines[0]
+    if len(first_line) > _SHORT_PROGRESS_TEXT_LEN:
+        first_line = first_line[:_SHORT_PROGRESS_TEXT_LEN] + "…"
+    return first_line
 
 
 def format_item_progress(item: dict) -> str | None:
@@ -355,22 +369,35 @@ class CodexCodeManager:
         if model:
             cmd.extend(["-m", model])
         if session_id:
-            cmd.extend(["resume", session_id, text])
+            cmd.extend(["resume", session_id, "-"])
         else:
-            cmd.append(text)
+            cmd.append("-")
 
         logger.info("Codex: launching turn in %s (session=%s)", repo_dir, session_id or "new")
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(repo_dir),
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=10 * 1024 * 1024,
             env=self._git_env(),
         )
         self._running_procs[chat_id] = proc
+
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(text.encode("utf-8"))
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.debug("Codex stdin closed before prompt write for chat %d: %s", chat_id, e)
+        finally:
+            proc.stdin.close()
+            try:
+                await proc.stdin.wait_closed()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         stderr_lines: list[str] = []
 

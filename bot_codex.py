@@ -34,6 +34,7 @@ from telegram.ext import (
 
 from codex_code import (
     CodexCodeManager,
+    format_agent_progress,
     format_item_progress,
     get_codex_cli_version,
     looks_like_auth_error,
@@ -269,12 +270,21 @@ async def _send_file_to_user(chat_id: int, path: Path, bot) -> bool:
         return False
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot) -> str:
     """Strip [SEND: path] markers from text and deliver the referenced files."""
     markers = SEND_MARKER_RE.findall(text)
     workspace = codex_mgr.workspace_path(repo) if repo else None
-    workspace_str = str(workspace.resolve()) if workspace else None
-    tmp_str = str(Path("/tmp").resolve())
+    allowed_roots = [Path("/tmp").resolve()]
+    if workspace:
+        allowed_roots.append(workspace.resolve())
     for raw in markers:
         raw = raw.strip()
         p = Path(raw)
@@ -282,7 +292,7 @@ async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot
             p = (workspace / raw).resolve()
         else:
             p = p.resolve()
-        safe = (workspace_str and str(p).startswith(workspace_str)) or str(p).startswith(tmp_str)
+        safe = any(_is_relative_to(p, root) for root in allowed_roots)
         if safe:
             await _send_file_to_user(chat_id, p, bot)
         else:
@@ -293,11 +303,20 @@ async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot
 def _make_event_handler(chat_id: int, bot):
     """Build an on_event callback that renders Codex exec JSON events into Telegram."""
     state = {"final_text": None, "usage": None}
+    pending_agent_progress: str | None = None
+
+    async def flush_pending_agent_progress() -> None:
+        nonlocal pending_agent_progress
+        if pending_agent_progress:
+            await _update_progress(chat_id, pending_agent_progress, bot)
+            pending_agent_progress = None
 
     async def on_event(event: dict) -> None:
+        nonlocal pending_agent_progress
         event_type = event.get("type")
 
         if event_type == "item.started":
+            await flush_pending_agent_progress()
             line = format_item_progress(event.get("item", {}))
             if line:
                 await _update_progress(chat_id, line, bot)
@@ -306,11 +325,14 @@ def _make_event_handler(chat_id: int, bot):
         if event_type == "item.completed":
             item = event.get("item", {})
             if item.get("type") == "agent_message":
-                state["final_text"] = item.get("text", "")
+                text = item.get("text", "")
+                state["final_text"] = text
+                pending_agent_progress = format_agent_progress(text)
                 return
             if item.get("type") == "error":
                 logger.warning("Codex item error for chat %d: %s", chat_id, item.get("message"))
                 return
+            await flush_pending_agent_progress()
             line = format_item_progress(item)
             if line:
                 await _update_progress(chat_id, line, bot)

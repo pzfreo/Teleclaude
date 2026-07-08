@@ -66,7 +66,9 @@ services:
   teleclaude-codex:
     build: .
     restart: unless-stopped
-    env_file: .env.codex
+    env_file:
+      - path: .env.codex
+        required: false
     command: ["python", "bot_codex.py"]
     volumes:
       - teleclaude-codex-data:/app/data
