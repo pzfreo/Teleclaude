@@ -285,6 +285,11 @@ async def send_long_message(
             )
         except TelegramError as e:
             logger.warning("Failed to send message chunk to %d: %s", chat_id, e)
+            if parse_mode:
+                try:
+                    await bot.send_message(chat_id=chat_id, text=chunk, disable_notification=disable_notification)
+                except TelegramError as retry_error:
+                    logger.warning("Failed to send plain message chunk to %d: %s", chat_id, retry_error)
 
 
 async def download_telegram_file(file_obj, bot) -> bytes:

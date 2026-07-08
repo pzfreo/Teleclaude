@@ -2,6 +2,8 @@
 
 from unittest.mock import AsyncMock, MagicMock
 
+from telegram.error import BadRequest
+
 
 class TestMdToTelegramHtml:
     def html(self, md: str) -> str:
@@ -155,3 +157,15 @@ class TestSendLongMessageParseMode:
         bot.send_message = AsyncMock()
         await send_long_message(123, "", bot, parse_mode="HTML")
         bot.send_message.assert_not_called()
+
+    async def test_html_send_retries_plain_text_on_telegram_error(self):
+        from shared import send_long_message
+
+        bot = MagicMock()
+        bot.send_message = AsyncMock(side_effect=[BadRequest("can't parse entities"), None])
+        await send_long_message(123, "**bold**", bot, parse_mode="HTML")
+
+        assert bot.send_message.await_count == 2
+        first_call, second_call = bot.send_message.call_args_list
+        assert first_call.kwargs["parse_mode"] == "HTML"
+        assert "parse_mode" not in second_call.kwargs
