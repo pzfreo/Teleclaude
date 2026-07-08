@@ -133,6 +133,18 @@ class TestExecuteToolCall:
             result = _execute_tool_call(block, "owner/repo", 9999)
         assert result == "search results"
 
+    def test_email_send_dispatch(self):
+        from bot import _execute_tool_call
+
+        block = self._make_block("send_email", {"to": "test@example.com", "subject": "Hello", "body": "Hi"})
+        with (
+            patch("bot.execute_email_tool", return_value='{"status": "sent"}'),
+            patch("bot._email_tool_names", {"send_email"}),
+            patch("bot.email_client", MagicMock()),
+        ):
+            result = _execute_tool_call(block, "owner/repo", 9999)
+        assert result == '{"status": "sent"}'
+
     def test_github_tool_no_repo(self):
         from bot import _execute_tool_call
 

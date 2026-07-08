@@ -34,7 +34,6 @@ from telegram.ext import (
 
 from codex_code import (
     CodexCodeManager,
-    format_agent_progress,
     format_item_progress,
     get_codex_cli_version,
     looks_like_auth_error,
@@ -84,6 +83,9 @@ _MIME_TO_EXT = {
     "application/pdf": ".pdf",
 }
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
+SKIP_DIRS = frozenset(
+    {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build", ".cache", ".tox"}
+)
 SEND_MARKER_RE = re.compile(r"\[SEND:\s*([^\]]+)\]", re.IGNORECASE)
 
 ALLOWED_USER_IDS: set[int] = set()
@@ -135,6 +137,7 @@ _chat_locks: dict[int, asyncio.Lock] = {}
 _typing_tasks: dict[int, asyncio.Task] = {}
 _progress_msg_ids: dict[int, int] = {}
 _progress_lines: dict[int, list[str]] = {}
+_files_cache: dict[int, list[Path]] = {}
 
 
 def get_active_repo(chat_id: int) -> str | None:
@@ -238,6 +241,24 @@ def _stop_typing(chat_id: int) -> None:
         task.cancel()
 
 
+def _list_workspace_files(workspace: Path, limit: int = 5) -> list[Path]:
+    files: list[Path] = []
+    try:
+        for path in workspace.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(workspace)
+            if any(part.startswith(".") or part in SKIP_DIRS for part in rel.parts[:-1]):
+                continue
+            if rel.parts[-1].startswith("."):
+                continue
+            files.append(path)
+    except PermissionError:
+        pass
+    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return files[:limit]
+
+
 _AUTH_ERROR_HELP = (
     "🔑 Codex authentication failed.\n\n"
     "The bot's Codex CLI credentials have expired or are invalid, so it can't reach OpenAI. "
@@ -267,6 +288,10 @@ async def _send_file_to_user(chat_id: int, path: Path, bot) -> bool:
         return True
     except Exception as e:
         logger.error("Failed to send file %s: %s", path, e)
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"Failed to send {path.name}: {e}")
+        except TelegramError:
+            pass
         return False
 
 
@@ -282,7 +307,8 @@ async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot
     """Strip [SEND: path] markers from text and deliver the referenced files."""
     markers = SEND_MARKER_RE.findall(text)
     workspace = codex_mgr.workspace_path(repo) if repo else None
-    allowed_roots = [Path("/tmp").resolve()]
+    shared = (codex_mgr.workspace_root / ".shared" / str(chat_id)).resolve()
+    allowed_roots = [Path("/tmp").resolve(), shared]
     if workspace:
         allowed_roots.append(workspace.resolve())
     for raw in markers:
@@ -303,20 +329,22 @@ async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot
 def _make_event_handler(chat_id: int, bot):
     """Build an on_event callback that renders Codex exec JSON events into Telegram."""
     state = {"final_text": None, "usage": None}
-    pending_agent_progress: str | None = None
+    pending_agent_message: str | None = None
 
-    async def flush_pending_agent_progress() -> None:
-        nonlocal pending_agent_progress
-        if pending_agent_progress:
-            await _update_progress(chat_id, pending_agent_progress, bot)
-            pending_agent_progress = None
+    async def flush_pending_agent_message() -> None:
+        nonlocal pending_agent_message
+        if pending_agent_message:
+            await send_long_message(chat_id, pending_agent_message, bot, disable_notification=True)
+            if state["final_text"] == pending_agent_message:
+                state["final_text"] = None
+            pending_agent_message = None
 
     async def on_event(event: dict) -> None:
-        nonlocal pending_agent_progress
+        nonlocal pending_agent_message
         event_type = event.get("type")
 
         if event_type == "item.started":
-            await flush_pending_agent_progress()
+            await flush_pending_agent_message()
             line = format_item_progress(event.get("item", {}))
             if line:
                 await _update_progress(chat_id, line, bot)
@@ -327,12 +355,12 @@ def _make_event_handler(chat_id: int, bot):
             if item.get("type") == "agent_message":
                 text = item.get("text", "")
                 state["final_text"] = text
-                pending_agent_progress = format_agent_progress(text)
+                pending_agent_message = text
                 return
             if item.get("type") == "error":
                 logger.warning("Codex item error for chat %d: %s", chat_id, item.get("message"))
                 return
-            await flush_pending_agent_progress()
+            await flush_pending_agent_message()
             line = format_item_progress(item)
             if line:
                 await _update_progress(chat_id, line, bot)
@@ -376,6 +404,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/newsession - Wipe this repo's session and start fresh\n"
         "/stop - Kill any in-flight Codex run\n"
         "/model [name] - Show or switch model\n"
+        "/files - Browse and download workspace files\n"
         "/update - Update Codex CLI to latest version\n"
         "/logs [min] - Download recent logs\n"
         "/version - Show bot version\n"
@@ -504,7 +533,7 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline keyboard callbacks: repo:"""
+    """Handle inline keyboard callbacks: dl:, repo:"""
     query = update.callback_query
     if not query or not query.from_user:
         return
@@ -515,7 +544,18 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data or ""
     chat_id = query.message.chat_id
 
-    if data.startswith("repo:"):
+    if data.startswith("dl:"):
+        try:
+            idx = int(data[3:])
+        except ValueError:
+            return
+        files = _files_cache.get(chat_id, [])
+        if idx >= len(files):
+            await query.edit_message_text("File list expired. Use /files again.")
+            return
+        await _send_file_to_user(chat_id, files[idx], context.bot)
+
+    elif data.startswith("repo:"):
         repo = data[5:]
         if "/" not in repo:
             return
@@ -590,6 +630,36 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     model_id = context.args[0]
     chat_models[chat_id] = model_id
     await update.message.reply_text(f"Model switched to: {model_id}")
+
+
+async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    repo = get_active_repo(chat_id)
+    if not repo:
+        await update.message.reply_text("No repo set. Use /repo owner/name first.")
+        return
+    workspace = codex_mgr.workspace_path(repo)
+    if not workspace.exists():
+        await update.message.reply_text("Workspace not cloned yet. Send a message after setting a repo first.")
+        return
+    files = _list_workspace_files(workspace)
+    if not files:
+        await update.message.reply_text("No files found in workspace.")
+        return
+
+    _files_cache[chat_id] = files
+    buttons = []
+    for idx, path in enumerate(files):
+        rel = path.relative_to(workspace)
+        size = path.stat().st_size
+        size_str = f"{size / 1024:.1f}KB" if size >= 1024 else f"{size}B"
+        buttons.append([InlineKeyboardButton(f"{rel}  ({size_str})", callback_data=f"dl:{idx}")])
+    await update.message.reply_text(
+        "Recent files - tap to download:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
 async def update_cli(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -750,6 +820,7 @@ async def notify_startup(app: Application) -> None:
             ("newsession", "Wipe this repo's session and start fresh"),
             ("stop", "Kill any in-flight Codex run"),
             ("model", "Show or switch model"),
+            ("files", "Browse and download workspace files"),
             ("update", "Update Codex CLI to latest version"),
             ("logs", "View recent bot logs"),
             ("version", "Show bot version"),
@@ -771,6 +842,7 @@ def main() -> None:
     app.add_handler(CommandHandler("newsession", new_session_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("model", show_model))
+    app.add_handler(CommandHandler("files", list_files))
     app.add_handler(CommandHandler("update", update_cli))
     app.add_handler(CommandHandler("version", show_version))
     app.add_handler(CommandHandler("logs", send_logs))
