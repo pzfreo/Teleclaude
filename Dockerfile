@@ -37,6 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV NPM_CONFIG_PREFIX=/home/teleclaude/.npm-global
 RUN npm install -g @anthropic-ai/claude-code
 
+# Install Codex CLI (prototype teleclaude-codex bot) into the same npm prefix.
+RUN npm install -g @openai/codex
+
 # Install boocloud-bridge (Bambu Lab printer bridge used by the agent's
 # boo-cloud MCP server). Tracks the latest published release; rebuild the
 # container to pick up a new version.
@@ -70,7 +73,7 @@ RUN ln -s /usr/local/bin/uv /usr/local/bin/uvx
 # ~/.claude/ is volume-mounted; we symlink ~/.claude.json into that directory so
 # the Claude Code MCP configuration also survives container rebuilds.
 RUN useradd -m -s /bin/bash teleclaude \
-    && mkdir -p /home/teleclaude/.local/bin /home/teleclaude/.claude \
+    && mkdir -p /home/teleclaude/.local/bin /home/teleclaude/.claude /home/teleclaude/.codex \
     && ln -s /home/teleclaude/.claude/claude.json /home/teleclaude/.claude.json \
     && chown -R teleclaude:teleclaude /home/teleclaude /home/teleclaude/.npm-global
 
@@ -95,7 +98,7 @@ COPY *.py VERSION ./
 COPY agent/CLAUDE.md /opt/teleclaude-agent/CLAUDE.md
 
 # Pre-create volume mount points owned by teleclaude so fresh volumes work
-RUN mkdir -p /app/data /app/workspaces && chown -R teleclaude:teleclaude /app
+RUN mkdir -p /app/data /app/workspaces /app/workspaces-codex && chown -R teleclaude:teleclaude /app
 
 USER teleclaude
 ENV PATH="/app/.venv/bin:/home/teleclaude/.npm-global/bin:/home/teleclaude/.local/bin:${PATH}"

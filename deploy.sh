@@ -119,6 +119,12 @@ case "$COMMAND" in
         else
             echo "WARNING: No .env.agent file found. Agent bot won't start without it."
         fi
+        if [ -f .env.codex ]; then
+            scp -o StrictHostKeyChecking=accept-new .env.codex "${SSH_USER}@${IP}:${REMOTE_DIR}/.env.codex"
+            ssh_run "$IP" "chmod 600 ${REMOTE_DIR}/.env.codex"
+        else
+            echo "WARNING: No .env.codex file found. Codex bot won't start without it."
+        fi
 
         # Build and start
         echo "==> Building and starting..."
@@ -167,6 +173,13 @@ case "$COMMAND" in
         else
             echo "WARNING: No .env.agent file found. Agent bot won't start without it."
         fi
+        if [ -f .env.codex ]; then
+            echo "==> Copying .env.codex..."
+            scp -o StrictHostKeyChecking=accept-new .env.codex "${SSH_USER}@${HOST}:${REMOTE_DIR}/.env.codex"
+            ssh_run "$HOST" "chmod 600 ${REMOTE_DIR}/.env.codex"
+        else
+            echo "WARNING: No .env.codex file found. Codex bot won't start without it."
+        fi
 
         echo "==> Building and starting..."
         ssh_run "$HOST" "cd ${REMOTE_DIR} && docker compose up -d --build"
@@ -213,6 +226,19 @@ case "$COMMAND" in
         ssh -t "${SSH_USER}@${HOST}" "cd ${REMOTE_DIR} && docker compose exec teleclaude-agent claude login"
         ;;
 
+    codex-login)
+        # Authenticate Codex CLI inside the container (prototype teleclaude-codex bot).
+        # --device-auth is required on a headless/remote box — the default flow starts
+        # a local callback server that an operator's browser on a different machine
+        # can never reach.
+        HOST="${1:-$(get_ip)}"
+        if [ -z "$HOST" ]; then echo "No droplet IP."; exit 1; fi
+        echo "==> Opening Codex device-auth login in container..."
+        echo "    A URL + code will appear — open the URL on any device and enter the code."
+        echo ""
+        ssh -t "${SSH_USER}@${HOST}" "cd ${REMOTE_DIR} && docker compose exec teleclaude-codex codex login --device-auth"
+        ;;
+
     destroy)
         echo "==> Destroying droplet: $DROPLET_NAME..."
         doctl compute droplet delete "$DROPLET_NAME" --force
@@ -234,6 +260,11 @@ case "$COMMAND" in
             ssh_run "$HOST" "chmod 600 ${REMOTE_DIR}/.env.agent"
             echo "==> .env.agent updated."
         fi
+        if [ -f .env.codex ]; then
+            scp -o StrictHostKeyChecking=accept-new .env.codex "${SSH_USER}@${HOST}:${REMOTE_DIR}/.env.codex"
+            ssh_run "$HOST" "chmod 600 ${REMOTE_DIR}/.env.codex"
+            echo "==> .env.codex updated."
+        fi
         echo "Run ./deploy.sh to restart with new values."
         ;;
 
@@ -243,6 +274,7 @@ case "$COMMAND" in
         echo "  ./deploy.sh setup <ip>           # Setup existing server"
         echo "  ./deploy.sh [<ip>]               # Deploy update"
         echo "  ./deploy.sh login                # Authenticate Claude Code (Max plan)"
+        echo "  ./deploy.sh codex-login           # Authenticate Codex CLI (prototype teleclaude-codex bot)"
         echo "  ./deploy.sh env                  # Push .env update"
         echo "  ./deploy.sh logs                 # Tail logs"
         echo "  ./deploy.sh ssh                  # SSH into droplet"

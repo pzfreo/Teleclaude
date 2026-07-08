@@ -125,6 +125,17 @@ def init_db() -> None:
             session_id TEXT NOT NULL,
             PRIMARY KEY (chat_id, repo)
         );
+        CREATE TABLE IF NOT EXISTS codex_active_repos (
+            chat_id INTEGER PRIMARY KEY,
+            repo TEXT NOT NULL,
+            branch TEXT
+        );
+        CREATE TABLE IF NOT EXISTS codex_repo_sessions (
+            chat_id INTEGER NOT NULL,
+            repo TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            PRIMARY KEY (chat_id, repo)
+        );
         """)
     # Migrations for existing databases
     _migrate(conn)
@@ -266,6 +277,72 @@ def save_session_id(chat_id: int, repo: str, session_id: str | None) -> None:
     else:
         conn.execute(
             "DELETE FROM repo_sessions WHERE chat_id = ? AND repo = ?",
+            (chat_id, repo),
+        )
+    conn.commit()
+    conn.close()
+
+
+def load_codex_active_repo(chat_id: int) -> str | None:
+    """Load active repo for a chat in the Codex bot (separate namespace from the Claude agent bot)."""
+    conn = _connect()
+    row = conn.execute("SELECT repo FROM codex_active_repos WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def save_codex_active_repo(chat_id: int, repo: str) -> None:
+    conn = _connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO codex_active_repos (chat_id, repo) VALUES (?, ?)",
+        (chat_id, repo),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_codex_active_branch(chat_id: int) -> str | None:
+    conn = _connect()
+    row = conn.execute("SELECT branch FROM codex_active_repos WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
+def save_codex_active_branch(chat_id: int, branch: str | None) -> None:
+    conn = _connect()
+    conn.execute(
+        """UPDATE codex_active_repos SET branch = ? WHERE chat_id = ?""",
+        (branch, chat_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_codex_session_id(chat_id: int, repo: str) -> str | None:
+    """Load the persisted Codex thread ID for a chat working on a specific repo."""
+    conn = _connect()
+    row = conn.execute(
+        "SELECT session_id FROM codex_repo_sessions WHERE chat_id = ? AND repo = ?",
+        (chat_id, repo),
+    ).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
+def save_codex_session_id(chat_id: int, repo: str, session_id: str | None) -> None:
+    """Persist (or clear) the Codex thread ID for a (chat, repo) pair.
+
+    Pass session_id=None to forget the session for this pair.
+    """
+    conn = _connect()
+    if session_id:
+        conn.execute(
+            "INSERT OR REPLACE INTO codex_repo_sessions (chat_id, repo, session_id) VALUES (?, ?, ?)",
+            (chat_id, repo, session_id),
+        )
+    else:
+        conn.execute(
+            "DELETE FROM codex_repo_sessions WHERE chat_id = ? AND repo = ?",
             (chat_id, repo),
         )
     conn.commit()
