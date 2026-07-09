@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import time
+from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -88,6 +89,7 @@ SKIP_DIRS = frozenset(
     {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build", ".cache", ".tox"}
 )
 SEND_MARKER_RE = re.compile(r"\[SEND:\s*([^\]]+)\]", re.IGNORECASE)
+LOCAL_MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[([^\]\n]+)\]\(([^)\n]+)\)")
 
 ALLOWED_USER_IDS: set[int] = set()
 for uid in os.getenv("ALLOWED_USER_IDS", "").split(","):
@@ -304,8 +306,48 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
+def _resolve_send_path(raw: str, workspace: Path | None) -> Path | None:
+    target = raw.strip()
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1].strip()
+    parsed = urlparse(target)
+    if parsed.scheme == "file":
+        target = parsed.path
+    elif parsed.scheme:
+        return None
+    target = unquote(target)
+    if not target:
+        return None
+
+    path = Path(target)
+    if not path.is_absolute() and workspace:
+        return (workspace / target).resolve()
+    return path.resolve()
+
+
+async def _send_resolved_path(
+    chat_id: int,
+    raw: str,
+    workspace: Path | None,
+    allowed_roots: list[Path],
+    bot,
+    must_exist: bool = False,
+) -> bool:
+    path = _resolve_send_path(raw, workspace)
+    if path is None:
+        return False
+    safe = any(_is_relative_to(path, root) for root in allowed_roots)
+    if not safe:
+        logger.warning("Blocked file send outside workspace: %s", path)
+        return True
+    if must_exist and not path.exists():
+        return False
+    await _send_file_to_user(chat_id, path, bot)
+    return True
+
+
 async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot) -> str:
-    """Strip [SEND: path] markers from text and deliver the referenced files."""
+    """Strip local file-send references from text and deliver the referenced files."""
     markers = SEND_MARKER_RE.findall(text)
     workspace = codex_mgr.workspace_path(repo) if repo else None
     shared = (codex_mgr.workspace_root / ".shared" / str(chat_id)).resolve()
@@ -313,18 +355,22 @@ async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot
     if workspace:
         allowed_roots.append(workspace.resolve())
     for raw in markers:
-        raw = raw.strip()
-        p = Path(raw)
-        if not p.is_absolute() and workspace:
-            p = (workspace / raw).resolve()
-        else:
-            p = p.resolve()
-        safe = any(_is_relative_to(p, root) for root in allowed_roots)
-        if safe:
-            await _send_file_to_user(chat_id, p, bot)
-        else:
-            logger.warning("Blocked file send outside workspace: %s", p)
-    return SEND_MARKER_RE.sub("", text).strip()
+        await _send_resolved_path(chat_id, raw, workspace, allowed_roots, bot)
+
+    text = SEND_MARKER_RE.sub("", text)
+    out: list[str] = []
+    cursor = 0
+    for match in LOCAL_MARKDOWN_LINK_RE.finditer(text):
+        raw_target = match.group(2)
+        if not await _send_resolved_path(chat_id, raw_target, workspace, allowed_roots, bot, must_exist=True):
+            continue
+        out.append(text[cursor : match.start()])
+        out.append(match.group(1))
+        cursor = match.end()
+    if not out:
+        return text.strip()
+    out.append(text[cursor:])
+    return "".join(out).strip()
 
 
 def _make_event_handler(chat_id: int, bot):

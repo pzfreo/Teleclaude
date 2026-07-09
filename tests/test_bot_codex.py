@@ -85,6 +85,45 @@ class TestSendFiles:
         assert remaining == "Here"
         bot.send_document.assert_awaited_once()
 
+    async def test_parse_markdown_workspace_link_sends_file_and_strips_local_target(self, tmp_path):
+        workspace = tmp_path / "pzfreo" / "draftwright"
+        path = workspace / "artifacts" / "ctc_review" / "ctc01_sheet.py"
+        path.parent.mkdir(parents=True)
+        path.write_text("print('hello')\n")
+        bot = MagicMock()
+        bot.send_document = AsyncMock()
+
+        text = f"Created [{path.name}]({path})"
+        with patch.object(bot_codex.codex_mgr, "workspace_path", return_value=workspace):
+            remaining = await bot_codex._parse_and_send_markers(123, text, "pzfreo/draftwright", bot)
+
+        assert remaining == f"Created {path.name}"
+        assert str(path) not in remaining
+        bot.send_document.assert_awaited_once()
+
+    async def test_parse_markdown_external_link_does_not_send_or_rewrite(self):
+        bot = MagicMock()
+        bot.send_document = AsyncMock()
+        text = "See [docs](https://example.com/docs)."
+
+        remaining = await bot_codex._parse_and_send_markers(123, text, None, bot)
+
+        assert remaining == text
+        bot.send_document.assert_not_awaited()
+
+    async def test_parse_markdown_missing_relative_link_does_not_send_or_rewrite(self, tmp_path):
+        workspace = tmp_path / "owner" / "repo"
+        workspace.mkdir(parents=True)
+        bot = MagicMock()
+        bot.send_document = AsyncMock()
+        text = "See [notes](notes.md)."
+
+        with patch.object(bot_codex.codex_mgr, "workspace_path", return_value=workspace):
+            remaining = await bot_codex._parse_and_send_markers(123, text, "owner/repo", bot)
+
+        assert remaining == text
+        bot.send_document.assert_not_awaited()
+
 
 class TestListFiles:
     async def test_list_files_no_repo(self):
