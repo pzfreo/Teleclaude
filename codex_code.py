@@ -22,12 +22,18 @@ import json
 import logging
 import os
 import shutil
+import signal
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 GIT_TIMEOUT = 120  # 2 minutes for git operations
 NPM_UPDATE_TIMEOUT = 180  # 3 minutes for npm update
+PROCESS_ABORT_TIMEOUT = 3  # seconds to wait after TERM before escalating
+
+
+class CodexTurnAborted(Exception):
+    """Raised when a Codex turn is intentionally stopped by the user."""
 
 
 async def update_codex_cli() -> tuple[bool, str]:
@@ -221,6 +227,7 @@ class CodexCodeManager:
         self.cli_path = cli_path or os.getenv("CODEX_CLI_PATH") or shutil.which("codex")
         self._sessions: dict[tuple[int, str], str] = {}  # (chat_id, repo) → Codex thread_id
         self._running_procs: dict[int, asyncio.subprocess.Process] = {}  # chat_id → in-flight proc
+        self._aborted_chats: set[int] = set()
 
     @property
     def available(self) -> bool:
@@ -332,15 +339,51 @@ class CodexCodeManager:
         proc = self._running_procs.get(chat_id)
         return proc is not None and proc.returncode is None
 
-    async def abort(self, chat_id: int) -> bool:
+    async def abort(self, chat_id: int, mark_pending: bool = False) -> bool:
         """Kill the in-flight Codex subprocess for a chat. Returns True if one was killed."""
         proc = self._running_procs.get(chat_id)
         if not proc or proc.returncode is not None:
+            if mark_pending:
+                self._aborted_chats.add(chat_id)
+                return True
             return False
-        proc.kill()
-        await proc.wait()
+        self._aborted_chats.add(chat_id)
+        await self._terminate_proc(chat_id, proc)
         self._running_procs.pop(chat_id, None)
         return True
+
+    async def _terminate_proc(self, chat_id: int, proc: asyncio.subprocess.Process) -> None:
+        self._signal_proc_group(proc, signal.SIGTERM)
+        if not await self._wait_for_proc_exit(proc, PROCESS_ABORT_TIMEOUT):
+            logger.warning("Codex process for chat %d did not stop after SIGTERM; sending SIGKILL", chat_id)
+            self._signal_proc_group(proc, signal.SIGKILL)
+            await self._wait_for_proc_exit(proc, PROCESS_ABORT_TIMEOUT)
+
+    @staticmethod
+    def _signal_proc_group(proc: asyncio.subprocess.Process, sig: signal.Signals) -> None:
+        try:
+            os.killpg(proc.pid, sig)
+            return
+        except ProcessLookupError:
+            return
+        except Exception as e:
+            logger.debug("Could not signal Codex process group for pid %s: %s", getattr(proc, "pid", "?"), e)
+
+        try:
+            if sig == signal.SIGTERM:
+                proc.terminate()
+            else:
+                proc.kill()
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
+    async def _wait_for_proc_exit(proc: asyncio.subprocess.Process, timeout: float) -> bool:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+            return True
+        except TimeoutError:
+            return False
 
     # ── Turn execution ────────────────────────────────────────────────
 
@@ -361,6 +404,9 @@ class CodexCodeManager:
         persisting it to disk (mirrors ClaudeCodeManager's session handling).
         """
         assert self.cli_path is not None, "Codex CLI not found — install it or set CODEX_CLI_PATH"
+        if chat_id in self._aborted_chats:
+            self._aborted_chats.discard(chat_id)
+            raise CodexTurnAborted()
         repo_dir = self.workspace_path(repo)
         session_key = (chat_id, repo)
         session_id = self._sessions.get(session_key)
@@ -383,8 +429,20 @@ class CodexCodeManager:
             stderr=asyncio.subprocess.PIPE,
             limit=10 * 1024 * 1024,
             env=self._git_env(),
+            start_new_session=True,
         )
         self._running_procs[chat_id] = proc
+        if chat_id in self._aborted_chats:
+            await self._terminate_proc(chat_id, proc)
+            self._running_procs.pop(chat_id, None)
+            if proc.stdin is not None:
+                proc.stdin.close()
+                try:
+                    await proc.stdin.wait_closed()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            self._aborted_chats.discard(chat_id)
+            raise CodexTurnAborted()
 
         assert proc.stdin is not None
         try:
@@ -417,6 +475,8 @@ class CodexCodeManager:
         try:
             assert proc.stdout is not None
             async for raw_line in proc.stdout:
+                if chat_id in self._aborted_chats:
+                    break
                 line = raw_line.decode(errors="replace").strip()
                 if not line:
                     continue
@@ -443,6 +503,10 @@ class CodexCodeManager:
                 await stderr_task
             except (asyncio.CancelledError, Exception):
                 pass
+
+        if chat_id in self._aborted_chats:
+            self._aborted_chats.discard(chat_id)
+            raise CodexTurnAborted()
 
         if proc.returncode != 0:
             stderr_text = "\n".join(stderr_lines[-20:])

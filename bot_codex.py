@@ -34,6 +34,7 @@ from telegram.ext import (
 
 from codex_code import (
     CodexCodeManager,
+    CodexTurnAborted,
     format_item_progress,
     get_codex_cli_version,
     looks_like_auth_error,
@@ -615,7 +616,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.effective_chat.id
     _stop_typing(chat_id)
     await _clear_progress(chat_id, context.bot)
-    stopped = await codex_mgr.abort(chat_id)
+    stopped = await codex_mgr.abort(chat_id, mark_pending=_chat_lock(chat_id).locked())
     await update.message.reply_text("Stopped." if stopped else "Nothing running.")
 
 
@@ -793,6 +794,9 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
     on_event, state = _make_event_handler(chat_id, context.bot)
     try:
         await codex_mgr.run_turn(chat_id, repo, prompt, on_event, model=get_model(chat_id))
+    except CodexTurnAborted:
+        logger.info("Codex turn stopped for chat %d", chat_id)
+        return
     except Exception as e:
         logger.error("Codex run_turn failed for chat %d: %s", chat_id, e, exc_info=True)
         await update.message.reply_text(f"Codex Code error: {e}")
