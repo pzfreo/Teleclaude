@@ -1,12 +1,19 @@
 """Tests for codex_code.py — mocked subprocess."""
 
 import json
+import signal
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from codex_code import CodexCodeManager, format_agent_progress, format_item_progress, looks_like_auth_error
+from codex_code import (
+    CodexCodeManager,
+    CodexTurnAborted,
+    format_agent_progress,
+    format_item_progress,
+    looks_like_auth_error,
+)
 
 
 class TestCodexCodeManager:
@@ -65,6 +72,33 @@ class TestCodexCodeManager:
     async def test_abort_no_proc_returns_false(self, tmp_path):
         mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
         assert await mgr.abort(1001) is False
+
+    async def test_abort_can_mark_pending_turn_without_proc(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+
+        assert await mgr.abort(1001, mark_pending=True) is True
+        assert 1001 in mgr._aborted_chats
+
+    async def test_abort_signals_process_group_and_marks_chat_aborted(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+
+        class _RunningProc:
+            pid = 4321
+            returncode = None
+
+            async def wait(self):
+                self.returncode = -signal.SIGTERM
+                return self.returncode
+
+        proc = _RunningProc()
+        mgr._running_procs[1001] = proc  # type: ignore[assignment]
+
+        with patch("os.killpg") as killpg:
+            assert await mgr.abort(1001) is True
+
+        killpg.assert_called_once_with(4321, signal.SIGTERM)
+        assert 1001 not in mgr._running_procs
+        assert 1001 in mgr._aborted_chats
 
 
 class TestTokenNotInCloneUrl:
@@ -227,6 +261,7 @@ class TestRunTurn:
 
         class _FakeProc:
             def __init__(self):
+                self.pid = 4321
                 self.stdin = _FakeStdin()
                 self.stdout = _FakeStream(stdout_lines)
                 self.stderr = _FakeStream([])
@@ -254,6 +289,7 @@ class TestRunTurn:
 
         async def fake_create(*args, **_kwargs):
             captured["cmd"] = list(args)
+            captured["kwargs"] = _kwargs
             return proc
 
         received: list[dict] = []
@@ -271,10 +307,55 @@ class TestRunTurn:
         assert "resume" not in cmd
         assert "hello" not in cmd
         assert cmd[-1] == "-"
+        assert captured["kwargs"]["start_new_session"] is True
         assert proc.stdin.data == b"hello"
         assert proc.stdin.closed is True
         assert mgr.get_session_id(1001, "owner/repo") == "thread-123"
         assert len(received) == 3
+
+    async def test_pending_abort_prevents_process_launch(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
+        repo_dir = mgr.workspace_path("owner/repo")
+        repo_dir.mkdir(parents=True)
+        mgr._aborted_chats.add(1001)
+
+        async def on_event(event):
+            pass
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=AsyncMock()) as create_proc,
+            pytest.raises(CodexTurnAborted),
+        ):
+            await mgr.run_turn(1001, "owner/repo", "hello", on_event)
+
+        create_proc.assert_not_awaited()
+        assert 1001 not in mgr._aborted_chats
+
+    async def test_abort_during_process_launch_terminates_created_proc(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
+        repo_dir = mgr.workspace_path("owner/repo")
+        repo_dir.mkdir(parents=True)
+        proc = self._fake_proc([], returncode=None)
+
+        async def fake_create(*_args, **_kwargs):
+            mgr._aborted_chats.add(1001)
+            return proc
+
+        async def on_event(event):
+            pass
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=fake_create),
+            patch("os.killpg") as killpg,
+            pytest.raises(CodexTurnAborted),
+        ):
+            await mgr.run_turn(1001, "owner/repo", "hello", on_event)
+
+        killpg.assert_called_once_with(4321, signal.SIGTERM)
+        assert proc.stdin.data == b""
+        assert proc.stdin.closed is True
+        assert 1001 not in mgr._running_procs
+        assert 1001 not in mgr._aborted_chats
 
     async def test_resume_uses_stored_session_id(self, tmp_path):
         mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
@@ -322,6 +403,51 @@ class TestRunTurn:
             await mgr.run_turn(1001, "owner/repo", "hello", on_event)
 
         assert any(e.get("type") == "_process_error" for e in received)
+
+    async def test_aborted_turn_suppresses_buffered_events(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
+        repo_dir = mgr.workspace_path("owner/repo")
+        repo_dir.mkdir(parents=True)
+
+        class _AbortStream:
+            def __init__(self):
+                self.sent = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.sent:
+                    raise StopAsyncIteration
+                self.sent = True
+                mgr._aborted_chats.add(1001)
+                return b'{"type":"item.completed","item":{"type":"agent_message","text":"late"}}\n'
+
+        class _FakeProc:
+            pid = 4321
+            returncode = -signal.SIGTERM
+
+            def __init__(self):
+                base = TestRunTurn._fake_proc([])
+                self.stdin = base.stdin
+                self.stderr = base.stderr
+                self.stdout = _AbortStream()
+
+            async def wait(self):
+                return self.returncode
+
+        async def fake_create(*_args, **_kwargs):
+            return _FakeProc()
+
+        received: list[dict] = []
+
+        async def on_event(event):
+            received.append(event)
+
+        with patch("asyncio.create_subprocess_exec", new=fake_create), pytest.raises(CodexTurnAborted):
+            await mgr.run_turn(1001, "owner/repo", "hello", on_event)
+
+        assert received == []
 
     async def test_running_proc_cleared_after_turn(self, tmp_path):
         mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
