@@ -390,7 +390,7 @@ class TestCommandHandlers:
             patch("bot.save_model"),
         ):
             await show_model(update, ctx)
-        assert chat_models.get(7775) == "claude-opus-4-6"
+        assert chat_models.get(7775) == "claude-opus-5"
         text = update.message.reply_text.call_args[0][0]
         assert "opus" in text.lower()
         chat_models.pop(7775, None)
