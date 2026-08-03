@@ -352,6 +352,48 @@ class CodexCodeManager:
         self._running_procs.pop(chat_id, None)
         return True
 
+    async def interrupt(self, chat_id: int, mark_pending: bool = False) -> bool:
+        """Cancel the active turn without signaling its process group.
+
+        This is the soft-cancel counterpart to :meth:`abort`.  It signals only
+        the Codex parent process so independently running/background children
+        are not deliberately killed.  If Codex does not exit after SIGINT, the
+        parent alone is terminated and finally killed.
+        """
+        proc = self._running_procs.get(chat_id)
+        if not proc or proc.returncode is not None:
+            if mark_pending:
+                self._aborted_chats.add(chat_id)
+                return True
+            return False
+        self._aborted_chats.add(chat_id)
+        await self._interrupt_proc(chat_id, proc)
+        self._running_procs.pop(chat_id, None)
+        return True
+
+    async def _interrupt_proc(self, chat_id: int, proc: asyncio.subprocess.Process) -> None:
+        try:
+            proc.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            return
+        if await self._wait_for_proc_exit(proc, PROCESS_ABORT_TIMEOUT):
+            return
+
+        logger.warning("Codex process for chat %d ignored SIGINT; terminating parent only", chat_id)
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        if await self._wait_for_proc_exit(proc, PROCESS_ABORT_TIMEOUT):
+            return
+
+        logger.warning("Codex process for chat %d ignored SIGTERM; killing parent only", chat_id)
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+        await self._wait_for_proc_exit(proc, PROCESS_ABORT_TIMEOUT)
+
     async def _terminate_proc(self, chat_id: int, proc: asyncio.subprocess.Process) -> None:
         self._signal_proc_group(proc, signal.SIGTERM)
         if not await self._wait_for_proc_exit(proc, PROCESS_ABORT_TIMEOUT):

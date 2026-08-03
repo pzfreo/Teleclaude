@@ -100,6 +100,36 @@ class TestCodexCodeManager:
         assert 1001 not in mgr._running_procs
         assert 1001 in mgr._aborted_chats
 
+    async def test_interrupt_signals_parent_only_and_marks_chat_aborted(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+
+        class _RunningProc:
+            pid = 4321
+            returncode = None
+
+            def send_signal(self, sig):
+                assert sig == signal.SIGINT
+                self.returncode = -sig
+
+            async def wait(self):
+                return self.returncode
+
+        proc = _RunningProc()
+        mgr._running_procs[1001] = proc  # type: ignore[assignment]
+
+        with patch("os.killpg") as killpg:
+            assert await mgr.interrupt(1001) is True
+
+        killpg.assert_not_called()
+        assert 1001 not in mgr._running_procs
+        assert 1001 in mgr._aborted_chats
+
+    async def test_interrupt_can_mark_pending_turn_without_proc(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+
+        assert await mgr.interrupt(1001, mark_pending=True) is True
+        assert 1001 in mgr._aborted_chats
+
 
 class TestTokenNotInCloneUrl:
     async def test_ensure_clone_url_does_not_contain_token(self, tmp_path):
