@@ -75,6 +75,7 @@ DEFAULT_MODEL = os.getenv("CODEX_MODEL", "")  # empty = let the CLI use its own 
 MAX_TELEGRAM_LENGTH = 4096
 TYPING_INTERVAL = 4
 MAX_PROGRESS_LINES = 6
+CODEX_IDLE_HEARTBEAT_SECONDS = max(1, int(os.getenv("CODEX_IDLE_HEARTBEAT_SECONDS", "600")))
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
 _MIME_TO_EXT = {
@@ -373,7 +374,7 @@ async def _parse_and_send_markers(chat_id: int, text: str, repo: str | None, bot
     return "".join(out).strip()
 
 
-def _make_event_handler(chat_id: int, bot):
+def _make_event_handler(chat_id: int, bot, activity_event: asyncio.Event | None = None):
     """Build an on_event callback that renders Codex exec JSON events into Telegram."""
     state = {"final_text": None, "usage": None}
     pending_agent_message: str | None = None
@@ -388,6 +389,8 @@ def _make_event_handler(chat_id: int, bot):
 
     async def on_event(event: dict) -> None:
         nonlocal pending_agent_message
+        if activity_event is not None:
+            activity_event.set()
         event_type = event.get("type")
 
         if event_type == "item.started":
@@ -431,6 +434,22 @@ def _make_event_handler(chat_id: int, bot):
     return on_event, state
 
 
+async def _idle_heartbeat(chat_id: int, bot, activity_event: asyncio.Event) -> None:
+    """Post a durable status update when Codex emits no events for a while."""
+    while True:
+        activity_event.clear()
+        try:
+            await asyncio.wait_for(activity_event.wait(), timeout=CODEX_IDLE_HEARTBEAT_SECONDS)
+        except TimeoutError:
+            minutes = max(1, round(CODEX_IDLE_HEARTBEAT_SECONDS / 60))
+            await send_long_message(
+                chat_id,
+                f"Still working. No new Codex events for {minutes} minute(s). Use /cancel to interrupt.",
+                bot,
+                disable_notification=True,
+            )
+
+
 # ── Commands ──────────────────────────────────────────────────────────
 
 
@@ -449,7 +468,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/repo owner/name - Set the active GitHub repo directly\n"
         "/branch name - Set active branch\n"
         "/newsession - Wipe this repo's session and start fresh\n"
-        "/stop - Kill any in-flight Codex run\n"
+        "/cancel - Interrupt the active turn (keeps background tasks)\n"
+        "/stop - Kill the Codex run and its child processes\n"
         "/model [name] - Show or switch model\n"
         "/files - Browse and download workspace files\n"
         "/update - Update Codex CLI to latest version\n"
@@ -666,6 +686,17 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("Stopped." if stopped else "Nothing running.")
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Interrupt only the active Codex turn, leaving background work alone."""
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    _stop_typing(chat_id)
+    await _clear_progress(chat_id, context.bot)
+    cancelled = await codex_mgr.interrupt(chat_id, mark_pending=_chat_lock(chat_id).locked())
+    await update.message.reply_text("Cancelled current turn." if cancelled else "Nothing running.")
+
+
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
@@ -807,7 +838,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         paths_str = "\n".join(f"  - {p}" for p in attachment_paths)
         prompt += f"\n\nAttached files (saved to disk, you can read them):\n{paths_str}"
 
-    async with _chat_lock(chat_id):
+    lock = _chat_lock(chat_id)
+    if lock.locked():
+        await msg.reply_text("Codex is still working on the previous request. Use /cancel to interrupt it.")
+        return
+
+    async with lock:
         await _dispatch_prompt(chat_id, prompt, update, context)
 
 
@@ -837,7 +873,9 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
         return
 
     _start_typing(chat_id, context.bot)
-    on_event, state = _make_event_handler(chat_id, context.bot)
+    activity_event = asyncio.Event()
+    on_event, state = _make_event_handler(chat_id, context.bot, activity_event)
+    heartbeat_task = asyncio.create_task(_idle_heartbeat(chat_id, context.bot, activity_event))
     try:
         await codex_mgr.run_turn(chat_id, repo, prompt, on_event, model=get_model(chat_id))
     except CodexTurnAborted:
@@ -848,6 +886,11 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
         await update.message.reply_text(f"Codex Code error: {e}")
         return
     finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
         _stop_typing(chat_id)
 
     new_session_id = codex_mgr.get_session_id(chat_id, repo)
@@ -868,7 +911,8 @@ async def notify_startup(app: Application) -> None:
             ("repo", "Set active GitHub repo (list / number / name / owner/name)"),
             ("branch", "Set active branch"),
             ("newsession", "Wipe this repo's session and start fresh"),
-            ("stop", "Kill any in-flight Codex run"),
+            ("cancel", "Interrupt active turn; keep background tasks"),
+            ("stop", "Kill Codex run and child processes"),
             ("model", "Show or switch model"),
             ("files", "Browse and download workspace files"),
             ("update", "Update Codex CLI to latest version"),
@@ -890,6 +934,7 @@ def main() -> None:
     app.add_handler(CommandHandler("repo", set_repo))
     app.add_handler(CommandHandler("branch", set_branch))
     app.add_handler(CommandHandler("newsession", new_session_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("model", show_model))
     app.add_handler(CommandHandler("files", list_files))

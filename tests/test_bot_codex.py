@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -256,3 +257,102 @@ class TestProgressExplanations:
         assert state["final_text"] == "Done."
         update_progress.assert_not_awaited()
         send_long_message.assert_not_awaited()
+
+    async def test_event_handler_marks_turn_activity(self):
+        activity = asyncio.Event()
+        on_event, _state = bot_codex._make_event_handler(123, object(), activity)
+
+        await on_event({"type": "turn.started"})
+
+        assert activity.is_set()
+
+
+class TestIdleHeartbeat:
+    async def test_posts_after_idle_interval_and_resets_after_activity(self):
+        activity = asyncio.Event()
+        bot = object()
+
+        with (
+            patch("bot_codex.CODEX_IDLE_HEARTBEAT_SECONDS", 0.01),
+            patch("bot_codex.send_long_message", new_callable=AsyncMock) as send_long_message,
+        ):
+            task = asyncio.create_task(bot_codex._idle_heartbeat(123, bot, activity))
+            try:
+                await asyncio.sleep(0.015)
+                assert send_long_message.await_count == 1
+
+                activity.set()
+                await asyncio.sleep(0)
+                await asyncio.sleep(0.015)
+                assert send_long_message.await_count == 2
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        send_long_message.assert_awaited_with(
+            123,
+            "Still working. No new Codex events for 1 minute(s). Use /cancel to interrupt.",
+            bot,
+            disable_notification=True,
+        )
+
+
+class TestLongRunningTurn:
+    async def test_second_message_reports_busy_instead_of_waiting(self):
+        chat_id = 401
+        update = _make_update(chat_id=chat_id)
+        update.message.text = "another request"
+        update.message.caption = None
+        update.message.photo = []
+        update.message.document = None
+        context = _make_context()
+        lock = bot_codex._chat_lock(chat_id)
+
+        await lock.acquire()
+        try:
+            with (
+                patch("bot_codex.is_authorized", return_value=True),
+                patch("bot_codex._dispatch_prompt", new_callable=AsyncMock) as dispatch,
+            ):
+                await bot_codex.handle_message(update, context)
+        finally:
+            lock.release()
+            bot_codex._chat_locks.pop(chat_id, None)
+
+        dispatch.assert_not_awaited()
+        update.message.reply_text.assert_awaited_once_with(
+            "Codex is still working on the previous request. Use /cancel to interrupt it."
+        )
+
+
+class TestCancellationCommands:
+    async def test_cancel_uses_parent_only_interrupt(self):
+        update = _make_update(chat_id=501)
+        context = _make_context()
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch.object(bot_codex.codex_mgr, "interrupt", new_callable=AsyncMock, return_value=True) as interrupt,
+            patch("bot_codex._clear_progress", new_callable=AsyncMock),
+        ):
+            await bot_codex.cancel_command(update, context)
+
+        interrupt.assert_awaited_once_with(501, mark_pending=False)
+        update.message.reply_text.assert_awaited_once_with("Cancelled current turn.")
+
+    async def test_stop_keeps_hard_process_group_abort(self):
+        update = _make_update(chat_id=502)
+        context = _make_context()
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch.object(bot_codex.codex_mgr, "abort", new_callable=AsyncMock, return_value=True) as abort,
+            patch("bot_codex._clear_progress", new_callable=AsyncMock),
+        ):
+            await bot_codex.stop_command(update, context)
+
+        abort.assert_awaited_once_with(502, mark_pending=False)
+        update.message.reply_text.assert_awaited_once_with("Stopped.")
