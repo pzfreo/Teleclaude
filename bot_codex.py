@@ -468,8 +468,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/repo owner/name - Set the active GitHub repo directly\n"
         "/branch name - Set active branch\n"
         "/newsession - Wipe this repo's session and start fresh\n"
-        "/cancel - Ask the active turn to stop gracefully\n"
-        "/stop - Force-kill the Codex run and its child processes\n"
+        "/cancel - Interrupt the active turn (keeps background tasks)\n"
+        "/stop - Kill the Codex run and its child processes\n"
         "/model [name] - Show or switch model\n"
         "/files - Browse and download workspace files\n"
         "/update - Update Codex CLI to latest version\n"
@@ -687,19 +687,14 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ask the active Codex turn to stop gracefully, without force-killing it."""
+    """Interrupt only the active Codex turn, leaving background work alone."""
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
     _stop_typing(chat_id)
     await _clear_progress(chat_id, context.bot)
     cancelled = await codex_mgr.interrupt(chat_id, mark_pending=_chat_lock(chat_id).locked())
-    if not cancelled:
-        await update.message.reply_text("Nothing running.")
-    elif codex_mgr.has_running_proc(chat_id):
-        await update.message.reply_text("Turn cancelled, but Codex ignored the interrupt. Use /stop to kill it.")
-    else:
-        await update.message.reply_text("Cancelled current turn.")
+    await update.message.reply_text("Cancelled current turn." if cancelled else "Nothing running.")
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -916,8 +911,8 @@ async def notify_startup(app: Application) -> None:
             ("repo", "Set active GitHub repo (list / number / name / owner/name)"),
             ("branch", "Set active branch"),
             ("newsession", "Wipe this repo's session and start fresh"),
-            ("cancel", "Ask the active turn to stop gracefully"),
-            ("stop", "Force-kill Codex run and child processes"),
+            ("cancel", "Interrupt active turn; keep background tasks"),
+            ("stop", "Kill Codex run and child processes"),
             ("model", "Show or switch model"),
             ("files", "Browse and download workspace files"),
             ("update", "Update Codex CLI to latest version"),
