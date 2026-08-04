@@ -329,7 +329,7 @@ class TestLongRunningTurn:
 
 
 class TestCancellationCommands:
-    async def test_cancel_uses_parent_only_interrupt(self):
+    async def test_cancel_uses_graceful_interrupt(self):
         update = _make_update(chat_id=501)
         context = _make_context()
 
@@ -342,6 +342,22 @@ class TestCancellationCommands:
 
         interrupt.assert_awaited_once_with(501, mark_pending=False)
         update.message.reply_text.assert_awaited_once_with("Cancelled current turn.")
+
+    async def test_cancel_points_at_stop_when_process_survives(self):
+        update = _make_update(chat_id=503)
+        context = _make_context()
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch.object(bot_codex.codex_mgr, "interrupt", new_callable=AsyncMock, return_value=True),
+            patch.object(bot_codex.codex_mgr, "has_running_proc", return_value=True),
+            patch("bot_codex._clear_progress", new_callable=AsyncMock),
+        ):
+            await bot_codex.cancel_command(update, context)
+
+        update.message.reply_text.assert_awaited_once_with(
+            "Turn cancelled, but Codex ignored the interrupt. Use /stop to kill it."
+        )
 
     async def test_stop_keeps_hard_process_group_abort(self):
         update = _make_update(chat_id=502)
