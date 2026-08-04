@@ -448,6 +448,13 @@ class CodexCodeManager:
         session_key = (chat_id, repo)
         session_id = self._sessions.get(session_key)
 
+        # A soft cancel leaves a SIGINT-ignoring process alive and detached. Kill it
+        # now rather than run two Codex processes against the same workspace.
+        stale = self._running_procs.pop(chat_id, None)
+        if stale is not None and stale.returncode is None:
+            logger.warning("Killing abandoned Codex process for chat %d before starting a new turn", chat_id)
+            await self._terminate_proc(chat_id, stale)
+
         cmd = [self.cli_path, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
         if model:
             cmd.extend(["-m", model])
@@ -547,7 +554,10 @@ class CodexCodeManager:
             self._abort_events.pop(chat_id, None)
             # Bounded: after a soft cancel the process may still be alive, and an
             # unbounded wait here would hold the caller's per-chat lock forever.
-            if await self._wait_for_proc_exit(proc, PROCESS_ABORT_TIMEOUT):
+            # On a clean EOF the exit is imminent and its code decides whether we
+            # report a failure, so wait longer there than on the abort path.
+            exit_timeout = PROCESS_ABORT_TIMEOUT if abort_event.is_set() else PROCESS_INTERRUPT_GRACE
+            if await self._wait_for_proc_exit(proc, exit_timeout):
                 self._running_procs.pop(chat_id, None)
             else:
                 logger.warning("Codex process for chat %d outlived its turn; /stop will kill it", chat_id)

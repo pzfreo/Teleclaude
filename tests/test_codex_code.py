@@ -459,6 +459,66 @@ class TestRunTurn:
 
         assert 1001 not in mgr._abort_events
 
+    async def test_new_turn_kills_process_abandoned_by_soft_cancel(self, tmp_path):
+        """/cancel can leave a SIGINT-ignoring process alive; it must not outlive the next turn."""
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
+        repo_dir = mgr.workspace_path("owner/repo")
+        repo_dir.mkdir(parents=True)
+
+        class _StaleProc:
+            pid = 9999
+            returncode = None
+
+            async def wait(self):
+                self.returncode = -signal.SIGKILL
+                return self.returncode
+
+        mgr._running_procs[1001] = _StaleProc()  # type: ignore[assignment]
+
+        async def fake_create(*_args, **_kwargs):
+            return self._fake_proc([])
+
+        async def on_event(event):
+            pass
+
+        with patch("asyncio.create_subprocess_exec", new=fake_create), patch("os.killpg") as killpg:
+            await mgr.run_turn(1001, "owner/repo", "hello", on_event)
+
+        killpg.assert_called_once_with(9999, signal.SIGTERM)
+
+    async def test_nonzero_exit_still_reported_after_clean_eof(self, tmp_path):
+        """The bounded wait added for soft cancels must not swallow a real failure."""
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
+        repo_dir = mgr.workspace_path("owner/repo")
+        repo_dir.mkdir(parents=True)
+
+        proc = self._fake_proc([], returncode=None)
+
+        async def wait():
+            # Slower than the abort-path budget, well inside the clean-EOF one.
+            await asyncio.sleep(0.05)
+            proc.returncode = 2
+            return 2
+
+        proc.wait = wait
+
+        async def fake_create(*_args, **_kwargs):
+            return proc
+
+        received: list[dict] = []
+
+        async def on_event(event):
+            received.append(event)
+
+        with (
+            patch("asyncio.create_subprocess_exec", new=fake_create),
+            patch("codex_code.PROCESS_ABORT_TIMEOUT", 0.01),
+            patch("codex_code.PROCESS_INTERRUPT_GRACE", 2),
+        ):
+            await mgr.run_turn(1001, "owner/repo", "hello", on_event)
+
+        assert received == [{"type": "_process_error", "returncode": 2, "stderr": ""}]
+
     async def test_resume_uses_stored_session_id(self, tmp_path):
         mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
         repo_dir = mgr.workspace_path("owner/repo")
