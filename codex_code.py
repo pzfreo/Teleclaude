@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 GIT_TIMEOUT = 120  # 2 minutes for git operations
 NPM_UPDATE_TIMEOUT = 180  # 3 minutes for npm update
 PROCESS_ABORT_TIMEOUT = 3  # seconds to wait after TERM before escalating
+PROCESS_INTERRUPT_GRACE = 15  # seconds to let Codex wind down after SIGINT
 
 
 class CodexTurnAborted(Exception):
@@ -228,6 +229,7 @@ class CodexCodeManager:
         self._sessions: dict[tuple[int, str], str] = {}  # (chat_id, repo) → Codex thread_id
         self._running_procs: dict[int, asyncio.subprocess.Process] = {}  # chat_id → in-flight proc
         self._aborted_chats: set[int] = set()
+        self._abort_events: dict[int, asyncio.Event] = {}  # chat_id → signal to stop reading stdout
 
     @property
     def available(self) -> bool:
@@ -339,60 +341,56 @@ class CodexCodeManager:
         proc = self._running_procs.get(chat_id)
         return proc is not None and proc.returncode is None
 
+    def _release_reader(self, chat_id: int) -> None:
+        """Unblock run_turn's stdout reader, whether or not the process actually dies.
+
+        The `codex` entry point is an npm shim that relays signals to the real
+        binary; descendants inherit our stdout pipe, so a surviving child keeps
+        it open forever. Never make the reader depend on EOF.
+        """
+        event = self._abort_events.get(chat_id)
+        if event is not None:
+            event.set()
+
     async def abort(self, chat_id: int, mark_pending: bool = False) -> bool:
         """Kill the in-flight Codex subprocess for a chat. Returns True if one was killed."""
         proc = self._running_procs.get(chat_id)
         if not proc or proc.returncode is not None:
             if mark_pending:
                 self._aborted_chats.add(chat_id)
+                self._release_reader(chat_id)
                 return True
             return False
         self._aborted_chats.add(chat_id)
+        self._release_reader(chat_id)
         await self._terminate_proc(chat_id, proc)
         self._running_procs.pop(chat_id, None)
         return True
 
     async def interrupt(self, chat_id: int, mark_pending: bool = False) -> bool:
-        """Cancel the active turn without signaling its process group.
+        """Ask the active turn to stop gracefully, without force-killing it.
 
-        This is the soft-cancel counterpart to :meth:`abort`.  It signals only
-        the Codex parent process so independently running/background children
-        are not deliberately killed.  If Codex does not exit after SIGINT, the
-        parent alone is terminated and finally killed.
+        The soft-cancel counterpart to :meth:`abort`: SIGINT goes to the process
+        group so it reaches the real Codex binary behind the npm shim, and there
+        is no SIGKILL escalation. A process that ignores SIGINT is left running
+        and stays reachable by :meth:`abort` (`/stop`) — the turn detaches from
+        it either way.
         """
         proc = self._running_procs.get(chat_id)
         if not proc or proc.returncode is not None:
             if mark_pending:
                 self._aborted_chats.add(chat_id)
+                self._release_reader(chat_id)
                 return True
             return False
         self._aborted_chats.add(chat_id)
-        await self._interrupt_proc(chat_id, proc)
-        self._running_procs.pop(chat_id, None)
+        self._release_reader(chat_id)
+        self._signal_proc_group(proc, signal.SIGINT)
+        if await self._wait_for_proc_exit(proc, PROCESS_INTERRUPT_GRACE):
+            self._running_procs.pop(chat_id, None)
+        else:
+            logger.warning("Codex process for chat %d ignored SIGINT; leaving it for /stop", chat_id)
         return True
-
-    async def _interrupt_proc(self, chat_id: int, proc: asyncio.subprocess.Process) -> None:
-        try:
-            proc.send_signal(signal.SIGINT)
-        except ProcessLookupError:
-            return
-        if await self._wait_for_proc_exit(proc, PROCESS_ABORT_TIMEOUT):
-            return
-
-        logger.warning("Codex process for chat %d ignored SIGINT; terminating parent only", chat_id)
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            return
-        if await self._wait_for_proc_exit(proc, PROCESS_ABORT_TIMEOUT):
-            return
-
-        logger.warning("Codex process for chat %d ignored SIGTERM; killing parent only", chat_id)
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            return
-        await self._wait_for_proc_exit(proc, PROCESS_ABORT_TIMEOUT)
 
     async def _terminate_proc(self, chat_id: int, proc: asyncio.subprocess.Process) -> None:
         self._signal_proc_group(proc, signal.SIGTERM)
@@ -412,10 +410,7 @@ class CodexCodeManager:
             logger.debug("Could not signal Codex process group for pid %s: %s", getattr(proc, "pid", "?"), e)
 
         try:
-            if sig == signal.SIGTERM:
-                proc.terminate()
-            else:
-                proc.kill()
+            proc.send_signal(sig)
         except ProcessLookupError:
             pass
 
@@ -453,6 +448,13 @@ class CodexCodeManager:
         session_key = (chat_id, repo)
         session_id = self._sessions.get(session_key)
 
+        # A soft cancel leaves a SIGINT-ignoring process alive and detached. Kill it
+        # now rather than run two Codex processes against the same workspace.
+        stale = self._running_procs.pop(chat_id, None)
+        if stale is not None and stale.returncode is None:
+            logger.warning("Killing abandoned Codex process for chat %d before starting a new turn", chat_id)
+            await self._terminate_proc(chat_id, stale)
+
         cmd = [self.cli_path, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
         if model:
             cmd.extend(["-m", model])
@@ -474,9 +476,12 @@ class CodexCodeManager:
             start_new_session=True,
         )
         self._running_procs[chat_id] = proc
+        abort_event = asyncio.Event()
+        self._abort_events[chat_id] = abort_event
         if chat_id in self._aborted_chats:
             await self._terminate_proc(chat_id, proc)
             self._running_procs.pop(chat_id, None)
+            self._abort_events.pop(chat_id, None)
             if proc.stdin is not None:
                 proc.stdin.close()
                 try:
@@ -513,11 +518,18 @@ class CodexCodeManager:
                 logger.debug("Codex stderr reader ended for chat %d: %s", chat_id, e)
 
         stderr_task = asyncio.create_task(_drain_stderr())
+        abort_waiter = asyncio.create_task(abort_event.wait())
 
         try:
             assert proc.stdout is not None
-            async for raw_line in proc.stdout:
-                if chat_id in self._aborted_chats:
+            while True:
+                read_task = asyncio.create_task(proc.stdout.readline())
+                done, _pending = await asyncio.wait({read_task, abort_waiter}, return_when=asyncio.FIRST_COMPLETED)
+                if read_task not in done:
+                    read_task.cancel()
+                    break
+                raw_line = read_task.result()
+                if not raw_line or chat_id in self._aborted_chats:
                     break
                 line = raw_line.decode(errors="replace").strip()
                 if not line:
@@ -538,8 +550,17 @@ class CodexCodeManager:
                 except Exception as e:
                     logger.error("Codex on_event handler failed for chat %d: %s", chat_id, e, exc_info=True)
         finally:
-            await proc.wait()
-            self._running_procs.pop(chat_id, None)
+            abort_waiter.cancel()
+            self._abort_events.pop(chat_id, None)
+            # Bounded: after a soft cancel the process may still be alive, and an
+            # unbounded wait here would hold the caller's per-chat lock forever.
+            # On a clean EOF the exit is imminent and its code decides whether we
+            # report a failure, so wait longer there than on the abort path.
+            exit_timeout = PROCESS_ABORT_TIMEOUT if abort_event.is_set() else PROCESS_INTERRUPT_GRACE
+            if await self._wait_for_proc_exit(proc, exit_timeout):
+                self._running_procs.pop(chat_id, None)
+            else:
+                logger.warning("Codex process for chat %d outlived its turn; /stop will kill it", chat_id)
             stderr_task.cancel()
             try:
                 await stderr_task
@@ -550,6 +571,6 @@ class CodexCodeManager:
             self._aborted_chats.discard(chat_id)
             raise CodexTurnAborted()
 
-        if proc.returncode != 0:
+        if proc.returncode not in (0, None):
             stderr_text = "\n".join(stderr_lines[-20:])
             await on_event({"type": "_process_error", "returncode": proc.returncode, "stderr": stderr_text})
