@@ -46,15 +46,6 @@ RUN npm install -g @openai/codex
 RUN curl -fsSL https://github.com/estampo/boo-cloud/releases/latest/download/install.sh \
     | BOO_CLOUD_INSTALL_DIR=/usr/local/bin sh
 
-# Install rtk (Rust Token Killer) — CLI "context tool". The agent entrypoint
-# registers an rtk PreToolUse hook in ~/.claude/settings.json that transparently
-# compresses Bash command output before it enters the model's context. Needs jq
-# (above).
-ENV RTK_VERSION=v0.28.2
-RUN curl -fsSL "https://github.com/rtk-ai/rtk/releases/download/${RTK_VERSION}/rtk-x86_64-unknown-linux-musl.tar.gz" \
-    | tar -xz -C /usr/local/bin rtk \
-    && chmod +x /usr/local/bin/rtk
-
 # Install agent-browser (Vercel) + its MCP wrapper and Playwright/Chromium.
 # Browsers are installed to /opt/playwright-browsers so the non-root user can read them.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
