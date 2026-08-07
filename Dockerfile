@@ -40,6 +40,11 @@ RUN npm install -g @anthropic-ai/claude-code
 # Install Codex CLI (prototype teleclaude-codex bot) into the same npm prefix.
 RUN npm install -g @openai/codex
 
+# Install pnpm into the same npm prefix so the agent and codex bots can use it
+# on JS workspaces. Installed via npm rather than corepack to match the other
+# CLIs here and to avoid a lazy package download on first use at runtime.
+RUN npm install -g pnpm
+
 # Install boocloud-bridge (Bambu Lab printer bridge used by the agent's
 # boo-cloud MCP server). Tracks the latest published release; rebuild the
 # container to pick up a new version.
