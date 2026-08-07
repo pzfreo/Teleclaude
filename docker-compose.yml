@@ -49,10 +49,6 @@ services:
           claude mcp remove boo-cloud 2>/dev/null
           claude mcp add -s user boo-cloud -- boocloud-mcp
         '
-        # RTK output filtering: registers a PreToolUse hook that transparently
-        # compresses Bash command output before it enters the model's context.
-        # Independent of any proxy; Claude talks to the Anthropic API directly.
-        timeout 20 runuser -u teleclaude -- rtk init --global --auto-patch < /dev/null || true
         exec runuser -u teleclaude -- python bot_agent.py
     volumes:
       - teleclaude-agent-data:/app/data
@@ -61,8 +57,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
 
   # Prototype: Codex CLI bot, parallel to teleclaude-agent but backed by
-  # OpenAI's Codex CLI instead of Claude Code. No rtk hook, no boo-cloud MCP
-  # registration, no docker socket access — those are Claude-Code-specific.
+  # OpenAI's Codex CLI instead of Claude Code. No boo-cloud MCP registration,
+  # no docker socket access — those are Claude-Code-specific.
   teleclaude-codex:
     build: .
     restart: unless-stopped

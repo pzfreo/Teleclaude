@@ -2,10 +2,10 @@
 
 Trimmed counterpart to bot_agent.py. Deliberately does NOT include: autocompact
 (Codex's context window/compaction behavior differs and wasn't scoped here),
-the rtk context-compression hook (Claude-Code-specific), persistent stream
-mode (codex_code.py has no equivalent — see its module docstring), the
-[ASK:] inline-keyboard flow, and /files /df /cleanup /plan /work /btw. Those
-are candidates for a follow-up once this prototype is validated.
+persistent stream mode (codex_code.py has no equivalent — see its module
+docstring), the [ASK:] inline-keyboard flow, and /files /df /cleanup /plan
+/work /btw. Those are candidates for a follow-up once this prototype is
+validated.
 """
 
 from pathlib import Path
