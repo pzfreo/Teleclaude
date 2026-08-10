@@ -2,9 +2,10 @@
 
 import asyncio
 import json
+import os
 import signal
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
 
@@ -80,43 +81,61 @@ class TestCodexCodeManager:
         assert await mgr.abort(1001, mark_pending=True) is True
         assert 1001 in mgr._aborted_chats
 
-    async def test_abort_signals_process_group_and_marks_chat_aborted(self, tmp_path):
-        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
-
+    @staticmethod
+    def _exiting_proc(sig):
         class _RunningProc:
             pid = 4321
             returncode = None
 
             async def wait(self):
-                self.returncode = -signal.SIGTERM
+                self.returncode = -sig
                 return self.returncode
 
-        proc = _RunningProc()
-        mgr._running_procs[1001] = proc  # type: ignore[assignment]
+        return _RunningProc()
+
+    async def test_abort_signals_process_group(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        mgr._running_procs[1001] = self._exiting_proc(signal.SIGTERM)  # type: ignore[assignment]
 
         with patch("os.killpg") as killpg:
             assert await mgr.abort(1001) is True
 
         killpg.assert_called_once_with(4321, signal.SIGTERM)
         assert 1001 not in mgr._running_procs
+
+    async def test_abort_marks_chat_only_while_a_turn_is_in_flight(self, tmp_path):
+        """Regression: /stop on a detached process must not poison the *next* message.
+
+        `_aborted_chats` is consumed by run_turn. Setting it when no turn is
+        reading events left the flag behind, and the next message the user sent
+        was aborted before it reached Codex — the bot just went silent.
+        """
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        mgr._running_procs[1001] = self._exiting_proc(signal.SIGTERM)  # type: ignore[assignment]
+
+        with patch("os.killpg"):
+            assert await mgr.abort(1001) is True
+        assert 1001 not in mgr._aborted_chats
+
+        mgr._running_procs[1001] = self._exiting_proc(signal.SIGTERM)  # type: ignore[assignment]
+        mgr._abort_events[1001] = asyncio.Event()  # a turn is now reading events
+        with patch("os.killpg"):
+            assert await mgr.abort(1001) is True
         assert 1001 in mgr._aborted_chats
+
+    async def test_clear_pending_abort_drops_a_stale_flag(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        mgr._aborted_chats.add(1001)
+        mgr.clear_pending_abort(1001)
+        assert 1001 not in mgr._aborted_chats
 
     async def test_interrupt_sigints_process_group_and_marks_chat_aborted(self, tmp_path):
         mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
-
-        class _RunningProc:
-            pid = 4321
-            returncode = None
-
-            async def wait(self):
-                self.returncode = -signal.SIGINT
-                return self.returncode
-
-        proc = _RunningProc()
-        mgr._running_procs[1001] = proc  # type: ignore[assignment]
+        mgr._running_procs[1001] = self._exiting_proc(signal.SIGINT)  # type: ignore[assignment]
+        mgr._abort_events[1001] = asyncio.Event()
 
         with patch("os.killpg") as killpg:
-            assert await mgr.interrupt(1001) is True
+            assert await mgr.interrupt(1001) == "cancelled"
 
         # SIGINT must reach the process group: the `codex` entry point is an npm
         # shim, so signalling the parent alone does not stop the real binary.
@@ -124,8 +143,8 @@ class TestCodexCodeManager:
         assert 1001 not in mgr._running_procs
         assert 1001 in mgr._aborted_chats
 
-    async def test_interrupt_keeps_proc_reachable_when_sigint_ignored(self, tmp_path):
-        """A process that survives SIGINT stays registered so /stop can still kill it."""
+    async def test_interrupt_force_kills_when_sigint_ignored(self, tmp_path):
+        """Reporting a cancel that didn't happen is worse than killing the process."""
         mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
 
         class _StubbornProc:
@@ -137,10 +156,15 @@ class TestCodexCodeManager:
 
         mgr._running_procs[1001] = _StubbornProc()  # type: ignore[assignment]
 
-        with patch("codex_code.PROCESS_INTERRUPT_GRACE", 0.01), patch("os.killpg"):
-            assert await mgr.interrupt(1001) is True
+        with (
+            patch("codex_code.PROCESS_INTERRUPT_GRACE", 0.01),
+            patch("codex_code.PROCESS_ABORT_TIMEOUT", 0.01),
+            patch("os.killpg") as killpg,
+        ):
+            assert await mgr.interrupt(1001) == "forced"
 
-        assert mgr.has_running_proc(1001) is True
+        assert [c.args[1] for c in killpg.call_args_list] == [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]
+        assert 1001 not in mgr._running_procs
 
     async def test_interrupt_releases_reader_blocked_on_open_pipe(self, tmp_path):
         """Regression: an orphaned child holding stdout must not wedge the turn forever."""
@@ -148,14 +172,50 @@ class TestCodexCodeManager:
         abort_event = asyncio.Event()
         mgr._abort_events[1001] = abort_event
 
-        assert await mgr.interrupt(1001, mark_pending=True) is True
+        assert await mgr.interrupt(1001, mark_pending=True) == "cancelled"
         assert abort_event.is_set()
+
+    async def test_interrupt_reports_idle_when_nothing_is_running(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        assert await mgr.interrupt(1001) == "idle"
+        assert 1001 not in mgr._aborted_chats
 
     async def test_interrupt_can_mark_pending_turn_without_proc(self, tmp_path):
         mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
 
-        assert await mgr.interrupt(1001, mark_pending=True) is True
+        assert await mgr.interrupt(1001, mark_pending=True) == "cancelled"
         assert 1001 in mgr._aborted_chats
+
+    async def test_stop_kills_orphans_left_behind_by_a_reaped_shim(self, tmp_path):
+        """The npm shim can exit while the real binary keeps running in its group."""
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        mgr._pgids[1001] = 4321  # group recorded at spawn; parent already reaped
+
+        alive = {"n": 2}  # survives the probe, then SIGTERM, then reports gone
+
+        def fake_killpg(pgid, sig):
+            assert pgid == 4321
+            if sig == 0 and alive["n"] <= 0:
+                raise ProcessLookupError
+            if sig == signal.SIGTERM:
+                alive["n"] = 0
+
+        with patch("os.killpg", side_effect=fake_killpg), patch("codex_code._ORPHAN_POLL_INTERVAL", 0.001):
+            assert mgr.has_running_proc(1001) is True
+            assert await mgr.abort(1001) is True
+
+        assert 1001 not in mgr._pgids
+        assert mgr.has_running_proc(1001) is False
+
+    async def test_orphan_cleanup_never_signals_the_bots_own_group(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        mgr._pgids[1001] = os.getpgrp()
+
+        with patch("os.killpg") as killpg:
+            assert await mgr._kill_orphan_group(1001) is False
+
+        assert killpg.call_args_list == [((os.getpgrp(), 0), {})]
+        assert 1001 not in mgr._pgids
 
 
 class TestTokenNotInCloneUrl:
@@ -452,7 +512,7 @@ class TestRunTurn:
 
         with patch("codex_code.PROCESS_INTERRUPT_GRACE", 0.01), patch("codex_code.PROCESS_ABORT_TIMEOUT", 0.01):
             with patch("os.killpg"):
-                assert await mgr.interrupt(1001) is True
+                assert await mgr.interrupt(1001) == "forced"
 
             with pytest.raises(CodexTurnAborted):
                 await asyncio.wait_for(turn, timeout=2)
@@ -484,7 +544,29 @@ class TestRunTurn:
         with patch("asyncio.create_subprocess_exec", new=fake_create), patch("os.killpg") as killpg:
             await mgr.run_turn(1001, "owner/repo", "hello", on_event)
 
-        killpg.assert_called_once_with(9999, signal.SIGTERM)
+        # Plus a signal-0 probe of the new turn's own group as it drains.
+        assert call(9999, signal.SIGTERM) in killpg.call_args_list
+
+    async def test_clean_turn_forgets_its_process_group(self, tmp_path):
+        """Background work a completed turn started on purpose must survive.
+
+        The group id is only retained for turns that ended abnormally, so the
+        orphan sweep can't reach, say, a dev server the user asked Codex to run.
+        """
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
+        mgr.workspace_path("owner/repo").mkdir(parents=True)
+
+        async def fake_create(*_args, **_kwargs):
+            return self._fake_proc([])
+
+        async def on_event(event):
+            pass
+
+        with patch("asyncio.create_subprocess_exec", new=fake_create), patch("os.killpg"):
+            await mgr.run_turn(1001, "owner/repo", "hello", on_event)
+
+        assert 1001 not in mgr._pgids
+        assert mgr.has_running_proc(1001) is False
 
     async def test_nonzero_exit_still_reported_after_clean_eof(self, tmp_path):
         """The bounded wait added for soft cancels must not swallow a real failure."""
@@ -513,7 +595,7 @@ class TestRunTurn:
         with (
             patch("asyncio.create_subprocess_exec", new=fake_create),
             patch("codex_code.PROCESS_ABORT_TIMEOUT", 0.01),
-            patch("codex_code.PROCESS_INTERRUPT_GRACE", 2),
+            patch("codex_code.PROCESS_EXIT_WAIT", 2),
         ):
             await mgr.run_turn(1001, "owner/repo", "hello", on_event)
 

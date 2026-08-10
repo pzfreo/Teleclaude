@@ -75,6 +75,7 @@ DEFAULT_MODEL = os.getenv("CODEX_MODEL", "")  # empty = let the CLI use its own 
 MAX_TELEGRAM_LENGTH = 4096
 TYPING_INTERVAL = 4
 MAX_PROGRESS_LINES = 6
+MAX_QUEUED_PROMPTS = 5  # messages allowed to wait behind the running turn
 CODEX_IDLE_HEARTBEAT_SECONDS = max(1, int(os.getenv("CODEX_IDLE_HEARTBEAT_SECONDS", "600")))
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -142,6 +143,10 @@ _typing_tasks: dict[int, asyncio.Task] = {}
 _progress_msg_ids: dict[int, int] = {}
 _progress_lines: dict[int, list[str]] = {}
 _files_cache: dict[int, list[Path]] = {}
+# Messages that arrived mid-turn, waiting to be handed to Codex together. Whoever
+# holds the chat lock drains this when its turn ends; /cancel and /stop clear it,
+# so stopping a turn doesn't just start the next queued message.
+_pending_prompts: dict[int, list[tuple[str, Update]]] = {}
 
 
 def get_active_repo(chat_id: int) -> str | None:
@@ -183,6 +188,15 @@ def _chat_lock(chat_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _chat_locks[chat_id] = lock
     return lock
+
+
+def _drop_queued(chat_id: int) -> int:
+    """Discard everything queued for this chat. Returns how many were dropped.
+
+    Without this, stopping a turn just feeds the queued messages to Codex
+    straight away, which reads as the cancel not having worked.
+    """
+    return len(_pending_prompts.pop(chat_id, []))
 
 
 # ── Progress / typing UX (mirrors bot_agent.py's ephemeral progress message) ──
@@ -468,8 +482,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/repo owner/name - Set the active GitHub repo directly\n"
         "/branch name - Set active branch\n"
         "/newsession - Wipe this repo's session and start fresh\n"
-        "/cancel - Ask the active turn to stop gracefully\n"
-        "/stop - Force-kill the Codex run and its child processes\n"
+        "/cancel - Stop the active turn and clear the queue\n"
+        "/stop - Force-kill the Codex run and its child processes now\n"
         "/model [name] - Show or switch model\n"
         "/files - Browse and download workspace files\n"
         "/update - Update Codex CLI to latest version\n"
@@ -682,24 +696,43 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.effective_chat.id
     _stop_typing(chat_id)
     await _clear_progress(chat_id, context.bot)
+    dropped = _drop_queued(chat_id)
     stopped = await codex_mgr.abort(chat_id, mark_pending=_chat_lock(chat_id).locked())
-    await update.message.reply_text("Stopped." if stopped else "Nothing running.")
+    await update.message.reply_text(_with_dropped("Stopped." if stopped else "Nothing running.", dropped))
+
+
+_CANCEL_OUTCOMES = {
+    "idle": "Nothing running.",
+    "cancelled": "Cancelled current turn.",
+    "forced": "Codex ignored the interrupt — killed it.",
+}
+
+
+def _with_dropped(text: str, dropped: int) -> str:
+    if not dropped:
+        return text
+    return f"{text} Dropped {dropped} queued message{_s(dropped)}."
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ask the active Codex turn to stop gracefully, without force-killing it."""
+    """Stop the active Codex turn: SIGINT first, force-kill if it doesn't take."""
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
     _stop_typing(chat_id)
     await _clear_progress(chat_id, context.bot)
-    cancelled = await codex_mgr.interrupt(chat_id, mark_pending=_chat_lock(chat_id).locked())
-    if not cancelled:
-        await update.message.reply_text("Nothing running.")
-    elif codex_mgr.has_running_proc(chat_id):
-        await update.message.reply_text("Turn cancelled, but Codex ignored the interrupt. Use /stop to kill it.")
-    else:
-        await update.message.reply_text("Cancelled current turn.")
+    # Drop waiters before signalling, so none of them can grab the lock the
+    # instant the current turn dies.
+    dropped = _drop_queued(chat_id)
+    # Acknowledge before signalling: waiting out the SIGINT grace period can take
+    # seconds, and a silent /cancel reads as a bot that ignored the command.
+    ack = await update.message.reply_text("Interrupting Codex…")
+    outcome = await codex_mgr.interrupt(chat_id, mark_pending=_chat_lock(chat_id).locked())
+    text = _with_dropped(_CANCEL_OUTCOMES[outcome], dropped)
+    try:
+        await ack.edit_text(text)
+    except TelegramError:
+        await update.message.reply_text(text)
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -843,20 +876,79 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         paths_str = "\n".join(f"  - {p}" for p in attachment_paths)
         prompt += f"\n\nAttached files (saved to disk, you can read them):\n{paths_str}"
 
+    await _queue_prompt(chat_id, prompt, update, context)
+
+
+async def _queue_prompt(chat_id: int, prompt: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run the prompt now, or park it for the running turn to pick up when it ends."""
+    msg = update.message
     lock = _chat_lock(chat_id)
+
     if lock.locked():
-        await msg.reply_text("Codex is still working on the previous request. Use /cancel to interrupt it.")
+        pending = _pending_prompts.setdefault(chat_id, [])
+        if len(pending) >= MAX_QUEUED_PROMPTS:
+            await msg.reply_text(
+                f"{MAX_QUEUED_PROMPTS} messages are already waiting. "
+                "Use /cancel to stop the current turn and clear the queue."
+            )
+            return
+        # Appended before the ack below, so nothing can be lost to that await.
+        pending.append((prompt, update))
+        await msg.reply_text(f"Queued (#{len(pending)}) — goes to Codex when this turn finishes.")
         return
 
+    dropped = 0
     async with lock:
-        await _dispatch_prompt(chat_id, prompt, update, context)
+        keep_going = await _dispatch_prompt(chat_id, prompt, update, context)
+        while keep_going:
+            queued = _pending_prompts.pop(chat_id, None)
+            if not queued:
+                break
+            # One turn for the lot: `codex exec resume` reloads the thread each time,
+            # so N follow-ups as N turns is N times the setup for the same context.
+            logger.info("Codex: merging %d queued message(s) into one turn for chat %d", len(queued), chat_id)
+            merged = "\n\n".join(text for text, _ in queued)
+            keep_going = await _dispatch_prompt(chat_id, merged, queued[-1][1], context)
+
+        if not keep_going:
+            # Aborted mid-turn: anything queued in the gap before it actually
+            # stopped belongs to the work the user just cancelled.
+            dropped = _drop_queued(chat_id)
+
+    # Everything above the lock release is synchronous once the queue reads empty,
+    # so a message arriving from here on finds an unlocked chat and runs itself
+    # rather than being parked with no one left to drain it.
+    if dropped:
+        await _notify_dropped(chat_id, dropped, context.bot)
 
 
-async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _notify_dropped(chat_id: int, dropped: int, bot) -> None:
+    try:
+        await bot.send_message(chat_id=chat_id, text=f"Dropped {dropped} queued message{_s(dropped)}.")
+    except TelegramError:
+        pass
+
+
+def _s(count: int) -> str:
+    return "" if count == 1 else "s"
+
+
+async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Run one Codex turn. Returns False if it was stopped, so the caller
+    knows not to feed it whatever was queued behind it."""
+    # An abort flag belongs to the turn it was raised against. One left behind by
+    # a /stop that landed outside a turn would otherwise cancel this message
+    # before it ever reached Codex, silently. Must run before the first await.
+    codex_mgr.clear_pending_abort(chat_id)
+
     repo = get_active_repo(chat_id)
     if not repo:
         await update.message.reply_text("No repo set. Use /repo owner/name first.")
-        return
+        return True
+
+    # Drop any progress message the previous turn left behind, so its lines don't
+    # bleed into this turn's.
+    await _clear_progress(chat_id, context.bot)
 
     if codex_mgr.get_session_id(chat_id, repo) is None:
         saved_session = load_codex_session_id(chat_id, repo)
@@ -875,7 +967,7 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
         await codex_mgr.pull_latest(repo)
     except Exception as e:
         await update.message.reply_text(f"Failed to prepare workspace: {e}")
-        return
+        return True
 
     _start_typing(chat_id, context.bot)
     activity_event = asyncio.Event()
@@ -885,11 +977,13 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
         await codex_mgr.run_turn(chat_id, repo, prompt, on_event, model=get_model(chat_id))
     except CodexTurnAborted:
         logger.info("Codex turn stopped for chat %d", chat_id)
-        return
+        # The reader may have posted progress after /cancel cleared it.
+        await _clear_progress(chat_id, context.bot)
+        return False
     except Exception as e:
         logger.error("Codex run_turn failed for chat %d: %s", chat_id, e, exc_info=True)
         await update.message.reply_text(f"Codex Code error: {e}")
-        return
+        return True
     finally:
         heartbeat_task.cancel()
         try:
@@ -908,6 +1002,7 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
         final_text = await _parse_and_send_markers(chat_id, final_text, repo, context.bot)
         if final_text:
             await send_long_message(chat_id, final_text, context.bot)
+    return True
 
 
 async def notify_startup(app: Application) -> None:
@@ -916,8 +1011,8 @@ async def notify_startup(app: Application) -> None:
             ("repo", "Set active GitHub repo (list / number / name / owner/name)"),
             ("branch", "Set active branch"),
             ("newsession", "Wipe this repo's session and start fresh"),
-            ("cancel", "Ask the active turn to stop gracefully"),
-            ("stop", "Force-kill Codex run and child processes"),
+            ("cancel", "Stop the active turn and clear the queue"),
+            ("stop", "Force-kill Codex run and child processes now"),
             ("model", "Show or switch model"),
             ("files", "Browse and download workspace files"),
             ("update", "Update Codex CLI to latest version"),

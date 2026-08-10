@@ -24,13 +24,16 @@ import os
 import shutil
 import signal
 from pathlib import Path
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
 GIT_TIMEOUT = 120  # 2 minutes for git operations
 NPM_UPDATE_TIMEOUT = 180  # 3 minutes for npm update
 PROCESS_ABORT_TIMEOUT = 3  # seconds to wait after TERM before escalating
-PROCESS_INTERRUPT_GRACE = 15  # seconds to let Codex wind down after SIGINT
+PROCESS_INTERRUPT_GRACE = 8  # seconds to let Codex wind down after SIGINT before force-killing
+PROCESS_EXIT_WAIT = 15  # seconds to wait for exit after Codex closed stdout on its own
+_ORPHAN_POLL_INTERVAL = 0.1  # seconds between checks that a signalled process group has drained
 
 
 class CodexTurnAborted(Exception):
@@ -230,6 +233,7 @@ class CodexCodeManager:
         self._running_procs: dict[int, asyncio.subprocess.Process] = {}  # chat_id → in-flight proc
         self._aborted_chats: set[int] = set()
         self._abort_events: dict[int, asyncio.Event] = {}  # chat_id → signal to stop reading stdout
+        self._pgids: dict[int, int] = {}  # chat_id → process group of the last turn we spawned
 
     @property
     def available(self) -> bool:
@@ -339,7 +343,73 @@ class CodexCodeManager:
 
     def has_running_proc(self, chat_id: int) -> bool:
         proc = self._running_procs.get(chat_id)
-        return proc is not None and proc.returncode is None
+        if proc is not None and proc.returncode is None:
+            return True
+        return self._group_alive(chat_id)
+
+    def _turn_in_flight(self, chat_id: int) -> bool:
+        """True while run_turn is reading this chat's event stream."""
+        return chat_id in self._abort_events
+
+    def clear_pending_abort(self, chat_id: int) -> None:
+        """Drop a stale abort flag so it cannot cancel a *future* turn.
+
+        `_aborted_chats` only ever means "the turn in flight right now was asked
+        to stop". A `/stop` that lands outside a turn — killing a process the
+        previous turn detached from, or arriving in the window where the handler
+        still holds the chat lock after run_turn returned — used to leave the
+        flag set, and the next message was then swallowed before it ever reached
+        Codex. Callers clear it when they begin a new turn.
+        """
+        self._aborted_chats.discard(chat_id)
+
+    def _mark_aborted(self, chat_id: int, mark_pending: bool) -> None:
+        """Arm the abort flag only when there is a turn for it to abort."""
+        if mark_pending or self._turn_in_flight(chat_id):
+            self._aborted_chats.add(chat_id)
+
+    def _group_alive(self, chat_id: int) -> bool:
+        """True if the process group of this chat's last turn still has members.
+
+        Self-cleaning: forgets the group id as soon as it is gone.
+        """
+        pgid = self._pgids.get(chat_id)
+        if pgid is None:
+            return False
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            self._pgids.pop(chat_id, None)
+            return False
+        return True
+
+    async def _kill_orphan_group(self, chat_id: int) -> bool:
+        """Kill descendants that outlived the process we spawned.
+
+        `codex` is an npm shim: it can exit while the real binary keeps running
+        in the same process group. Once the shim is reaped we have no Process
+        handle left, so fall back to the group id recorded at spawn. Returns
+        True if orphans were found and signalled.
+        """
+        if not self._group_alive(chat_id):
+            return False
+        pgid = self._pgids[chat_id]
+        if pgid == os.getpgrp():  # never signal the bot's own group
+            self._pgids.pop(chat_id, None)
+            return False
+        logger.warning("Codex left orphans in process group %d for chat %d; killing them", pgid, chat_id)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(pgid, sig)
+            except OSError:
+                break
+            deadline = PROCESS_ABORT_TIMEOUT / _ORPHAN_POLL_INTERVAL
+            for _ in range(int(deadline)):
+                await asyncio.sleep(_ORPHAN_POLL_INTERVAL)
+                if not self._group_alive(chat_id):
+                    return True
+        self._pgids.pop(chat_id, None)
+        return True
 
     def _release_reader(self, chat_id: int) -> None:
         """Unblock run_turn's stdout reader, whether or not the process actually dies.
@@ -353,44 +423,54 @@ class CodexCodeManager:
             event.set()
 
     async def abort(self, chat_id: int, mark_pending: bool = False) -> bool:
-        """Kill the in-flight Codex subprocess for a chat. Returns True if one was killed."""
-        proc = self._running_procs.get(chat_id)
-        if not proc or proc.returncode is not None:
-            if mark_pending:
-                self._aborted_chats.add(chat_id)
-                self._release_reader(chat_id)
-                return True
-            return False
-        self._aborted_chats.add(chat_id)
+        """Force-kill the Codex subprocess for a chat. Returns True if anything was stopped."""
+        self._mark_aborted(chat_id, mark_pending)
         self._release_reader(chat_id)
-        await self._terminate_proc(chat_id, proc)
-        self._running_procs.pop(chat_id, None)
-        return True
+        proc = self._running_procs.get(chat_id)
+        if proc and proc.returncode is None:
+            await self._terminate_proc(chat_id, proc)
+            self._running_procs.pop(chat_id, None)
+            await self._kill_orphan_group(chat_id)
+            return True
+        # The process we spawned is gone, but the npm shim may have left the real
+        # binary running in its group — that is what "/stop says nothing running
+        # while Codex keeps working" looked like.
+        if await self._kill_orphan_group(chat_id):
+            return True
+        return mark_pending
 
-    async def interrupt(self, chat_id: int, mark_pending: bool = False) -> bool:
-        """Ask the active turn to stop gracefully, without force-killing it.
+    async def interrupt(self, chat_id: int, mark_pending: bool = False) -> Literal["idle", "cancelled", "forced"]:
+        """Stop the active turn, asking politely first.
 
-        The soft-cancel counterpart to :meth:`abort`: SIGINT goes to the process
-        group so it reaches the real Codex binary behind the npm shim, and there
-        is no SIGKILL escalation. A process that ignores SIGINT is left running
-        and stays reachable by :meth:`abort` (`/stop`) — the turn detaches from
-        it either way.
+        SIGINT goes to the process group so it reaches the real Codex binary
+        behind the npm shim. If the group is still alive after
+        ``PROCESS_INTERRUPT_GRACE`` it is terminated and killed — leaving a
+        SIGINT-ignoring process running only meant reporting a cancel that
+        hadn't happened and requiring a follow-up `/stop`.
+
+        Returns what actually happened so the caller can say so truthfully:
+        ``idle`` (nothing to stop), ``cancelled`` (exited on SIGINT, or only a
+        not-yet-started turn was flagged), ``forced`` (had to be killed).
         """
-        proc = self._running_procs.get(chat_id)
-        if not proc or proc.returncode is not None:
-            if mark_pending:
-                self._aborted_chats.add(chat_id)
-                self._release_reader(chat_id)
-                return True
-            return False
-        self._aborted_chats.add(chat_id)
+        self._mark_aborted(chat_id, mark_pending)
         self._release_reader(chat_id)
+        proc = self._running_procs.get(chat_id)
+
+        if not proc or proc.returncode is not None:
+            if await self._kill_orphan_group(chat_id):
+                return "forced"
+            return "cancelled" if mark_pending else "idle"
+
         self._signal_proc_group(proc, signal.SIGINT)
         if await self._wait_for_proc_exit(proc, PROCESS_INTERRUPT_GRACE):
             self._running_procs.pop(chat_id, None)
-        else:
-            logger.warning("Codex process for chat %d ignored SIGINT; leaving it for /stop", chat_id)
-        return True
+            return "forced" if await self._kill_orphan_group(chat_id) else "cancelled"
+
+        logger.warning("Codex process for chat %d ignored SIGINT; escalating to TERM/KILL", chat_id)
+        await self._terminate_proc(chat_id, proc)
+        self._running_procs.pop(chat_id, None)
+        await self._kill_orphan_group(chat_id)
+        return "forced"
 
     async def _terminate_proc(self, chat_id: int, proc: asyncio.subprocess.Process) -> None:
         self._signal_proc_group(proc, signal.SIGTERM)
@@ -454,6 +534,9 @@ class CodexCodeManager:
         if stale is not None and stale.returncode is None:
             logger.warning("Killing abandoned Codex process for chat %d before starting a new turn", chat_id)
             await self._terminate_proc(chat_id, stale)
+        # Only ever set for a turn that ended abnormally — a clean turn forgets its
+        # group, so background work it started on purpose survives into this one.
+        await self._kill_orphan_group(chat_id)
 
         cmd = [self.cli_path, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox"]
         if model:
@@ -476,6 +559,9 @@ class CodexCodeManager:
             start_new_session=True,
         )
         self._running_procs[chat_id] = proc
+        # start_new_session makes the child a group leader, so pgid == pid. Kept
+        # after the process is reaped so /stop can still reach orphaned children.
+        self._pgids[chat_id] = proc.pid
         abort_event = asyncio.Event()
         self._abort_events[chat_id] = abort_event
         if chat_id in self._aborted_chats:
@@ -556,9 +642,15 @@ class CodexCodeManager:
             # unbounded wait here would hold the caller's per-chat lock forever.
             # On a clean EOF the exit is imminent and its code decides whether we
             # report a failure, so wait longer there than on the abort path.
-            exit_timeout = PROCESS_ABORT_TIMEOUT if abort_event.is_set() else PROCESS_INTERRUPT_GRACE
+            exit_timeout = PROCESS_ABORT_TIMEOUT if abort_event.is_set() else PROCESS_EXIT_WAIT
             if await self._wait_for_proc_exit(proc, exit_timeout):
                 self._running_procs.pop(chat_id, None)
+                if abort_event.is_set():
+                    self._group_alive(chat_id)  # self-cleaning: forget the group once it has drained
+                else:
+                    # Ran to completion, so anything still in the group was started
+                    # deliberately (a dev server, say) and is not ours to hunt down.
+                    self._pgids.pop(chat_id, None)
             else:
                 logger.warning("Codex process for chat %d outlived its turn; /stop will kill it", chat_id)
             stderr_task.cancel()
