@@ -300,32 +300,106 @@ class TestIdleHeartbeat:
         )
 
 
-class TestLongRunningTurn:
-    async def test_second_message_reports_busy_instead_of_waiting(self):
+def _reset_queue_state(chat_id: int) -> None:
+    bot_codex._chat_locks.pop(chat_id, None)
+    bot_codex._pending_prompts.pop(chat_id, None)
+
+
+class TestQueuedMessages:
+    async def test_message_arriving_mid_turn_is_queued_not_rejected(self):
         chat_id = 401
         update = _make_update(chat_id=chat_id)
-        update.message.text = "another request"
-        update.message.caption = None
-        update.message.photo = []
-        update.message.document = None
         context = _make_context()
         lock = bot_codex._chat_lock(chat_id)
 
         await lock.acquire()
         try:
-            with (
-                patch("bot_codex.is_authorized", return_value=True),
-                patch("bot_codex._dispatch_prompt", new_callable=AsyncMock) as dispatch,
-            ):
-                await bot_codex.handle_message(update, context)
+            with patch("bot_codex._dispatch_prompt", new_callable=AsyncMock) as dispatch:
+                await bot_codex._queue_prompt(chat_id, "second", update, context)
         finally:
             lock.release()
-            bot_codex._chat_locks.pop(chat_id, None)
 
         dispatch.assert_not_awaited()
-        update.message.reply_text.assert_awaited_once_with(
-            "Codex is still working on the previous request. Use /cancel to interrupt it."
+        assert [text for text, _ in bot_codex._pending_prompts[chat_id]] == ["second"]
+        update.message.reply_text.assert_awaited_once_with("Queued (#1) — goes to Codex when this turn finishes.")
+        _reset_queue_state(chat_id)
+
+    async def test_queued_messages_are_merged_into_one_turn(self):
+        """`codex exec resume` reloads the thread per turn, so N follow-ups should
+        not cost N turns."""
+        chat_id = 404
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        bot_codex._pending_prompts[chat_id] = [("also lint it", _make_update(chat_id=chat_id))]
+        last = _make_update(chat_id=chat_id)
+        bot_codex._pending_prompts[chat_id].append(("and push", last))
+
+        with patch("bot_codex._dispatch_prompt", new_callable=AsyncMock, return_value=True) as dispatch:
+            await bot_codex._queue_prompt(chat_id, "run the tests", update, context)
+
+        assert [c.args[1] for c in dispatch.await_args_list] == ["run the tests", "also lint it\n\nand push"]
+        # The merged turn replies against the most recent of the queued messages.
+        assert dispatch.await_args_list[1].args[2] is last
+        assert chat_id not in bot_codex._pending_prompts
+        _reset_queue_state(chat_id)
+
+    async def test_queue_is_bounded(self):
+        chat_id = 402
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        lock = bot_codex._chat_lock(chat_id)
+        bot_codex._pending_prompts[chat_id] = [
+            (f"queued {i}", _make_update(chat_id=chat_id)) for i in range(bot_codex.MAX_QUEUED_PROMPTS)
+        ]
+
+        await lock.acquire()
+        try:
+            with patch("bot_codex._dispatch_prompt", new_callable=AsyncMock) as dispatch:
+                await bot_codex._queue_prompt(chat_id, "one too many", update, context)
+        finally:
+            lock.release()
+
+        dispatch.assert_not_awaited()
+        assert len(bot_codex._pending_prompts[chat_id]) == bot_codex.MAX_QUEUED_PROMPTS
+        assert "already waiting" in update.message.reply_text.await_args.args[0]
+        _reset_queue_state(chat_id)
+
+    async def test_aborted_turn_drops_the_queue_instead_of_running_it(self):
+        """Regression: stopping a turn used to feed the queue to Codex immediately,
+        which looked exactly like the cancel having failed."""
+        chat_id = 403
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        context.bot.send_message = AsyncMock()
+        bot_codex._pending_prompts[chat_id] = [("queued work", _make_update(chat_id=chat_id))]
+
+        with patch("bot_codex._dispatch_prompt", new_callable=AsyncMock, return_value=False) as dispatch:
+            await bot_codex._queue_prompt(chat_id, "first", update, context)
+
+        dispatch.assert_awaited_once()  # the queued message never ran
+        assert chat_id not in bot_codex._pending_prompts
+        context.bot.send_message.assert_awaited_once_with(chat_id=chat_id, text="Dropped 1 queued message.")
+        _reset_queue_state(chat_id)
+
+    async def test_cancel_clears_the_queue(self):
+        chat_id = 405
+        cancel_update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        bot_codex._pending_prompts[chat_id] = [("a", _make_update()), ("b", _make_update())]
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch.object(bot_codex.codex_mgr, "interrupt", new_callable=AsyncMock, return_value="cancelled"),
+            patch("bot_codex._clear_progress", new_callable=AsyncMock),
+            patch("bot_codex._stop_typing"),
+        ):
+            await bot_codex.cancel_command(cancel_update, context)
+
+        assert chat_id not in bot_codex._pending_prompts
+        cancel_update.message.reply_text.return_value.edit_text.assert_awaited_once_with(
+            "Cancelled current turn. Dropped 2 queued messages."
         )
+        _reset_queue_state(chat_id)
 
 
 class TestCancellationCommands:
@@ -335,28 +409,50 @@ class TestCancellationCommands:
 
         with (
             patch("bot_codex.is_authorized", return_value=True),
-            patch.object(bot_codex.codex_mgr, "interrupt", new_callable=AsyncMock, return_value=True) as interrupt,
+            patch.object(
+                bot_codex.codex_mgr, "interrupt", new_callable=AsyncMock, return_value="cancelled"
+            ) as interrupt,
             patch("bot_codex._clear_progress", new_callable=AsyncMock),
         ):
             await bot_codex.cancel_command(update, context)
 
         interrupt.assert_awaited_once_with(501, mark_pending=False)
-        update.message.reply_text.assert_awaited_once_with("Cancelled current turn.")
+        update.message.reply_text.return_value.edit_text.assert_awaited_once_with("Cancelled current turn.")
 
-    async def test_cancel_points_at_stop_when_process_survives(self):
+    async def test_cancel_acknowledges_before_signalling(self):
+        """Regression: /cancel used to sit silent for the whole SIGINT grace period."""
+        update = _make_update(chat_id=504)
+        context = _make_context()
+        order: list[str] = []
+
+        update.message.reply_text.side_effect = lambda *a, **k: order.append("ack") or AsyncMock()
+
+        async def slow_interrupt(*_a, **_k):
+            order.append("interrupt")
+            return "cancelled"
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch.object(bot_codex.codex_mgr, "interrupt", new=slow_interrupt),
+            patch("bot_codex._clear_progress", new_callable=AsyncMock),
+        ):
+            await bot_codex.cancel_command(update, context)
+
+        assert order == ["ack", "interrupt"]
+
+    async def test_cancel_reports_a_forced_kill_honestly(self):
         update = _make_update(chat_id=503)
         context = _make_context()
 
         with (
             patch("bot_codex.is_authorized", return_value=True),
-            patch.object(bot_codex.codex_mgr, "interrupt", new_callable=AsyncMock, return_value=True),
-            patch.object(bot_codex.codex_mgr, "has_running_proc", return_value=True),
+            patch.object(bot_codex.codex_mgr, "interrupt", new_callable=AsyncMock, return_value="forced"),
             patch("bot_codex._clear_progress", new_callable=AsyncMock),
         ):
             await bot_codex.cancel_command(update, context)
 
-        update.message.reply_text.assert_awaited_once_with(
-            "Turn cancelled, but Codex ignored the interrupt. Use /stop to kill it."
+        update.message.reply_text.return_value.edit_text.assert_awaited_once_with(
+            "Codex ignored the interrupt — killed it."
         )
 
     async def test_stop_keeps_hard_process_group_abort(self):
@@ -372,3 +468,36 @@ class TestCancellationCommands:
 
         abort.assert_awaited_once_with(502, mark_pending=False)
         update.message.reply_text.assert_awaited_once_with("Stopped.")
+
+    async def test_new_turn_clears_an_abort_flag_left_by_a_previous_stop(self):
+        """Regression: after /cancel then /stop, the next message was silently dropped.
+
+        /stop armed the manager's abort flag even though the turn it belonged to
+        had already finished. run_turn consumed the stale flag on the *next*
+        message and raised CodexTurnAborted before Codex ever saw the prompt, so
+        the user got no reply at all.
+        """
+        chat_id = 505
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        bot_codex.codex_mgr._aborted_chats.add(chat_id)
+
+        try:
+            with (
+                patch("bot_codex.get_active_repo", return_value="owner/repo"),
+                patch("bot_codex.get_active_branch", return_value=None),
+                patch("bot_codex._clear_progress", new_callable=AsyncMock),
+                patch("bot_codex.audit_log"),
+                patch.object(bot_codex.codex_mgr, "ensure_clone", new_callable=AsyncMock),
+                patch.object(bot_codex.codex_mgr, "pull_latest", new_callable=AsyncMock),
+                patch.object(bot_codex.codex_mgr, "run_turn", new_callable=AsyncMock) as run_turn,
+                patch("bot_codex._start_typing"),
+                patch("bot_codex._stop_typing"),
+                patch("bot_codex.load_codex_session_id", return_value=None),
+            ):
+                await bot_codex._dispatch_prompt(chat_id, "do the thing", update, context)
+
+            assert chat_id not in bot_codex.codex_mgr._aborted_chats
+            run_turn.assert_awaited_once()
+        finally:
+            bot_codex.codex_mgr._aborted_chats.discard(chat_id)
