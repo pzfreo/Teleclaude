@@ -1,6 +1,9 @@
 FROM python:3.12-slim
 
 # System deps: git, Node.js, GitHub CLI, Docker CLI (with buildx/compose), build tools
+# tmux lets the agent and codex bots park long-running commands in a detached
+# session instead of blocking a turn on them; ncurses-term supplies the
+# tmux-256color terminfo so it runs without falling back to a dumb terminal.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         curl \
@@ -13,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-client \
         procps \
         rsync \
+        tmux \
+        ncurses-term \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg \
         -o /etc/apt/keyrings/docker.asc \
