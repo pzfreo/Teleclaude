@@ -940,6 +940,9 @@ async def _handle_stream_slash(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Map escaped Telegram commands onto explicit app-server operations."""
+    # Clear only stale state from an earlier operation. A /cancel arriving after
+    # this synchronous boundary remains armed throughout repository preparation.
+    app_server_mgr.clear_pending_interrupt(chat_id)
     lock = _chat_lock(chat_id)
     if lock.locked():
         await update.message.reply_text("Codex is working. Wait for it to finish or use /cancel first.")
@@ -966,6 +969,9 @@ async def _handle_stream_slash(
             thread_id = codex_mgr.get_session_id(chat_id, repo)
             if thread_id:
                 save_codex_session_id(chat_id, repo, thread_id)
+        except CodexTurnAborted:
+            logger.info("Codex stream command stopped for chat %d", chat_id)
+            return
         except Exception as exc:
             logger.error("Codex stream command failed for chat %d: %s", chat_id, exc, exc_info=True)
             await update.message.reply_text(f"Codex stream command failed: {exc}")
@@ -1037,6 +1043,7 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
     # a /stop that landed outside a turn would otherwise cancel this message
     # before it ever reached Codex, silently. Must run before the first await.
     codex_mgr.clear_pending_abort(chat_id)
+    app_server_mgr.clear_pending_interrupt(chat_id)
 
     repo = get_active_repo(chat_id)
     if not repo:

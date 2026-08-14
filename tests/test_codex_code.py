@@ -123,6 +123,15 @@ class TestCodexAppServerManager:
         start.assert_not_awaited()
         assert 1001 not in manager._pending_interrupts
 
+    async def test_new_operation_can_clear_stale_pending_interrupt(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        manager._pending_interrupts.add(1001)
+
+        manager.clear_pending_interrupt(1001)
+
+        assert 1001 not in manager._pending_interrupts
+
     async def test_event_handler_failure_does_not_break_turn_completion(self, tmp_path):
         owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
         manager = CodexAppServerManager(owner)
@@ -198,6 +207,26 @@ class TestCodexAppServerManager:
 
         assert response == "Codex context compaction completed."
         assert conn.compact_done is None
+
+    async def test_execute_compact_consumes_cancel_armed_during_preparation(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        async def load_thread(*_args):
+            manager._pending_interrupts.add(1001)
+            return "thr_123"
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", side_effect=load_thread),
+            patch.object(manager, "_request", new_callable=AsyncMock) as request,
+            pytest.raises(CodexTurnAborted),
+        ):
+            await manager.execute_slash(1001, "owner/repo", "/compact")
+
+        request.assert_not_awaited()
+        assert 1001 not in manager._pending_interrupts
 
     async def test_execute_unknown_slash_does_not_start_model_turn(self, tmp_path):
         owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))

@@ -700,6 +700,15 @@ class CodexAppServerManager:
         conn = self._connections.get(chat_id)
         return bool(conn and conn.proc.returncode is None and conn.reader_task and not conn.reader_task.done())
 
+    def clear_pending_interrupt(self, chat_id: int) -> None:
+        """Discard a cancellation left behind before an operation started.
+
+        Callers do this synchronously at the boundary of a new user operation.
+        A cancellation arriving during later preparation awaits is then retained
+        and consumed by that operation, rather than leaking into the next one.
+        """
+        self._pending_interrupts.discard(chat_id)
+
     async def _start(self, chat_id: int) -> _AppServerConnection:
         if self.active(chat_id):
             return self._connections[chat_id]
@@ -1025,10 +1034,17 @@ class CodexAppServerManager:
         supported = {"compact", "status", "usage"}
         if name not in supported:
             return f"Unsupported Codex stream command: /{name}\n" "Supported: //status, //usage, //compact"
+        if name == "compact" and chat_id in self._pending_interrupts:
+            self._pending_interrupts.discard(chat_id)
+            raise CodexTurnAborted()
 
         conn = await self._start(chat_id)
         cwd = self.owner.workspace_path(repo)
         thread_id = await self._load_thread(chat_id, conn, repo, cwd, model)
+
+        if name == "compact" and chat_id in self._pending_interrupts:
+            self._pending_interrupts.discard(chat_id)
+            raise CodexTurnAborted()
 
         if name == "compact":
             if args:
