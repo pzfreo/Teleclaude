@@ -1082,9 +1082,12 @@ class CodexAppServerManager:
         """
         name, _, args = command.strip().partition(" ")
         name = name.lower().lstrip("/")
-        supported = {"compact", "status", "usage"}
+        supported = {"compact", "goal", "status", "usage"}
         if name not in supported:
-            return f"Unsupported Codex stream command: /{name}\n" "Supported: //status, //usage, //compact"
+            return (
+                f"Unsupported Codex stream command: /{name}\n"
+                "Supported: //status, //usage, //compact, //goal [objective|clear]"
+            )
         if name == "compact" and chat_id in self._pending_interrupts:
             self._pending_interrupts.discard(chat_id)
             raise CodexTurnAborted()
@@ -1133,6 +1136,42 @@ class CodexAppServerManager:
                 f"Repository: {repo}\n"
                 f"Model: {active_model}\n"
                 f"Runtime: {runtime_status}"
+            )
+
+        if name == "goal":
+            goal_args = args.strip()
+            if goal_args.lower() == "clear":
+                result = await self._request(
+                    chat_id,
+                    conn,
+                    "thread/goal/clear",
+                    {"threadId": thread_id},
+                )
+                return "Codex goal cleared." if result.get("cleared") else "No Codex goal was set."
+            if goal_args:
+                result = await self._request(
+                    chat_id,
+                    conn,
+                    "thread/goal/set",
+                    {"threadId": thread_id, "objective": goal_args},
+                )
+            else:
+                result = await self._request(
+                    chat_id,
+                    conn,
+                    "thread/goal/get",
+                    {"threadId": thread_id},
+                )
+            goal = result.get("goal")
+            if not goal:
+                return "No Codex goal is set.\nSet one with //goal <objective>."
+            budget = goal.get("tokenBudget")
+            budget_line = f"\nToken budget: {budget}" if budget is not None else ""
+            return (
+                "Codex goal\n"
+                f"Objective: {goal.get('objective', '')}\n"
+                f"Status: {goal.get('status', 'unknown')}\n"
+                f"Tokens used: {goal.get('tokensUsed', 0)}{budget_line}"
             )
 
         if name == "usage":

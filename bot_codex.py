@@ -487,7 +487,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/newsession - Wipe this repo's session and start fresh\n"
         "/stream - Use persistent Codex app-server mode (experimental)\n"
         "/nostream - Return to one-shot codex exec mode\n"
-        "//status, //usage, //compact - Run app-server commands in stream mode\n"
+        "//status, //usage, //compact, //goal - Run app-server commands in stream mode\n"
         "/cancel - Stop the active turn and clear the queue\n"
         "/stop - Force-kill the Codex run and its child processes now\n"
         "/model [name] - Show or switch model\n"
@@ -958,7 +958,7 @@ async def _handle_stream_slash(
             if saved_session:
                 codex_mgr._sessions[(chat_id, repo)] = saved_session
         command_name = command.lstrip("/").split(None, 1)[0].lower() if command.strip("/").strip() else ""
-        is_control = command_name in {"status", "usage"}
+        is_control = command_name in {"goal", "status", "usage"}
         if is_control:
             _stream_control_active.add(chat_id)
         try:

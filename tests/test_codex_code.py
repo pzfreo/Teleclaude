@@ -391,6 +391,59 @@ class TestCodexAppServerManager:
         request.assert_not_awaited()
         assert "Unsupported Codex stream command: /diff" in response
 
+    async def test_execute_goal_get_maps_to_thread_goal_get(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
+            patch.object(
+                manager,
+                "_request",
+                new_callable=AsyncMock,
+                return_value={
+                    "goal": {
+                        "objective": "Ship stream mode",
+                        "status": "active",
+                        "tokensUsed": 42,
+                        "tokenBudget": 1000,
+                    }
+                },
+            ) as request,
+        ):
+            response = await manager.execute_slash(1001, "owner/repo", "/goal")
+
+        request.assert_awaited_once_with(1001, conn, "thread/goal/get", {"threadId": "thr_123"})
+        assert "Objective: Ship stream mode" in response
+        assert "Token budget: 1000" in response
+
+    async def test_execute_goal_set_and_clear_use_goal_protocol_methods(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
+            patch.object(manager, "_request", new_callable=AsyncMock) as request,
+        ):
+            request.return_value = {
+                "goal": {"objective": "Ship it", "status": "active", "tokensUsed": 0, "tokenBudget": None}
+            }
+            assert "Objective: Ship it" in await manager.execute_slash(1001, "owner/repo", "/goal Ship it")
+            request.assert_awaited_with(
+                1001,
+                conn,
+                "thread/goal/set",
+                {"threadId": "thr_123", "objective": "Ship it"},
+            )
+
+            request.return_value = {"cleared": True}
+            assert await manager.execute_slash(1001, "owner/repo", "/goal clear") == "Codex goal cleared."
+            request.assert_awaited_with(1001, conn, "thread/goal/clear", {"threadId": "thr_123"})
+
     async def test_interrupted_notification_raises_turn_aborted(self, tmp_path):
         owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
         manager = CodexAppServerManager(owner)
