@@ -956,7 +956,7 @@ class CodexAppServerManager:
         common: dict[str, Any] = {
             "cwd": str(cwd),
             "approvalPolicy": "never",
-            "sandbox": "dangerFullAccess",
+            "sandbox": "danger-full-access",
         }
         if model:
             common["model"] = model

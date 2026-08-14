@@ -186,6 +186,25 @@ class TestCodexAppServerManager:
 
         stop.assert_awaited_once_with(1001)
 
+    @pytest.mark.parametrize("existing_thread", [None, "thr_existing"])
+    async def test_thread_load_uses_runtime_sandbox_wire_value(self, tmp_path, existing_thread):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+        if existing_thread:
+            owner._sessions[(1001, "owner/repo")] = existing_thread
+
+        with patch.object(
+            manager,
+            "_request",
+            new_callable=AsyncMock,
+            return_value={"thread": {"id": existing_thread or "thr_new"}},
+        ) as request:
+            await manager._load_thread(1001, conn, "owner/repo", tmp_path, None)
+
+        params = request.await_args.args[3]
+        assert params["sandbox"] == "danger-full-access"
+
     async def test_execute_status_maps_to_thread_read(self, tmp_path):
         owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
         manager = CodexAppServerManager(owner)
