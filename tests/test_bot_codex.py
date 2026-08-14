@@ -578,7 +578,7 @@ class TestStreamModeCommands:
         finally:
             bot_codex._stream_mode.discard(chat_id)
 
-    async def test_double_slash_routes_to_stream_command_not_prompt_queue(self):
+    async def test_double_slash_passes_single_slash_to_prompt_queue(self):
         chat_id = 604
         update = _make_update(chat_id=chat_id)
         update.message.text = "//status"
@@ -590,13 +590,47 @@ class TestStreamModeCommands:
         try:
             with (
                 patch("bot_codex.is_authorized", return_value=True),
-                patch("bot_codex._handle_stream_slash", new_callable=AsyncMock) as slash,
                 patch("bot_codex._queue_prompt", new_callable=AsyncMock) as queue,
             ):
                 await bot_codex.handle_message(update, context)
 
-            slash.assert_awaited_once_with(chat_id, "/status", update, context)
-            queue.assert_not_awaited()
+            queue.assert_awaited_once_with(chat_id, "/status", update, context)
+        finally:
+            bot_codex._stream_mode.discard(chat_id)
+
+    async def test_double_slash_passthrough_also_works_in_one_shot_mode(self):
+        chat_id = 606
+        update = _make_update(chat_id=chat_id)
+        update.message.text = "//anything flexible"
+        update.message.caption = None
+        update.message.photo = []
+        update.message.document = None
+        context = _make_context()
+        bot_codex._stream_mode.discard(chat_id)
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch("bot_codex._queue_prompt", new_callable=AsyncMock) as queue,
+        ):
+            await bot_codex.handle_message(update, context)
+
+        queue.assert_awaited_once_with(chat_id, "/anything flexible", update, context)
+
+    async def test_fixed_goal_is_an_ordinary_telegram_command(self):
+        chat_id = 605
+        update = _make_update(chat_id=chat_id)
+        update.message.text = "/goal Ship it"
+        context = _make_context()
+        context.args = ["Ship", "it"]
+        bot_codex._stream_mode.add(chat_id)
+        try:
+            with (
+                patch("bot_codex.is_authorized", return_value=True),
+                patch("bot_codex._handle_stream_slash", new_callable=AsyncMock) as control,
+            ):
+                await bot_codex.stream_control_command(update, context)
+
+            control.assert_awaited_once_with(chat_id, "/goal Ship it", update, context)
         finally:
             bot_codex._stream_mode.discard(chat_id)
 

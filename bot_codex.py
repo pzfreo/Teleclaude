@@ -487,7 +487,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/newsession - Wipe this repo's session and start fresh\n"
         "/stream - Use persistent Codex app-server mode (experimental)\n"
         "/nostream - Return to one-shot codex exec mode\n"
-        "//status, //usage, //compact, //goal - Run app-server commands in stream mode\n"
+        "/status, /usage, /compact, /goal - App-server controls in stream mode\n"
+        "//command - Pass /command through to Codex as turn input\n"
         "/cancel - Stop the active turn and clear the queue\n"
         "/stop - Force-kill the Codex run and its child processes now\n"
         "/model [name] - Show or switch model\n"
@@ -922,9 +923,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text and not attachment_paths:
         return
 
-    if text.startswith("//") and not attachment_paths and chat_id in _stream_mode:
-        await _handle_stream_slash(chat_id, text[1:], update, context)
-        return
+    if text.startswith("//"):
+        text = text[1:]
 
     prompt = text
     if attachment_paths:
@@ -981,6 +981,22 @@ async def _handle_stream_slash(
             if is_control:
                 _stream_control_active.discard(chat_id)
     await send_long_message(chat_id, response, context.bot)
+
+
+async def stream_control_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run a fixed app-server operation exposed as a Telegram command."""
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    if chat_id not in _stream_mode:
+        await update.message.reply_text("This command requires stream mode. Use /stream first.")
+        return
+    command_name = (update.message.text or "").split(None, 1)[0].split("@", 1)[0]
+    args = " ".join(context.args)
+    command = f"{command_name} {args}".rstrip()
+    await _handle_stream_slash(chat_id, command, update, context)
 
 
 async def _queue_prompt(chat_id: int, prompt: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1149,6 +1165,10 @@ async def notify_startup(app: Application) -> None:
             ("newsession", "Wipe this repo's session and start fresh"),
             ("stream", "Enable persistent app-server mode (experimental)"),
             ("nostream", "Return to one-shot codex exec mode"),
+            ("status", "Show Codex app-server status (stream mode)"),
+            ("usage", "Show Codex account usage (stream mode)"),
+            ("compact", "Compact Codex context (stream mode)"),
+            ("goal", "Show or set the Codex goal (stream mode)"),
             ("cancel", "Stop the active turn and clear the queue"),
             ("stop", "Force-kill Codex run and child processes now"),
             ("model", "Show or switch model"),
@@ -1178,6 +1198,7 @@ def main() -> None:
     app.add_handler(CommandHandler("newsession", new_session_command))
     app.add_handler(CommandHandler("stream", stream_command))
     app.add_handler(CommandHandler("nostream", nostream_command))
+    app.add_handler(CommandHandler(["status", "usage", "compact", "goal"], stream_control_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("model", show_model))

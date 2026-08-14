@@ -1086,7 +1086,7 @@ class CodexAppServerManager:
         if name not in supported:
             return (
                 f"Unsupported Codex stream command: /{name}\n"
-                "Supported: //status, //usage, //compact, //goal [objective|clear]"
+                "Supported: /status, /usage, /compact, /goal [objective|clear]"
             )
         if name == "compact" and chat_id in self._pending_interrupts:
             self._pending_interrupts.discard(chat_id)
@@ -1164,7 +1164,7 @@ class CodexAppServerManager:
                 )
             goal = result.get("goal")
             if not goal:
-                return "No Codex goal is set.\nSet one with //goal <objective>."
+                return "No Codex goal is set.\nSet one with /goal <objective>."
             budget = goal.get("tokenBudget")
             budget_line = f"\nToken budget: {budget}" if budget is not None else ""
             return (
