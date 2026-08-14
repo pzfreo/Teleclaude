@@ -956,9 +956,9 @@ class CodexAppServerManager:
         common: dict[str, Any] = {
             "cwd": str(cwd),
             "approvalPolicy": "never",
-            # ThreadStartParams/ThreadResumeParams use the protocol's camel-case
-            # SandboxMode enum, unlike turn/start's kebab-case SandboxPolicy tag.
-            "sandbox": "dangerFullAccess",
+            # The thread request enum uses kebab-case on the wire. This is the
+            # opposite of turn/start's nested SandboxPolicy discriminator.
+            "sandbox": "danger-full-access",
         }
         if model:
             common["model"] = model
@@ -1000,9 +1000,9 @@ class CodexAppServerManager:
             "input": [{"type": "text", "text": text}],
             "cwd": str(cwd),
             "approvalPolicy": "never",
-            # SandboxPolicy's tagged-union discriminator uses the CLI's native
-            # kebab-case spelling (unlike ThreadStartParams.sandbox above).
-            "sandboxPolicy": {"type": "danger-full-access"},
+            # The nested turn SandboxPolicy discriminator uses camelCase on the
+            # wire. This is the opposite of ThreadStartParams.sandbox above.
+            "sandboxPolicy": {"type": "dangerFullAccess"},
         }
         if model:
             params["model"] = model
