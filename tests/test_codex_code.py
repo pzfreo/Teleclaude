@@ -52,6 +52,7 @@ class TestCodexAppServerManager:
             assert method == "turn/start"
             assert params["threadId"] == "thr_123"
             assert params["input"] == [{"type": "text", "text": "Run tests"}]
+            assert params["sandboxPolicy"] == {"type": "danger-full-access"}
             await manager._notification(
                 1001,
                 conn,

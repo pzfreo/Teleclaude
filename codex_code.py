@@ -998,7 +998,9 @@ class CodexAppServerManager:
             "input": [{"type": "text", "text": text}],
             "cwd": str(cwd),
             "approvalPolicy": "never",
-            "sandboxPolicy": {"type": "dangerFullAccess"},
+            # SandboxPolicy's tagged-union discriminator uses the CLI's native
+            # kebab-case spelling (unlike ThreadStartParams.sandbox above).
+            "sandboxPolicy": {"type": "danger-full-access"},
         }
         if model:
             params["model"] = model
