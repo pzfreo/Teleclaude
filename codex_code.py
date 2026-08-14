@@ -911,8 +911,10 @@ class CodexAppServerManager:
         elif status == "failed":
             error = turn.get("error") or {}
             done.set_exception(RuntimeError(error.get("message", "Codex app-server turn failed")))
-        else:
+        elif status == "completed":
             done.set_result(None)
+        else:
+            done.set_exception(RuntimeError(f"Unexpected Codex app-server terminal status: {status!r}"))
 
     @staticmethod
     async def _emit(chat_id: int, on_event, event: dict) -> None:
@@ -958,11 +960,18 @@ class CodexAppServerManager:
         }
         if model:
             common["model"] = model
-        if thread_id:
-            result = await self._request(chat_id, conn, "thread/resume", {"threadId": thread_id, **common})
-        else:
-            common["serviceName"] = "teleclaude"
-            result = await self._request(chat_id, conn, "thread/start", common)
+        try:
+            if thread_id:
+                result = await self._request(chat_id, conn, "thread/resume", {"threadId": thread_id, **common})
+            else:
+                common["serviceName"] = "teleclaude"
+                result = await self._request(chat_id, conn, "thread/start", common)
+        except Exception:
+            # A timed-out mutating request may still have succeeded server-side.
+            # Recycle the connection so the next operation cannot collide with
+            # protocol state whose outcome this client no longer knows.
+            await self.stop(chat_id)
+            raise
         loaded = (result.get("thread") or {}).get("id")
         if not loaded:
             raise RuntimeError("Codex app-server did not return a thread id")
@@ -1010,10 +1019,12 @@ class CodexAppServerManager:
                     raise CodexTurnAborted()
             await done
         except Exception:
-            if conn.turn_done is done:
+            uncertain_server_state = conn.turn_done is done
+            if uncertain_server_state:
                 conn.turn_done = None
                 conn.on_event = None
                 conn.active_turn_id = None
+                await self.stop(chat_id)
             raise
 
     async def execute_slash(
@@ -1054,6 +1065,11 @@ class CodexAppServerManager:
             try:
                 await self._request(chat_id, conn, "thread/compact/start", {"threadId": thread_id})
                 await done
+            except Exception:
+                if conn.compact_done is done:
+                    conn.compact_done = None
+                    await self.stop(chat_id)
+                raise
             finally:
                 if conn.compact_done is done:
                     conn.compact_done = None
