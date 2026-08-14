@@ -1,4 +1,4 @@
-"""Teleclaude Codex bot with one-shot exec and opt-in persistent app-server modes.
+"""Teleclaude Codex bot with default persistent app-server and one-shot modes.
 
 Trimmed counterpart to bot_agent.py. Deliberately does NOT include: autocompact
 (Codex's context window/compaction behavior differs and wasn't scoped here),
@@ -46,9 +46,11 @@ from persistence import (
     load_codex_active_branch,
     load_codex_active_repo,
     load_codex_session_id,
+    load_codex_stream_mode,
     save_codex_active_branch,
     save_codex_active_repo,
     save_codex_session_id,
+    save_codex_stream_mode,
 )
 from shared import (
     download_telegram_file,
@@ -143,7 +145,8 @@ _typing_tasks: dict[int, asyncio.Task] = {}
 _progress_msg_ids: dict[int, int] = {}
 _progress_lines: dict[int, list[str]] = {}
 _files_cache: dict[int, list[Path]] = {}
-_stream_mode: set[int] = set()  # opt-in app-server chats; codex exec remains the default
+_one_shot_mode: set[int] = set()  # explicit /nostream opt-outs; app-server is the default
+_stream_mode_loaded: set[int] = set()  # chats whose persisted preference has been read
 _stream_control_active: set[int] = set()  # non-turn app-server controls such as /status and /goal
 _prompt_active: set[int] = set()  # chat locks currently owned by the prompt runner, not // controls
 _pending_steers: dict[int, set[object]] = {}  # follow-ups waiting for turn/started
@@ -192,6 +195,14 @@ def _chat_lock(chat_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _chat_locks[chat_id] = lock
     return lock
+
+
+def _uses_stream(chat_id: int) -> bool:
+    if chat_id not in _stream_mode_loaded:
+        if not load_codex_stream_mode(chat_id):
+            _one_shot_mode.add(chat_id)
+        _stream_mode_loaded.add(chat_id)
+    return chat_id not in _one_shot_mode
 
 
 def _drop_queued(chat_id: int) -> int:
@@ -488,8 +499,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/repo owner/name - Set the active GitHub repo directly\n"
         "/branch name - Set active branch\n"
         "/newsession - Wipe this repo's session and start fresh\n"
-        "/stream - Use persistent Codex app-server mode (experimental)\n"
-        "/nostream - Return to one-shot codex exec mode\n"
+        "/stream - Use persistent Codex app-server mode (default)\n"
+        "/nostream - Opt out to one-shot codex exec mode\n"
         "/status, /usage, /compact, /goal - App-server controls in stream mode\n"
         "//command - Pass /command through to Codex as turn input\n"
         "/cancel - Stop the active turn and clear the queue\n"
@@ -740,7 +751,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Acknowledge before signalling: waiting out the SIGINT grace period can take
     # seconds, and a silent /cancel reads as a bot that ignored the command.
     ack = await update.message.reply_text("Interrupting Codex…")
-    if chat_id in _stream_mode:
+    if _uses_stream(chat_id):
         outcome = (
             "idle"
             if chat_id in _stream_control_active
@@ -756,20 +767,19 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def stream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Opt this chat into the persistent Codex app-server prototype."""
+    """Restore this chat to the default persistent app-server transport."""
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
     if _chat_lock(chat_id).locked():
         await update.message.reply_text("Codex is working. Use /cancel before switching modes.")
         return
-    if chat_id in _stream_mode:
+    if _uses_stream(chat_id):
         await update.message.reply_text("Persistent stream mode is already enabled.")
         return
-    _stream_mode.add(chat_id)
-    await update.message.reply_text(
-        "Persistent stream mode enabled (experimental). The next message will use Codex app-server."
-    )
+    _one_shot_mode.discard(chat_id)
+    save_codex_stream_mode(chat_id, True)
+    await update.message.reply_text("Persistent stream mode enabled. The next message will use Codex app-server.")
 
 
 async def nostream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -780,8 +790,9 @@ async def nostream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if _chat_lock(chat_id).locked():
         await update.message.reply_text("Codex is working. Use /cancel before switching modes.")
         return
-    was_streaming = chat_id in _stream_mode
-    _stream_mode.discard(chat_id)
+    was_streaming = _uses_stream(chat_id)
+    _one_shot_mode.add(chat_id)
+    save_codex_stream_mode(chat_id, False)
     await app_server_mgr.stop(chat_id)
     await update.message.reply_text(
         "One-shot mode enabled. Future messages will use codex exec."
@@ -993,7 +1004,7 @@ async def stream_control_command(update: Update, context: ContextTypes.DEFAULT_T
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
-    if chat_id not in _stream_mode:
+    if not _uses_stream(chat_id):
         await update.message.reply_text("This command requires stream mode. Use /stream first.")
         return
     command_name = (update.message.text or "").split(None, 1)[0].split("@", 1)[0]
@@ -1008,7 +1019,7 @@ async def _queue_prompt(chat_id: int, prompt: str, update: Update, context: Cont
     lock = _chat_lock(chat_id)
 
     if lock.locked():
-        if chat_id in _stream_mode:
+        if _uses_stream(chat_id):
             try:
                 if await app_server_mgr.steer(chat_id, prompt):
                     audit_log(
@@ -1188,7 +1199,7 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
     on_event, state = _make_event_handler(chat_id, context.bot, activity_event)
     heartbeat_task = asyncio.create_task(_idle_heartbeat(chat_id, context.bot, activity_event))
     try:
-        manager = app_server_mgr if chat_id in _stream_mode else codex_mgr
+        manager = app_server_mgr if _uses_stream(chat_id) else codex_mgr
         await manager.run_turn(chat_id, repo, prompt, on_event, model=get_model(chat_id))
     except CodexTurnAborted:
         logger.info("Codex turn stopped for chat %d", chat_id)
@@ -1226,8 +1237,8 @@ async def notify_startup(app: Application) -> None:
             ("repo", "Set active GitHub repo (list / number / name / owner/name)"),
             ("branch", "Set active branch"),
             ("newsession", "Wipe this repo's session and start fresh"),
-            ("stream", "Enable persistent app-server mode (experimental)"),
-            ("nostream", "Return to one-shot codex exec mode"),
+            ("stream", "Use persistent app-server mode (default)"),
+            ("nostream", "Opt out to one-shot codex exec mode"),
             ("status", "Show Codex app-server status (stream mode)"),
             ("usage", "Show Codex account usage (stream mode)"),
             ("compact", "Compact Codex context (stream mode)"),

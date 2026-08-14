@@ -14,6 +14,7 @@ class TestInitDb:
         assert "active_repos" in tables
         assert "todo_lists" in tables
         assert "chat_modes" in tables
+        assert "codex_chat_settings" in tables
 
     def test_idempotent(self, tmp_db):
         """Calling init_db twice should not error."""
@@ -21,6 +22,23 @@ class TestInitDb:
             from persistence import init_db
 
             init_db()  # second call — should not raise
+
+
+class TestCodexStreamMode:
+    def test_defaults_to_streaming(self, tmp_db):
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import load_codex_stream_mode
+
+            assert load_codex_stream_mode(1001) is True
+
+    def test_persists_both_modes(self, tmp_db):
+        with patch("persistence.DB_PATH", tmp_db):
+            from persistence import load_codex_stream_mode, save_codex_stream_mode
+
+            save_codex_stream_mode(1001, False)
+            assert load_codex_stream_mode(1001) is False
+            save_codex_stream_mode(1001, True)
+            assert load_codex_stream_mode(1001) is True
 
 
 class TestConversations:

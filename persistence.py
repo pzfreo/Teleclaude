@@ -136,6 +136,10 @@ def init_db() -> None:
             session_id TEXT NOT NULL,
             PRIMARY KEY (chat_id, repo)
         );
+        CREATE TABLE IF NOT EXISTS codex_chat_settings (
+            chat_id INTEGER PRIMARY KEY,
+            stream_mode INTEGER NOT NULL DEFAULT 1
+        );
         """)
     # Migrations for existing databases
     _migrate(conn)
@@ -347,6 +351,36 @@ def save_codex_session_id(chat_id: int, repo: str, session_id: str | None) -> No
         )
     conn.commit()
     conn.close()
+
+
+def load_codex_stream_mode(chat_id: int) -> bool:
+    """Load the Codex transport preference, defaulting new chats to streaming."""
+    conn = _connect()
+    _ensure_codex_chat_settings(conn)
+    row = conn.execute("SELECT stream_mode FROM codex_chat_settings WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return bool(row[0]) if row else True
+
+
+def save_codex_stream_mode(chat_id: int, enabled: bool) -> None:
+    """Persist whether a chat uses the Codex app-server streaming transport."""
+    conn = _connect()
+    _ensure_codex_chat_settings(conn)
+    conn.execute(
+        """INSERT INTO codex_chat_settings (chat_id, stream_mode) VALUES (?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET stream_mode = excluded.stream_mode""",
+        (chat_id, int(enabled)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _ensure_codex_chat_settings(conn: sqlite3.Connection) -> None:
+    """Allow preference access during startup and rolling upgrades before init_db runs."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS codex_chat_settings (
+               chat_id INTEGER PRIMARY KEY,
+               stream_mode INTEGER NOT NULL DEFAULT 1
+           )""")
 
 
 def load_todos(chat_id: int) -> list[dict]:

@@ -306,6 +306,7 @@ def _reset_queue_state(chat_id: int) -> None:
     bot_codex._pending_prompts.pop(chat_id, None)
     bot_codex._prompt_active.discard(chat_id)
     bot_codex._pending_steers.pop(chat_id, None)
+    bot_codex._one_shot_mode.discard(chat_id)
 
 
 class TestQueuedMessages:
@@ -314,7 +315,7 @@ class TestQueuedMessages:
         update = _make_update(chat_id=chat_id)
         context = _make_context()
         lock = bot_codex._chat_lock(chat_id)
-        bot_codex._stream_mode.add(chat_id)
+        bot_codex._one_shot_mode.discard(chat_id)
 
         await lock.acquire()
         try:
@@ -326,7 +327,7 @@ class TestQueuedMessages:
                 await bot_codex._queue_prompt(chat_id, "second", update, context)
         finally:
             lock.release()
-            bot_codex._stream_mode.discard(chat_id)
+            bot_codex._one_shot_mode.discard(chat_id)
 
         steer.assert_awaited_once_with(chat_id, "second")
         dispatch.assert_not_awaited()
@@ -339,7 +340,7 @@ class TestQueuedMessages:
         update = _make_update(chat_id=chat_id)
         context = _make_context()
         lock = bot_codex._chat_lock(chat_id)
-        bot_codex._stream_mode.add(chat_id)
+        bot_codex._one_shot_mode.discard(chat_id)
         bot_codex._prompt_active.add(chat_id)
         await lock.acquire()
 
@@ -352,7 +353,7 @@ class TestQueuedMessages:
                 await bot_codex._queue_prompt(chat_id, "during setup", update, context)
         finally:
             lock.release()
-            bot_codex._stream_mode.discard(chat_id)
+            bot_codex._one_shot_mode.discard(chat_id)
 
         assert steer.await_count == 2
         assert chat_id not in bot_codex._pending_steers
@@ -376,7 +377,7 @@ class TestQueuedMessages:
         update = _make_update(chat_id=chat_id)
         context = _make_context()
         lock = bot_codex._chat_lock(chat_id)
-        bot_codex._stream_mode.add(chat_id)
+        bot_codex._one_shot_mode.discard(chat_id)
         await lock.acquire()
 
         try:
@@ -391,7 +392,7 @@ class TestQueuedMessages:
         finally:
             if lock.locked():
                 lock.release()
-            bot_codex._stream_mode.discard(chat_id)
+            bot_codex._one_shot_mode.discard(chat_id)
 
         dispatch.assert_awaited_once_with(chat_id, "after status", update, context)
         assert chat_id not in bot_codex._pending_prompts
@@ -403,6 +404,7 @@ class TestQueuedMessages:
         update = _make_update(chat_id=chat_id)
         context = _make_context()
         lock = bot_codex._chat_lock(chat_id)
+        bot_codex._one_shot_mode.add(chat_id)
 
         await lock.acquire()
         try:
@@ -440,6 +442,7 @@ class TestQueuedMessages:
         update = _make_update(chat_id=chat_id)
         context = _make_context()
         lock = bot_codex._chat_lock(chat_id)
+        bot_codex._one_shot_mode.add(chat_id)
         bot_codex._pending_prompts[chat_id] = [
             (f"queued {i}", _make_update(chat_id=chat_id)) for i in range(bot_codex.MAX_QUEUED_PROMPTS)
         ]
@@ -478,6 +481,7 @@ class TestQueuedMessages:
         cancel_update = _make_update(chat_id=chat_id)
         context = _make_context()
         bot_codex._pending_prompts[chat_id] = [("a", _make_update()), ("b", _make_update())]
+        bot_codex._one_shot_mode.add(chat_id)
 
         with (
             patch("bot_codex.is_authorized", return_value=True),
@@ -498,6 +502,7 @@ class TestCancellationCommands:
     async def test_cancel_uses_graceful_interrupt(self):
         update = _make_update(chat_id=501)
         context = _make_context()
+        bot_codex._one_shot_mode.add(501)
 
         with (
             patch("bot_codex.is_authorized", return_value=True),
@@ -510,11 +515,13 @@ class TestCancellationCommands:
 
         interrupt.assert_awaited_once_with(501, mark_pending=False)
         update.message.reply_text.return_value.edit_text.assert_awaited_once_with("Cancelled current turn.")
+        bot_codex._one_shot_mode.discard(501)
 
     async def test_cancel_acknowledges_before_signalling(self):
         """Regression: /cancel used to sit silent for the whole SIGINT grace period."""
         update = _make_update(chat_id=504)
         context = _make_context()
+        bot_codex._one_shot_mode.add(504)
         order: list[str] = []
 
         update.message.reply_text.side_effect = lambda *a, **k: order.append("ack") or AsyncMock()
@@ -531,10 +538,12 @@ class TestCancellationCommands:
             await bot_codex.cancel_command(update, context)
 
         assert order == ["ack", "interrupt"]
+        bot_codex._one_shot_mode.discard(504)
 
     async def test_cancel_reports_a_forced_kill_honestly(self):
         update = _make_update(chat_id=503)
         context = _make_context()
+        bot_codex._one_shot_mode.add(503)
 
         with (
             patch("bot_codex.is_authorized", return_value=True),
@@ -546,6 +555,7 @@ class TestCancellationCommands:
         update.message.reply_text.return_value.edit_text.assert_awaited_once_with(
             "Codex ignored the interrupt — killed it."
         )
+        bot_codex._one_shot_mode.discard(503)
 
     async def test_stop_keeps_hard_process_group_abort(self):
         update = _make_update(chat_id=502)
@@ -563,32 +573,59 @@ class TestCancellationCommands:
 
 
 class TestStreamModeCommands:
+    def test_stream_is_default_for_new_chat(self):
+        chat_id = 600
+        bot_codex._one_shot_mode.discard(chat_id)
+        bot_codex._stream_mode_loaded.discard(chat_id)
+
+        with patch("bot_codex.load_codex_stream_mode", return_value=True):
+            assert bot_codex._uses_stream(chat_id) is True
+
+    def test_persisted_nostream_mode_is_restored(self):
+        chat_id = 606
+        bot_codex._one_shot_mode.discard(chat_id)
+        bot_codex._stream_mode_loaded.discard(chat_id)
+
+        with patch("bot_codex.load_codex_stream_mode", return_value=False) as load:
+            assert bot_codex._uses_stream(chat_id) is False
+            assert bot_codex._uses_stream(chat_id) is False
+
+        load.assert_called_once_with(chat_id)
+        bot_codex._one_shot_mode.discard(chat_id)
+        bot_codex._stream_mode_loaded.discard(chat_id)
+
     async def test_stream_enables_app_server_mode(self):
         chat_id = 601
         update = _make_update(chat_id=chat_id)
         context = _make_context()
-        bot_codex._stream_mode.discard(chat_id)
+        bot_codex._one_shot_mode.add(chat_id)
 
-        with patch("bot_codex.is_authorized", return_value=True):
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch("bot_codex.save_codex_stream_mode") as save_mode,
+        ):
             await bot_codex.stream_command(update, context)
 
-        assert chat_id in bot_codex._stream_mode
+        assert chat_id not in bot_codex._one_shot_mode
+        save_mode.assert_called_once_with(chat_id, True)
         assert "enabled" in update.message.reply_text.await_args.args[0]
-        bot_codex._stream_mode.discard(chat_id)
+        bot_codex._one_shot_mode.discard(chat_id)
 
     async def test_nostream_stops_app_server_and_restores_exec(self):
         chat_id = 602
         update = _make_update(chat_id=chat_id)
         context = _make_context()
-        bot_codex._stream_mode.add(chat_id)
+        bot_codex._one_shot_mode.discard(chat_id)
 
         with (
             patch("bot_codex.is_authorized", return_value=True),
+            patch("bot_codex.save_codex_stream_mode") as save_mode,
             patch.object(bot_codex.app_server_mgr, "stop", new_callable=AsyncMock) as stop,
         ):
             await bot_codex.nostream_command(update, context)
 
-        assert chat_id not in bot_codex._stream_mode
+        assert chat_id in bot_codex._one_shot_mode
+        save_mode.assert_called_once_with(chat_id, False)
         stop.assert_awaited_once_with(chat_id)
         assert "One-shot mode enabled" in update.message.reply_text.await_args.args[0]
 
@@ -596,7 +633,7 @@ class TestStreamModeCommands:
         chat_id = 603
         update = _make_update(chat_id=chat_id)
         context = _make_context()
-        bot_codex._stream_mode.add(chat_id)
+        bot_codex._one_shot_mode.discard(chat_id)
         try:
             with (
                 patch("bot_codex.get_active_repo", return_value="owner/repo"),
@@ -614,7 +651,7 @@ class TestStreamModeCommands:
 
             run_turn.assert_awaited_once()
         finally:
-            bot_codex._stream_mode.discard(chat_id)
+            bot_codex._one_shot_mode.discard(chat_id)
 
     async def test_double_slash_passes_single_slash_to_prompt_queue(self):
         chat_id = 604
@@ -624,7 +661,7 @@ class TestStreamModeCommands:
         update.message.photo = []
         update.message.document = None
         context = _make_context()
-        bot_codex._stream_mode.add(chat_id)
+        bot_codex._one_shot_mode.discard(chat_id)
         try:
             with (
                 patch("bot_codex.is_authorized", return_value=True),
@@ -634,7 +671,7 @@ class TestStreamModeCommands:
 
             queue.assert_awaited_once_with(chat_id, "/status", update, context)
         finally:
-            bot_codex._stream_mode.discard(chat_id)
+            bot_codex._one_shot_mode.discard(chat_id)
 
     async def test_double_slash_passthrough_also_works_in_one_shot_mode(self):
         chat_id = 606
@@ -644,7 +681,7 @@ class TestStreamModeCommands:
         update.message.photo = []
         update.message.document = None
         context = _make_context()
-        bot_codex._stream_mode.discard(chat_id)
+        bot_codex._one_shot_mode.add(chat_id)
 
         with (
             patch("bot_codex.is_authorized", return_value=True),
@@ -653,6 +690,7 @@ class TestStreamModeCommands:
             await bot_codex.handle_message(update, context)
 
         queue.assert_awaited_once_with(chat_id, "/anything flexible", update, context)
+        bot_codex._one_shot_mode.discard(chat_id)
 
     async def test_fixed_goal_is_an_ordinary_telegram_command(self):
         chat_id = 605
@@ -660,7 +698,7 @@ class TestStreamModeCommands:
         update.message.text = "/goal Ship it"
         context = _make_context()
         context.args = ["Ship", "it"]
-        bot_codex._stream_mode.add(chat_id)
+        bot_codex._one_shot_mode.discard(chat_id)
         try:
             with (
                 patch("bot_codex.is_authorized", return_value=True),
@@ -670,7 +708,7 @@ class TestStreamModeCommands:
 
             control.assert_awaited_once_with(chat_id, "/goal Ship it", update, context)
         finally:
-            bot_codex._stream_mode.discard(chat_id)
+            bot_codex._one_shot_mode.discard(chat_id)
 
     async def test_new_turn_clears_an_abort_flag_left_by_a_previous_stop(self):
         """Regression: after /cancel then /stop, the next message was silently dropped.
@@ -684,6 +722,7 @@ class TestStreamModeCommands:
         update = _make_update(chat_id=chat_id)
         context = _make_context()
         bot_codex.codex_mgr._aborted_chats.add(chat_id)
+        bot_codex._one_shot_mode.add(chat_id)
 
         try:
             with (
@@ -704,3 +743,4 @@ class TestStreamModeCommands:
             run_turn.assert_awaited_once()
         finally:
             bot_codex.codex_mgr._aborted_chats.discard(chat_id)
+            bot_codex._one_shot_mode.discard(chat_id)
