@@ -1,10 +1,9 @@
 """Codex CLI integration — routes agent-mode messages through `codex` CLI.
 
-Prototype counterpart to claude_code.py. The established path uses single-shot
-`codex exec` subprocesses with continuity through `resume`. An opt-in prototype
-also uses `codex app-server` over JSONL stdio for persistent threads, streamed
-events, and protocol-level interruption; the bot exposes that path through
-`/stream` while retaining `codex exec` as its default.
+Prototype counterpart to claude_code.py. The default path uses `codex app-server`
+over JSONL stdio for persistent threads, streamed events, steering, and
+protocol-level interruption. Chats can opt out through `/nostream`, which uses
+single-shot `codex exec` subprocesses with continuity through `resume`.
 
 Event schema below (thread.started / turn.started / item.started /
 item.completed / turn.completed / turn.failed / error) was verified against a
@@ -685,7 +684,7 @@ class CodexCodeManager:
 
 
 class CodexAppServerManager:
-    """Persistent, opt-in Codex app-server transport for Telegram chats.
+    """Persistent Codex app-server transport for Telegram chats.
 
     Each opted-in chat gets one JSONL-over-stdio app-server process. Thread ids
     are shared with ``CodexCodeManager`` so a chat can switch between app-server
