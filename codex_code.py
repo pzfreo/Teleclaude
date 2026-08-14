@@ -50,6 +50,7 @@ class _AppServerConnection:
     active_repo: str | None = None
     active_thread_id: str | None = None
     active_turn_id: str | None = None
+    turn_ready: bool = False
     on_event: Any = None
     turn_done: asyncio.Future | None = None
     compact_done: asyncio.Future | None = None
@@ -863,6 +864,7 @@ class CodexAppServerManager:
         if method == "turn/started":
             turn = params.get("turn") or {}
             conn.active_turn_id = turn.get("id")
+            conn.turn_ready = True
             if chat_id in self._pending_interrupts and conn.active_thread_id and conn.active_turn_id:
                 self._pending_interrupts.discard(chat_id)
                 asyncio.create_task(
@@ -902,6 +904,7 @@ class CodexAppServerManager:
             await self._emit(chat_id, on_event, {"type": "turn.completed", "usage": {}})
         done = conn.turn_done
         conn.active_turn_id = None
+        conn.turn_ready = False
         conn.on_event = None
         conn.turn_done = None
         if not done or done.done():
@@ -995,6 +998,7 @@ class CodexAppServerManager:
         done = asyncio.get_running_loop().create_future()
         conn.turn_done = done
         conn.on_event = on_event
+        conn.turn_ready = False
         params: dict[str, Any] = {
             "threadId": thread_id,
             "input": [{"type": "text", "text": text}],
@@ -1028,8 +1032,39 @@ class CodexAppServerManager:
                 conn.turn_done = None
                 conn.on_event = None
                 conn.active_turn_id = None
+                conn.turn_ready = False
                 await self.stop(chat_id)
             raise
+
+    async def steer(self, chat_id: int, text: str) -> bool:
+        """Add user input to the active turn, returning False if none exists."""
+        conn = self._connections.get(chat_id)
+        if (
+            not conn
+            or not conn.active_thread_id
+            or not conn.active_turn_id
+            or not conn.turn_ready
+            or not conn.turn_done
+            or conn.turn_done.done()
+        ):
+            return False
+        expected_turn_id = conn.active_turn_id
+        result = await self._request(
+            chat_id,
+            conn,
+            "turn/steer",
+            {
+                "threadId": conn.active_thread_id,
+                "expectedTurnId": expected_turn_id,
+                "input": [{"type": "text", "text": text}],
+            },
+        )
+        returned_turn_id = result.get("turnId")
+        if returned_turn_id != expected_turn_id:
+            raise RuntimeError(
+                f"Codex app-server steered unexpected turn {returned_turn_id!r}; expected {expected_turn_id!r}"
+            )
+        return True
 
     async def execute_slash(
         self,

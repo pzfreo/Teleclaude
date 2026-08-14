@@ -172,6 +172,59 @@ class TestCodexAppServerManager:
         stop.assert_awaited_once_with(1001)
         assert conn.turn_done is None
 
+    async def test_steer_adds_input_to_active_turn(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(
+            proc=MagicMock(),
+            active_thread_id="thr_123",
+            active_turn_id="turn_456",
+            turn_ready=True,
+            turn_done=asyncio.get_running_loop().create_future(),
+        )
+        manager._connections[1001] = conn
+
+        with patch.object(
+            manager,
+            "_request",
+            new_callable=AsyncMock,
+            return_value={"turnId": "turn_456"},
+        ) as request:
+            assert await manager.steer(1001, "Also check typing") is True
+
+        request.assert_awaited_once_with(
+            1001,
+            conn,
+            "turn/steer",
+            {
+                "threadId": "thr_123",
+                "expectedTurnId": "turn_456",
+                "input": [{"type": "text", "text": "Also check typing"}],
+            },
+        )
+
+    async def test_steer_returns_false_without_active_turn(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+
+        assert await manager.steer(1001, "Too early") is False
+
+    async def test_steer_waits_for_turn_started_notification(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(
+            proc=MagicMock(),
+            active_thread_id="thr_123",
+            active_turn_id="turn_456",
+            turn_done=asyncio.get_running_loop().create_future(),
+        )
+        manager._connections[1001] = conn
+
+        with patch.object(manager, "_request", new_callable=AsyncMock) as request:
+            assert await manager.steer(1001, "Still too early") is False
+
+        request.assert_not_awaited()
+
     async def test_thread_load_failure_recycles_connection_with_uncertain_state(self, tmp_path):
         owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
         manager = CodexAppServerManager(owner)

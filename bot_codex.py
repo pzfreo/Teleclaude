@@ -988,6 +988,24 @@ async def _queue_prompt(chat_id: int, prompt: str, update: Update, context: Cont
     lock = _chat_lock(chat_id)
 
     if lock.locked():
+        if chat_id in _stream_mode:
+            try:
+                if await app_server_mgr.steer(chat_id, prompt):
+                    audit_log(
+                        "codex_message_steered",
+                        chat_id=chat_id,
+                        user_id=update.effective_user.id if update.effective_user else None,
+                        detail=(prompt[:80] + "...") if len(prompt) > 80 else prompt,
+                    )
+                    await msg.reply_text("Added to the active Codex turn.")
+                    return
+            except Exception as exc:
+                # A turn can finish between observing its id and the server
+                # accepting turn/steer. Do not enqueue after a failed steer:
+                # /cancel may already have cleared the queue in that window.
+                logger.warning("Codex turn/steer failed for chat %d: %s", chat_id, exc)
+                await msg.reply_text("Could not add that message to the active turn. Please send it again.")
+                return
         pending = _pending_prompts.setdefault(chat_id, [])
         if len(pending) >= MAX_QUEUED_PROMPTS:
             await msg.reply_text(
