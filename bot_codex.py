@@ -144,7 +144,9 @@ _progress_msg_ids: dict[int, int] = {}
 _progress_lines: dict[int, list[str]] = {}
 _files_cache: dict[int, list[Path]] = {}
 _stream_mode: set[int] = set()  # opt-in app-server chats; codex exec remains the default
-_stream_control_active: set[int] = set()  # //status or //usage, which do not create cancellable turns
+_stream_control_active: set[int] = set()  # non-turn app-server controls such as /status and /goal
+_prompt_active: set[int] = set()  # chat locks currently owned by the prompt runner, not // controls
+_pending_steers: dict[int, set[object]] = {}  # follow-ups waiting for turn/started
 # Messages that arrived mid-turn, waiting to be handed to Codex together. Whoever
 # holds the chat lock drains this when its turn ends; /cancel and /stop clear it,
 # so stopping a turn doesn't just start the next queued message.
@@ -198,7 +200,9 @@ def _drop_queued(chat_id: int) -> int:
     Without this, stopping a turn just feeds the queued messages to Codex
     straight away, which reads as the cancel not having worked.
     """
-    return len(_pending_prompts.pop(chat_id, []))
+    queued = len(_pending_prompts.pop(chat_id, []))
+    waiting = len(_pending_steers.pop(chat_id, set()))
+    return queued + waiting
 
 
 # ── Progress / typing UX (mirrors bot_agent.py's ephemeral progress message) ──
@@ -486,7 +490,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/newsession - Wipe this repo's session and start fresh\n"
         "/stream - Use persistent Codex app-server mode (experimental)\n"
         "/nostream - Return to one-shot codex exec mode\n"
-        "//status, //usage, //compact - Run app-server commands in stream mode\n"
+        "/status, /usage, /compact, /goal - App-server controls in stream mode\n"
+        "//command - Pass /command through to Codex as turn input\n"
         "/cancel - Stop the active turn and clear the queue\n"
         "/stop - Force-kill the Codex run and its child processes now\n"
         "/model [name] - Show or switch model\n"
@@ -921,9 +926,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text and not attachment_paths:
         return
 
-    if text.startswith("//") and not attachment_paths and chat_id in _stream_mode:
-        await _handle_stream_slash(chat_id, text[1:], update, context)
-        return
+    if text.startswith("//"):
+        text = text[1:]
 
     prompt = text
     if attachment_paths:
@@ -939,7 +943,7 @@ async def _handle_stream_slash(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Map escaped Telegram commands onto explicit app-server operations."""
+    """Map fixed Telegram control commands onto explicit app-server operations."""
     # Clear only stale state from an earlier operation. A /cancel arriving after
     # this synchronous boundary remains armed throughout repository preparation.
     app_server_mgr.clear_pending_interrupt(chat_id)
@@ -957,7 +961,7 @@ async def _handle_stream_slash(
             if saved_session:
                 codex_mgr._sessions[(chat_id, repo)] = saved_session
         command_name = command.lstrip("/").split(None, 1)[0].lower() if command.strip("/").strip() else ""
-        is_control = command_name in {"status", "usage"}
+        is_control = command_name in {"goal", "status", "usage"}
         if is_control:
             _stream_control_active.add(chat_id)
         try:
@@ -982,12 +986,67 @@ async def _handle_stream_slash(
     await send_long_message(chat_id, response, context.bot)
 
 
+async def stream_control_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run a fixed app-server operation exposed as a Telegram command."""
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    if chat_id not in _stream_mode:
+        await update.message.reply_text("This command requires stream mode. Use /stream first.")
+        return
+    command_name = (update.message.text or "").split(None, 1)[0].split("@", 1)[0]
+    args = " ".join(context.args)
+    command = f"{command_name} {args}".rstrip()
+    await _handle_stream_slash(chat_id, command, update, context)
+
+
 async def _queue_prompt(chat_id: int, prompt: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Run the prompt now, or park it for the running turn to pick up when it ends."""
     msg = update.message
     lock = _chat_lock(chat_id)
 
     if lock.locked():
+        if chat_id in _stream_mode:
+            try:
+                if await app_server_mgr.steer(chat_id, prompt):
+                    audit_log(
+                        "codex_message_steered",
+                        chat_id=chat_id,
+                        user_id=update.effective_user.id if update.effective_user else None,
+                        detail=(prompt[:80] + "...") if len(prompt) > 80 else prompt,
+                    )
+                    await msg.reply_text("Added to the active Codex turn.")
+                    return
+            except Exception as exc:
+                # A turn can finish between observing its id and the server
+                # accepting turn/steer. Do not enqueue after a failed steer:
+                # /cancel may already have cleared the queue in that window.
+                logger.warning("Codex turn/steer failed for chat %d: %s", chat_id, exc)
+                await msg.reply_text("Could not add that message to the active turn. Please send it again.")
+                return
+            if chat_id in _prompt_active:
+                waiting = _pending_steers.setdefault(chat_id, set())
+                if len(waiting) + len(_pending_prompts.get(chat_id, [])) >= MAX_QUEUED_PROMPTS:
+                    await msg.reply_text(
+                        f"{MAX_QUEUED_PROMPTS} messages are already waiting. "
+                        "Use /cancel to stop the current turn and clear them."
+                    )
+                    return
+                token = object()
+                waiting.add(token)
+                await msg.reply_text("Waiting for the active Codex turn to accept this message…")
+                await _wait_and_steer(chat_id, prompt, update, context, token)
+                return
+            else:
+                # Stream control commands share the lock but do not drain the
+                # prompt queue. Wait for that command, then dispatch normally.
+                await msg.reply_text("Waiting for the current Codex command to finish…")
+                async with lock:
+                    pass
+                await _queue_prompt(chat_id, prompt, update, context)
+                return
         pending = _pending_prompts.setdefault(chat_id, [])
         if len(pending) >= MAX_QUEUED_PROMPTS:
             await msg.reply_text(
@@ -1002,27 +1061,78 @@ async def _queue_prompt(chat_id: int, prompt: str, update: Update, context: Cont
 
     dropped = 0
     async with lock:
-        keep_going = await _dispatch_prompt(chat_id, prompt, update, context)
-        while keep_going:
-            queued = _pending_prompts.pop(chat_id, None)
-            if not queued:
-                break
-            # One turn for the lot: `codex exec resume` reloads the thread each time,
-            # so N follow-ups as N turns is N times the setup for the same context.
-            logger.info("Codex: merging %d queued message(s) into one turn for chat %d", len(queued), chat_id)
-            merged = "\n\n".join(text for text, _ in queued)
-            keep_going = await _dispatch_prompt(chat_id, merged, queued[-1][1], context)
+        _prompt_active.add(chat_id)
+        try:
+            keep_going = await _dispatch_prompt(chat_id, prompt, update, context)
+            while keep_going:
+                queued = _pending_prompts.pop(chat_id, None)
+                if not queued:
+                    break
+                # One turn for the lot: `codex exec resume` reloads the thread each time,
+                # so N follow-ups as N turns is N times the setup for the same context.
+                logger.info("Codex: merging %d queued message(s) into one turn for chat %d", len(queued), chat_id)
+                merged = "\n\n".join(text for text, _ in queued)
+                keep_going = await _dispatch_prompt(chat_id, merged, queued[-1][1], context)
 
-        if not keep_going:
-            # Aborted mid-turn: anything queued in the gap before it actually
-            # stopped belongs to the work the user just cancelled.
-            dropped = _drop_queued(chat_id)
+            if not keep_going:
+                # Aborted mid-turn: anything queued in the gap before it actually
+                # stopped belongs to the work the user just cancelled.
+                dropped = _drop_queued(chat_id)
+        finally:
+            _prompt_active.discard(chat_id)
 
     # Everything above the lock release is synchronous once the queue reads empty,
     # so a message arriving from here on finds an unlocked chat and runs itself
     # rather than being parked with no one left to drain it.
     if dropped:
         await _notify_dropped(chat_id, dropped, context.bot)
+
+
+async def _wait_and_steer(
+    chat_id: int,
+    prompt: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    token: object,
+) -> None:
+    """Steer a follow-up once turn/started arrives, or run it after a normal early exit."""
+    while token in _pending_steers.get(chat_id, set()):
+        try:
+            if await app_server_mgr.steer(chat_id, prompt):
+                waiting = _pending_steers.get(chat_id)
+                if not waiting or token not in waiting:
+                    return  # /cancel removed it while the request was in flight
+                waiting.discard(token)
+                if not waiting:
+                    _pending_steers.pop(chat_id, None)
+                audit_log(
+                    "codex_message_steered",
+                    chat_id=chat_id,
+                    user_id=update.effective_user.id if update.effective_user else None,
+                    detail=(prompt[:80] + "...") if len(prompt) > 80 else prompt,
+                )
+                await update.message.reply_text("Added to the active Codex turn.")
+                return
+        except Exception as exc:
+            logger.warning("Deferred Codex turn/steer failed for chat %d: %s", chat_id, exc)
+            waiting = _pending_steers.get(chat_id)
+            if waiting:
+                waiting.discard(token)
+                if not waiting:
+                    _pending_steers.pop(chat_id, None)
+            await update.message.reply_text("Could not add that message to the active turn. Please send it again.")
+            return
+
+        if chat_id not in _prompt_active:
+            waiting = _pending_steers.get(chat_id)
+            if not waiting or token not in waiting:
+                return  # cancelled, rather than a normal turn exit
+            waiting.discard(token)
+            if not waiting:
+                _pending_steers.pop(chat_id, None)
+            await _queue_prompt(chat_id, prompt, update, context)
+            return
+        await asyncio.sleep(0.05)
 
 
 async def _notify_dropped(chat_id: int, dropped: int, bot) -> None:
@@ -1118,6 +1228,10 @@ async def notify_startup(app: Application) -> None:
             ("newsession", "Wipe this repo's session and start fresh"),
             ("stream", "Enable persistent app-server mode (experimental)"),
             ("nostream", "Return to one-shot codex exec mode"),
+            ("status", "Show Codex app-server status (stream mode)"),
+            ("usage", "Show Codex account usage (stream mode)"),
+            ("compact", "Compact Codex context (stream mode)"),
+            ("goal", "Show or set the Codex goal (stream mode)"),
             ("cancel", "Stop the active turn and clear the queue"),
             ("stop", "Force-kill Codex run and child processes now"),
             ("model", "Show or switch model"),
@@ -1147,6 +1261,7 @@ def main() -> None:
     app.add_handler(CommandHandler("newsession", new_session_command))
     app.add_handler(CommandHandler("stream", stream_command))
     app.add_handler(CommandHandler("nostream", nostream_command))
+    app.add_handler(CommandHandler(["status", "usage", "compact", "goal"], stream_control_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("model", show_model))

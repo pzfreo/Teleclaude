@@ -304,9 +304,100 @@ class TestIdleHeartbeat:
 def _reset_queue_state(chat_id: int) -> None:
     bot_codex._chat_locks.pop(chat_id, None)
     bot_codex._pending_prompts.pop(chat_id, None)
+    bot_codex._prompt_active.discard(chat_id)
+    bot_codex._pending_steers.pop(chat_id, None)
 
 
 class TestQueuedMessages:
+    async def test_stream_message_steers_active_turn_instead_of_queueing(self):
+        chat_id = 400
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        lock = bot_codex._chat_lock(chat_id)
+        bot_codex._stream_mode.add(chat_id)
+
+        await lock.acquire()
+        try:
+            with (
+                patch.object(bot_codex.app_server_mgr, "steer", new_callable=AsyncMock, return_value=True) as steer,
+                patch("bot_codex._dispatch_prompt", new_callable=AsyncMock) as dispatch,
+                patch("bot_codex.audit_log"),
+            ):
+                await bot_codex._queue_prompt(chat_id, "second", update, context)
+        finally:
+            lock.release()
+            bot_codex._stream_mode.discard(chat_id)
+
+        steer.assert_awaited_once_with(chat_id, "second")
+        dispatch.assert_not_awaited()
+        assert chat_id not in bot_codex._pending_prompts
+        update.message.reply_text.assert_awaited_once_with("Added to the active Codex turn.")
+        _reset_queue_state(chat_id)
+
+    async def test_stream_message_waits_for_turn_started_then_steers(self):
+        chat_id = 407
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        lock = bot_codex._chat_lock(chat_id)
+        bot_codex._stream_mode.add(chat_id)
+        bot_codex._prompt_active.add(chat_id)
+        await lock.acquire()
+
+        try:
+            with (
+                patch.object(bot_codex.app_server_mgr, "steer", new_callable=AsyncMock) as steer,
+                patch("bot_codex.audit_log"),
+            ):
+                steer.side_effect = [False, True]
+                await bot_codex._queue_prompt(chat_id, "during setup", update, context)
+        finally:
+            lock.release()
+            bot_codex._stream_mode.discard(chat_id)
+
+        assert steer.await_count == 2
+        assert chat_id not in bot_codex._pending_steers
+        assert [call.args[0] for call in update.message.reply_text.await_args_list] == [
+            "Waiting for the active Codex turn to accept this message…",
+            "Added to the active Codex turn.",
+        ]
+        _reset_queue_state(chat_id)
+
+    async def test_cancel_drops_message_waiting_to_steer(self):
+        chat_id = 408
+        token = object()
+        bot_codex._pending_steers[chat_id] = {token}
+
+        assert bot_codex._drop_queued(chat_id) == 1
+        assert chat_id not in bot_codex._pending_steers
+        _reset_queue_state(chat_id)
+
+    async def test_stream_message_waits_out_control_lock_without_becoming_orphaned(self):
+        chat_id = 406
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        lock = bot_codex._chat_lock(chat_id)
+        bot_codex._stream_mode.add(chat_id)
+        await lock.acquire()
+
+        try:
+            with (
+                patch.object(bot_codex.app_server_mgr, "steer", new_callable=AsyncMock, return_value=False),
+                patch("bot_codex._dispatch_prompt", new_callable=AsyncMock, return_value=True) as dispatch,
+            ):
+                task = asyncio.create_task(bot_codex._queue_prompt(chat_id, "after status", update, context))
+                await asyncio.sleep(0)
+                lock.release()
+                await task
+        finally:
+            if lock.locked():
+                lock.release()
+            bot_codex._stream_mode.discard(chat_id)
+
+        dispatch.assert_awaited_once_with(chat_id, "after status", update, context)
+        assert chat_id not in bot_codex._pending_prompts
+        update.message.reply_text.assert_awaited_once_with("Waiting for the current Codex command to finish…")
+        _reset_queue_state(chat_id)
+
     async def test_message_arriving_mid_turn_is_queued_not_rejected(self):
         chat_id = 401
         update = _make_update(chat_id=chat_id)
@@ -525,7 +616,7 @@ class TestStreamModeCommands:
         finally:
             bot_codex._stream_mode.discard(chat_id)
 
-    async def test_double_slash_routes_to_stream_command_not_prompt_queue(self):
+    async def test_double_slash_passes_single_slash_to_prompt_queue(self):
         chat_id = 604
         update = _make_update(chat_id=chat_id)
         update.message.text = "//status"
@@ -537,13 +628,47 @@ class TestStreamModeCommands:
         try:
             with (
                 patch("bot_codex.is_authorized", return_value=True),
-                patch("bot_codex._handle_stream_slash", new_callable=AsyncMock) as slash,
                 patch("bot_codex._queue_prompt", new_callable=AsyncMock) as queue,
             ):
                 await bot_codex.handle_message(update, context)
 
-            slash.assert_awaited_once_with(chat_id, "/status", update, context)
-            queue.assert_not_awaited()
+            queue.assert_awaited_once_with(chat_id, "/status", update, context)
+        finally:
+            bot_codex._stream_mode.discard(chat_id)
+
+    async def test_double_slash_passthrough_also_works_in_one_shot_mode(self):
+        chat_id = 606
+        update = _make_update(chat_id=chat_id)
+        update.message.text = "//anything flexible"
+        update.message.caption = None
+        update.message.photo = []
+        update.message.document = None
+        context = _make_context()
+        bot_codex._stream_mode.discard(chat_id)
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch("bot_codex._queue_prompt", new_callable=AsyncMock) as queue,
+        ):
+            await bot_codex.handle_message(update, context)
+
+        queue.assert_awaited_once_with(chat_id, "/anything flexible", update, context)
+
+    async def test_fixed_goal_is_an_ordinary_telegram_command(self):
+        chat_id = 605
+        update = _make_update(chat_id=chat_id)
+        update.message.text = "/goal Ship it"
+        context = _make_context()
+        context.args = ["Ship", "it"]
+        bot_codex._stream_mode.add(chat_id)
+        try:
+            with (
+                patch("bot_codex.is_authorized", return_value=True),
+                patch("bot_codex._handle_stream_slash", new_callable=AsyncMock) as control,
+            ):
+                await bot_codex.stream_control_command(update, context)
+
+            control.assert_awaited_once_with(chat_id, "/goal Ship it", update, context)
         finally:
             bot_codex._stream_mode.discard(chat_id)
 

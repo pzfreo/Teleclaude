@@ -50,6 +50,7 @@ class _AppServerConnection:
     active_repo: str | None = None
     active_thread_id: str | None = None
     active_turn_id: str | None = None
+    turn_ready: bool = False
     on_event: Any = None
     turn_done: asyncio.Future | None = None
     compact_done: asyncio.Future | None = None
@@ -863,7 +864,9 @@ class CodexAppServerManager:
         if method == "turn/started":
             turn = params.get("turn") or {}
             conn.active_turn_id = turn.get("id")
-            if chat_id in self._pending_interrupts and conn.active_thread_id and conn.active_turn_id:
+            cancellation_pending = chat_id in self._pending_interrupts
+            conn.turn_ready = not cancellation_pending
+            if cancellation_pending and conn.active_thread_id and conn.active_turn_id:
                 self._pending_interrupts.discard(chat_id)
                 asyncio.create_task(
                     self._interrupt_started_turn(chat_id, conn, conn.active_thread_id, conn.active_turn_id)
@@ -902,6 +905,7 @@ class CodexAppServerManager:
             await self._emit(chat_id, on_event, {"type": "turn.completed", "usage": {}})
         done = conn.turn_done
         conn.active_turn_id = None
+        conn.turn_ready = False
         conn.on_event = None
         conn.turn_done = None
         if not done or done.done():
@@ -995,6 +999,7 @@ class CodexAppServerManager:
         done = asyncio.get_running_loop().create_future()
         conn.turn_done = done
         conn.on_event = on_event
+        conn.turn_ready = False
         params: dict[str, Any] = {
             "threadId": thread_id,
             "input": [{"type": "text", "text": text}],
@@ -1028,8 +1033,39 @@ class CodexAppServerManager:
                 conn.turn_done = None
                 conn.on_event = None
                 conn.active_turn_id = None
+                conn.turn_ready = False
                 await self.stop(chat_id)
             raise
+
+    async def steer(self, chat_id: int, text: str) -> bool:
+        """Add user input to the active turn, returning False if none exists."""
+        conn = self._connections.get(chat_id)
+        if (
+            not conn
+            or not conn.active_thread_id
+            or not conn.active_turn_id
+            or not conn.turn_ready
+            or not conn.turn_done
+            or conn.turn_done.done()
+        ):
+            return False
+        expected_turn_id = conn.active_turn_id
+        result = await self._request(
+            chat_id,
+            conn,
+            "turn/steer",
+            {
+                "threadId": conn.active_thread_id,
+                "expectedTurnId": expected_turn_id,
+                "input": [{"type": "text", "text": text}],
+            },
+        )
+        returned_turn_id = result.get("turnId")
+        if returned_turn_id != expected_turn_id:
+            raise RuntimeError(
+                f"Codex app-server steered unexpected turn {returned_turn_id!r}; expected {expected_turn_id!r}"
+            )
+        return True
 
     async def execute_slash(
         self,
@@ -1041,14 +1077,17 @@ class CodexAppServerManager:
         """Execute a supported TUI-style command through app-server methods.
 
         Slash commands are normally parsed by the interactive Codex TUI, not
-        by app-server. Teleclaude maps the useful read/maintenance commands
-        explicitly so ``//status`` is never mistaken for a model prompt.
+        by app-server. Teleclaude exposes selected app-server operations as
+        ordinary Telegram commands; flexible ``//`` input bypasses this method.
         """
         name, _, args = command.strip().partition(" ")
         name = name.lower().lstrip("/")
-        supported = {"compact", "status", "usage"}
+        supported = {"compact", "goal", "status", "usage"}
         if name not in supported:
-            return f"Unsupported Codex stream command: /{name}\n" "Supported: //status, //usage, //compact"
+            return (
+                f"Unsupported Codex stream command: /{name}\n"
+                "Supported: /status, /usage, /compact, /goal [objective|clear]"
+            )
         if name == "compact" and chat_id in self._pending_interrupts:
             self._pending_interrupts.discard(chat_id)
             raise CodexTurnAborted()
@@ -1063,7 +1102,7 @@ class CodexAppServerManager:
 
         if name == "compact":
             if args:
-                return "Usage: //compact"
+                return "Usage: /compact"
             done = asyncio.get_running_loop().create_future()
             conn.compact_done = done
             try:
@@ -1081,7 +1120,7 @@ class CodexAppServerManager:
 
         if name == "status":
             if args:
-                return "Usage: //status"
+                return "Usage: /status"
             result = await self._request(
                 chat_id,
                 conn,
@@ -1099,9 +1138,45 @@ class CodexAppServerManager:
                 f"Runtime: {runtime_status}"
             )
 
+        if name == "goal":
+            goal_args = args.strip()
+            if goal_args.lower() == "clear":
+                result = await self._request(
+                    chat_id,
+                    conn,
+                    "thread/goal/clear",
+                    {"threadId": thread_id},
+                )
+                return "Codex goal cleared." if result.get("cleared") else "No Codex goal was set."
+            if goal_args:
+                result = await self._request(
+                    chat_id,
+                    conn,
+                    "thread/goal/set",
+                    {"threadId": thread_id, "objective": goal_args},
+                )
+            else:
+                result = await self._request(
+                    chat_id,
+                    conn,
+                    "thread/goal/get",
+                    {"threadId": thread_id},
+                )
+            goal = result.get("goal")
+            if not goal:
+                return "No Codex goal is set.\nSet one with /goal <objective>."
+            budget = goal.get("tokenBudget")
+            budget_line = f"\nToken budget: {budget}" if budget is not None else ""
+            return (
+                "Codex goal\n"
+                f"Objective: {goal.get('objective', '')}\n"
+                f"Status: {goal.get('status', 'unknown')}\n"
+                f"Tokens used: {goal.get('tokensUsed', 0)}{budget_line}"
+            )
+
         if name == "usage":
             if args:
-                return "Usage filters are not supported yet. Use //usage without arguments."
+                return "Usage filters are not supported yet. Use /usage without arguments."
             result = await self._request(chat_id, conn, "account/usage/read", {})
             rendered = json.dumps(result, indent=2, sort_keys=True)
             if len(rendered) > 3500:
@@ -1120,6 +1195,9 @@ class CodexAppServerManager:
                 self._pending_interrupts.add(chat_id)
                 return "cancelled"
             return "idle"
+        # Stop accepting follow-up input before awaiting the protocol response;
+        # /cancel and a simultaneous message are processed concurrently.
+        conn.turn_ready = False
         try:
             await self._request(
                 chat_id,
