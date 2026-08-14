@@ -1,12 +1,10 @@
 """Codex CLI integration — routes agent-mode messages through `codex` CLI.
 
-Prototype counterpart to claude_code.py. Unlike Claude Code CLI, `codex exec`
-is single-shot: each turn spawns a fresh subprocess and exits, and there is no
-equivalent to Claude Code's `--input-format stream-json` for feeding follow-up
-messages into a live process. Conversation continuity across turns is via
-`codex exec resume <thread_id> <prompt>` instead. This means there is no
-persistent "stream mode" here — no background process to push scheduled or
-monitor-triggered messages into.
+Prototype counterpart to claude_code.py. The established path uses single-shot
+`codex exec` subprocesses with continuity through `resume`. An opt-in prototype
+also uses `codex app-server` over JSONL stdio for persistent threads, streamed
+events, and protocol-level interruption; the bot exposes that path through
+`/stream` while retaining `codex exec` as its default.
 
 Event schema below (thread.started / turn.started / item.started /
 item.completed / turn.completed / turn.failed / error) was verified against a
@@ -23,8 +21,9 @@ import logging
 import os
 import shutil
 import signal
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +37,22 @@ _ORPHAN_POLL_INTERVAL = 0.1  # seconds between checks that a signalled process g
 
 class CodexTurnAborted(Exception):
     """Raised when a Codex turn is intentionally stopped by the user."""
+
+
+@dataclass
+class _AppServerConnection:
+    proc: asyncio.subprocess.Process
+    write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    pending: dict[int, asyncio.Future] = field(default_factory=dict)
+    next_id: int = 1
+    reader_task: asyncio.Task | None = None
+    stderr_task: asyncio.Task | None = None
+    active_repo: str | None = None
+    active_thread_id: str | None = None
+    active_turn_id: str | None = None
+    on_event: Any = None
+    turn_done: asyncio.Future | None = None
+    compact_done: asyncio.Future | None = None
 
 
 async def update_codex_cli() -> tuple[bool, str]:
@@ -666,3 +681,445 @@ class CodexCodeManager:
         if proc.returncode not in (0, None):
             stderr_text = "\n".join(stderr_lines[-20:])
             await on_event({"type": "_process_error", "returncode": proc.returncode, "stderr": stderr_text})
+
+
+class CodexAppServerManager:
+    """Persistent, opt-in Codex app-server transport for Telegram chats.
+
+    Each opted-in chat gets one JSONL-over-stdio app-server process. Thread ids
+    are shared with ``CodexCodeManager`` so a chat can switch between app-server
+    and ``codex exec resume`` without losing its conversation.
+    """
+
+    def __init__(self, owner: CodexCodeManager):
+        self.owner = owner
+        self._connections: dict[int, _AppServerConnection] = {}
+        self._pending_interrupts: set[int] = set()
+
+    def active(self, chat_id: int) -> bool:
+        conn = self._connections.get(chat_id)
+        return bool(conn and conn.proc.returncode is None and conn.reader_task and not conn.reader_task.done())
+
+    async def _start(self, chat_id: int) -> _AppServerConnection:
+        if self.active(chat_id):
+            return self._connections[chat_id]
+        await self.stop(chat_id)
+        assert self.owner.cli_path is not None, "Codex CLI not found"
+        proc = await asyncio.create_subprocess_exec(
+            self.owner.cli_path,
+            "app-server",
+            "--listen",
+            "stdio://",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=10 * 1024 * 1024,
+            env=self.owner._git_env(),
+            start_new_session=True,
+        )
+        conn = _AppServerConnection(proc=proc)
+        self._connections[chat_id] = conn
+        conn.reader_task = asyncio.create_task(self._read_forever(chat_id, conn))
+        conn.stderr_task = asyncio.create_task(self._drain_stderr(chat_id, conn))
+        try:
+            await self._request(
+                chat_id,
+                conn,
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "teleclaude",
+                        "title": "Teleclaude Codex Bot",
+                        "version": "prototype",
+                    }
+                },
+            )
+            await self._send(conn, {"method": "initialized", "params": {}})
+        except Exception:
+            await self.stop(chat_id)
+            raise
+        return conn
+
+    async def _send(self, conn: _AppServerConnection, payload: dict) -> None:
+        if conn.proc.stdin is None or conn.proc.stdin.is_closing():
+            raise RuntimeError("Codex app-server stdin is closed")
+        async with conn.write_lock:
+            conn.proc.stdin.write((json.dumps(payload) + "\n").encode())
+            await asyncio.wait_for(conn.proc.stdin.drain(), timeout=5)
+
+    async def _request(
+        self,
+        chat_id: int,
+        conn: _AppServerConnection,
+        method: str,
+        params: dict,
+        timeout: float = 30,
+    ) -> dict:
+        request_id = conn.next_id
+        conn.next_id += 1
+        future = asyncio.get_running_loop().create_future()
+        conn.pending[request_id] = future
+        try:
+            await self._send(conn, {"method": method, "id": request_id, "params": params})
+            result = await asyncio.wait_for(future, timeout=timeout)
+            return result
+        finally:
+            conn.pending.pop(request_id, None)
+
+    async def _read_forever(self, chat_id: int, conn: _AppServerConnection) -> None:
+        assert conn.proc.stdout is not None
+        error: Exception = RuntimeError("Codex app-server exited")
+        try:
+            async for raw in conn.proc.stdout:
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.debug("Codex app-server emitted non-JSON: %s", raw.decode(errors="replace").rstrip())
+                    continue
+                request_id = message.get("id")
+                if request_id is not None and ("result" in message or "error" in message):
+                    future = conn.pending.get(request_id)
+                    if future and not future.done():
+                        if "error" in message:
+                            detail = message["error"].get("message", str(message["error"]))
+                            future.set_exception(RuntimeError(f"Codex app-server {detail}"))
+                        else:
+                            future.set_result(message.get("result", {}))
+                    continue
+                if request_id is not None and message.get("method"):
+                    await self._send(
+                        conn,
+                        {
+                            "id": request_id,
+                            "error": {
+                                "code": -32601,
+                                "message": f"Unsupported server request: {message['method']}",
+                            },
+                        },
+                    )
+                    continue
+                await self._notification(chat_id, conn, message)
+        except asyncio.CancelledError:
+            error = CodexTurnAborted()
+            raise
+        except Exception as exc:
+            error = exc
+            logger.error("Codex app-server reader failed for chat %d: %s", chat_id, exc, exc_info=True)
+        finally:
+            for future in list(conn.pending.values()):
+                if not future.done():
+                    future.set_exception(error)
+            if conn.turn_done and not conn.turn_done.done():
+                conn.turn_done.set_exception(error)
+            if conn.compact_done and not conn.compact_done.done():
+                conn.compact_done.set_exception(error)
+
+    async def _drain_stderr(self, chat_id: int, conn: _AppServerConnection) -> None:
+        assert conn.proc.stderr is not None
+        try:
+            async for raw in conn.proc.stderr:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    logger.debug("Codex app-server stderr (chat %d): %s", chat_id, line)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Codex app-server stderr reader ended for chat %d: %s", chat_id, exc)
+
+    @staticmethod
+    def _normalize_item(item: dict) -> dict:
+        normalized = dict(item)
+        type_map = {
+            "agentMessage": "agent_message",
+            "commandExecution": "command_execution",
+            "fileChange": "file_change",
+            "mcpToolCall": "mcp_tool_call",
+            "webSearch": "web_search",
+        }
+        item_type = item.get("type")
+        normalized["type"] = type_map.get(item_type, item_type) if isinstance(item_type, str) else item_type
+        if item.get("status") == "inProgress":
+            normalized["status"] = "in_progress"
+        if "exitCode" in item:
+            normalized["exit_code"] = item["exitCode"]
+        return normalized
+
+    async def _notification(self, chat_id: int, conn: _AppServerConnection, message: dict) -> None:
+        method = message.get("method")
+        params = message.get("params") or {}
+        thread_id = params.get("threadId")
+        if thread_id and conn.active_thread_id and thread_id != conn.active_thread_id:
+            return
+        on_event = conn.on_event
+        if method == "turn/started":
+            turn = params.get("turn") or {}
+            conn.active_turn_id = turn.get("id")
+            if chat_id in self._pending_interrupts and conn.active_thread_id and conn.active_turn_id:
+                self._pending_interrupts.discard(chat_id)
+                asyncio.create_task(
+                    self._interrupt_started_turn(chat_id, conn, conn.active_thread_id, conn.active_turn_id)
+                )
+            if on_event:
+                await self._emit(chat_id, on_event, {"type": "turn.started"})
+            return
+        if method in {"item/started", "item/completed"} and on_event:
+            event_type = "item.started" if method.endswith("started") else "item.completed"
+            await self._emit(
+                chat_id,
+                on_event,
+                {"type": event_type, "item": self._normalize_item(params.get("item") or {})},
+            )
+            return
+        if method == "error" and on_event:
+            error = params.get("error") or {}
+            await self._emit(
+                chat_id,
+                on_event,
+                {"type": "_process_error", "returncode": 1, "stderr": error.get("message", str(error))},
+            )
+            return
+        if method == "thread/compacted":
+            done = conn.compact_done
+            conn.compact_done = None
+            if done and not done.done():
+                done.set_result(None)
+            return
+        if method != "turn/completed":
+            return
+
+        turn = params.get("turn") or {}
+        status = turn.get("status")
+        if on_event and status == "completed":
+            await self._emit(chat_id, on_event, {"type": "turn.completed", "usage": {}})
+        done = conn.turn_done
+        conn.active_turn_id = None
+        conn.on_event = None
+        conn.turn_done = None
+        if not done or done.done():
+            return
+        if status == "interrupted":
+            done.set_exception(CodexTurnAborted())
+        elif status == "failed":
+            error = turn.get("error") or {}
+            done.set_exception(RuntimeError(error.get("message", "Codex app-server turn failed")))
+        else:
+            done.set_result(None)
+
+    @staticmethod
+    async def _emit(chat_id: int, on_event, event: dict) -> None:
+        try:
+            await on_event(event)
+        except Exception as exc:
+            logger.error("Codex app-server event handler failed for chat %d: %s", chat_id, exc, exc_info=True)
+
+    async def _interrupt_started_turn(
+        self,
+        chat_id: int,
+        conn: _AppServerConnection,
+        thread_id: str,
+        turn_id: str,
+    ) -> None:
+        try:
+            await self._request(
+                chat_id,
+                conn,
+                "turn/interrupt",
+                {"threadId": thread_id, "turnId": turn_id},
+            )
+        except Exception as exc:
+            logger.warning("Deferred Codex app-server interrupt failed for chat %d: %s", chat_id, exc)
+            await self.stop(chat_id)
+
+    async def _load_thread(
+        self,
+        chat_id: int,
+        conn: _AppServerConnection,
+        repo: str,
+        cwd: Path,
+        model: str | None,
+    ) -> str:
+        if conn.active_repo == repo and conn.active_thread_id:
+            return conn.active_thread_id
+        session_key = (chat_id, repo)
+        thread_id = self.owner._sessions.get(session_key)
+        common: dict[str, Any] = {
+            "cwd": str(cwd),
+            "approvalPolicy": "never",
+            "sandbox": "dangerFullAccess",
+        }
+        if model:
+            common["model"] = model
+        if thread_id:
+            result = await self._request(chat_id, conn, "thread/resume", {"threadId": thread_id, **common})
+        else:
+            common["serviceName"] = "teleclaude"
+            result = await self._request(chat_id, conn, "thread/start", common)
+        loaded = (result.get("thread") or {}).get("id")
+        if not loaded:
+            raise RuntimeError("Codex app-server did not return a thread id")
+        self.owner._sessions[session_key] = loaded
+        conn.active_repo = repo
+        conn.active_thread_id = loaded
+        return loaded
+
+    async def run_turn(self, chat_id: int, repo: str, text: str, on_event, model: str | None = None) -> None:
+        if chat_id in self._pending_interrupts:
+            self._pending_interrupts.discard(chat_id)
+            raise CodexTurnAborted()
+        conn = await self._start(chat_id)
+        cwd = self.owner.workspace_path(repo)
+        thread_id = await self._load_thread(chat_id, conn, repo, cwd, model)
+        if chat_id in self._pending_interrupts:
+            self._pending_interrupts.discard(chat_id)
+            raise CodexTurnAborted()
+        done = asyncio.get_running_loop().create_future()
+        conn.turn_done = done
+        conn.on_event = on_event
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": text}],
+            "cwd": str(cwd),
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "dangerFullAccess"},
+        }
+        if model:
+            params["model"] = model
+        try:
+            result = await self._request(chat_id, conn, "turn/start", params)
+            if not done.done():
+                conn.active_turn_id = (result.get("turn") or {}).get("id") or conn.active_turn_id
+            if chat_id in self._pending_interrupts:
+                self._pending_interrupts.discard(chat_id)
+                if conn.active_turn_id:
+                    await self._request(
+                        chat_id,
+                        conn,
+                        "turn/interrupt",
+                        {"threadId": thread_id, "turnId": conn.active_turn_id},
+                    )
+                else:
+                    raise CodexTurnAborted()
+            await done
+        except Exception:
+            if conn.turn_done is done:
+                conn.turn_done = None
+                conn.on_event = None
+                conn.active_turn_id = None
+            raise
+
+    async def execute_slash(
+        self,
+        chat_id: int,
+        repo: str,
+        command: str,
+        model: str | None = None,
+    ) -> str:
+        """Execute a supported TUI-style command through app-server methods.
+
+        Slash commands are normally parsed by the interactive Codex TUI, not
+        by app-server. Teleclaude maps the useful read/maintenance commands
+        explicitly so ``//status`` is never mistaken for a model prompt.
+        """
+        name, _, args = command.strip().partition(" ")
+        name = name.lower().lstrip("/")
+        supported = {"compact", "status", "usage"}
+        if name not in supported:
+            return f"Unsupported Codex stream command: /{name}\n" "Supported: //status, //usage, //compact"
+
+        conn = await self._start(chat_id)
+        cwd = self.owner.workspace_path(repo)
+        thread_id = await self._load_thread(chat_id, conn, repo, cwd, model)
+
+        if name == "compact":
+            if args:
+                return "Usage: //compact"
+            done = asyncio.get_running_loop().create_future()
+            conn.compact_done = done
+            try:
+                await self._request(chat_id, conn, "thread/compact/start", {"threadId": thread_id})
+                await done
+            finally:
+                if conn.compact_done is done:
+                    conn.compact_done = None
+            return "Codex context compaction completed."
+
+        if name == "status":
+            if args:
+                return "Usage: //status"
+            result = await self._request(
+                chat_id,
+                conn,
+                "thread/read",
+                {"threadId": thread_id, "includeTurns": False},
+            )
+            thread = result.get("thread") or {}
+            runtime_status = thread.get("status") or "loaded"
+            active_model = thread.get("model") or model or "CLI default"
+            return (
+                "Codex app-server status\n"
+                f"Thread: {thread_id}\n"
+                f"Repository: {repo}\n"
+                f"Model: {active_model}\n"
+                f"Runtime: {runtime_status}"
+            )
+
+        if name == "usage":
+            if args:
+                return "Usage filters are not supported yet. Use //usage without arguments."
+            result = await self._request(chat_id, conn, "account/usage/read", {})
+            rendered = json.dumps(result, indent=2, sort_keys=True)
+            if len(rendered) > 3500:
+                rendered = rendered[:3500] + "\n…"
+            return f"Codex account usage\n{rendered}"
+
+        raise AssertionError(f"unhandled supported command: {name}")
+
+    async def interrupt(self, chat_id: int, mark_pending: bool = False) -> Literal["idle", "cancelled", "forced"]:
+        conn = self._connections.get(chat_id)
+        if conn and conn.compact_done and not conn.compact_done.done():
+            await self.stop(chat_id)
+            return "forced"
+        if not conn or not conn.active_thread_id or not conn.active_turn_id:
+            if mark_pending or (conn and conn.turn_done and not conn.turn_done.done()):
+                self._pending_interrupts.add(chat_id)
+                return "cancelled"
+            return "idle"
+        try:
+            await self._request(
+                chat_id,
+                conn,
+                "turn/interrupt",
+                {"threadId": conn.active_thread_id, "turnId": conn.active_turn_id},
+            )
+            return "cancelled"
+        except Exception as exc:
+            logger.warning("Codex app-server interrupt failed for chat %d: %s", chat_id, exc)
+            await self.stop(chat_id)
+            return "forced"
+
+    async def stop(self, chat_id: int, mark_pending: bool = False) -> bool:
+        if mark_pending:
+            self._pending_interrupts.add(chat_id)
+        conn = self._connections.pop(chat_id, None)
+        if not conn:
+            return mark_pending
+        if conn.reader_task and not conn.reader_task.done():
+            conn.reader_task.cancel()
+        if conn.stderr_task and not conn.stderr_task.done():
+            conn.stderr_task.cancel()
+        if conn.proc.returncode is None:
+            CodexCodeManager._signal_proc_group(conn.proc, signal.SIGTERM)
+            if not await CodexCodeManager._wait_for_proc_exit(conn.proc, PROCESS_ABORT_TIMEOUT):
+                CodexCodeManager._signal_proc_group(conn.proc, signal.SIGKILL)
+                await CodexCodeManager._wait_for_proc_exit(conn.proc, PROCESS_ABORT_TIMEOUT)
+        for task in (conn.reader_task, conn.stderr_task):
+            if task:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        return True
+
+    async def stop_all(self) -> None:
+        for chat_id in list(self._connections):
+            await self.stop(chat_id)

@@ -169,6 +169,7 @@ class TestListFiles:
             with (
                 patch("bot_codex.is_authorized", return_value=True),
                 patch("bot_codex.get_active_repo", return_value="owner/repo"),
+                patch("bot_codex.get_active_branch", return_value=None),
                 patch.object(bot_codex.codex_mgr, "workspace_path", return_value=workspace),
             ):
                 await bot_codex.list_files(update, ctx)
@@ -468,6 +469,83 @@ class TestCancellationCommands:
 
         abort.assert_awaited_once_with(502, mark_pending=False)
         update.message.reply_text.assert_awaited_once_with("Stopped.")
+
+
+class TestStreamModeCommands:
+    async def test_stream_enables_app_server_mode(self):
+        chat_id = 601
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        bot_codex._stream_mode.discard(chat_id)
+
+        with patch("bot_codex.is_authorized", return_value=True):
+            await bot_codex.stream_command(update, context)
+
+        assert chat_id in bot_codex._stream_mode
+        assert "enabled" in update.message.reply_text.await_args.args[0]
+        bot_codex._stream_mode.discard(chat_id)
+
+    async def test_nostream_stops_app_server_and_restores_exec(self):
+        chat_id = 602
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        bot_codex._stream_mode.add(chat_id)
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch.object(bot_codex.app_server_mgr, "stop", new_callable=AsyncMock) as stop,
+        ):
+            await bot_codex.nostream_command(update, context)
+
+        assert chat_id not in bot_codex._stream_mode
+        stop.assert_awaited_once_with(chat_id)
+        assert "One-shot mode enabled" in update.message.reply_text.await_args.args[0]
+
+    async def test_dispatch_uses_app_server_when_stream_enabled(self):
+        chat_id = 603
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        bot_codex._stream_mode.add(chat_id)
+        try:
+            with (
+                patch("bot_codex.get_active_repo", return_value="owner/repo"),
+                patch("bot_codex.get_active_branch", return_value=None),
+                patch("bot_codex.load_codex_session_id", return_value=None),
+                patch.object(bot_codex.codex_mgr, "ensure_clone", new_callable=AsyncMock),
+                patch.object(bot_codex.codex_mgr, "pull_latest", new_callable=AsyncMock),
+                patch.object(bot_codex.app_server_mgr, "run_turn", new_callable=AsyncMock) as run_turn,
+                patch("bot_codex._clear_progress", new_callable=AsyncMock),
+                patch("bot_codex._start_typing"),
+                patch("bot_codex._stop_typing"),
+                patch("bot_codex._idle_heartbeat", new_callable=AsyncMock),
+            ):
+                assert await bot_codex._dispatch_prompt(chat_id, "hello", update, context) is True
+
+            run_turn.assert_awaited_once()
+        finally:
+            bot_codex._stream_mode.discard(chat_id)
+
+    async def test_double_slash_routes_to_stream_command_not_prompt_queue(self):
+        chat_id = 604
+        update = _make_update(chat_id=chat_id)
+        update.message.text = "//status"
+        update.message.caption = None
+        update.message.photo = []
+        update.message.document = None
+        context = _make_context()
+        bot_codex._stream_mode.add(chat_id)
+        try:
+            with (
+                patch("bot_codex.is_authorized", return_value=True),
+                patch("bot_codex._handle_stream_slash", new_callable=AsyncMock) as slash,
+                patch("bot_codex._queue_prompt", new_callable=AsyncMock) as queue,
+            ):
+                await bot_codex.handle_message(update, context)
+
+            slash.assert_awaited_once_with(chat_id, "/status", update, context)
+            queue.assert_not_awaited()
+        finally:
+            bot_codex._stream_mode.discard(chat_id)
 
     async def test_new_turn_clears_an_abort_flag_left_by_a_previous_stop(self):
         """Regression: after /cancel then /stop, the next message was silently dropped.
