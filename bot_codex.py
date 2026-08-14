@@ -1,11 +1,9 @@
-"""Teleclaude Codex bot (prototype) — every message pipes to Codex CLI via `codex exec`.
+"""Teleclaude Codex bot with one-shot exec and opt-in persistent app-server modes.
 
 Trimmed counterpart to bot_agent.py. Deliberately does NOT include: autocompact
 (Codex's context window/compaction behavior differs and wasn't scoped here),
-persistent stream mode (codex_code.py has no equivalent — see its module
-docstring), the [ASK:] inline-keyboard flow, and /files /df /cleanup /plan
-/work /btw. Those are candidates for a follow-up once this prototype is
-validated.
+the [ASK:] inline-keyboard flow, and /df /cleanup /plan /work /btw. Those are
+candidates for a follow-up once this prototype is validated.
 """
 
 from pathlib import Path
@@ -34,6 +32,7 @@ from telegram.ext import (
 )
 
 from codex_code import (
+    CodexAppServerManager,
     CodexCodeManager,
     CodexTurnAborted,
     format_item_progress,
@@ -119,6 +118,7 @@ if not GITHUB_TOKEN:
 # ── Codex CLI ─────────────────────────────────────────────────────────
 
 codex_mgr = CodexCodeManager(GITHUB_TOKEN)
+app_server_mgr = CodexAppServerManager(codex_mgr)
 if codex_mgr.available:
     logger.info("Codex CLI: enabled (path=%s)", codex_mgr.cli_path)
 
@@ -143,6 +143,8 @@ _typing_tasks: dict[int, asyncio.Task] = {}
 _progress_msg_ids: dict[int, int] = {}
 _progress_lines: dict[int, list[str]] = {}
 _files_cache: dict[int, list[Path]] = {}
+_stream_mode: set[int] = set()  # opt-in app-server chats; codex exec remains the default
+_stream_control_active: set[int] = set()  # //status or //usage, which do not create cancellable turns
 # Messages that arrived mid-turn, waiting to be handed to Codex together. Whoever
 # holds the chat lock drains this when its turn ends; /cancel and /stop clear it,
 # so stopping a turn doesn't just start the next queued message.
@@ -482,6 +484,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/repo owner/name - Set the active GitHub repo directly\n"
         "/branch name - Set active branch\n"
         "/newsession - Wipe this repo's session and start fresh\n"
+        "/stream - Use persistent Codex app-server mode (experimental)\n"
+        "/nostream - Return to one-shot codex exec mode\n"
+        "//status, //usage, //compact - Run app-server commands in stream mode\n"
         "/cancel - Stop the active turn and clear the queue\n"
         "/stop - Force-kill the Codex run and its child processes now\n"
         "/model [name] - Show or switch model\n"
@@ -685,6 +690,7 @@ async def new_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not repo:
         await update.message.reply_text("No repo set. Use /repo owner/name first.")
         return
+    await app_server_mgr.stop(chat_id)
     codex_mgr.new_session(chat_id, repo)
     save_codex_session_id(chat_id, repo, None)
     await update.message.reply_text(f"Session cleared for {repo}. Next message starts fresh.")
@@ -697,7 +703,9 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     _stop_typing(chat_id)
     await _clear_progress(chat_id, context.bot)
     dropped = _drop_queued(chat_id)
-    stopped = await codex_mgr.abort(chat_id, mark_pending=_chat_lock(chat_id).locked())
+    stream_stopped = await app_server_mgr.stop(chat_id, mark_pending=_chat_lock(chat_id).locked())
+    exec_stopped = await codex_mgr.abort(chat_id, mark_pending=_chat_lock(chat_id).locked())
+    stopped = stream_stopped or exec_stopped
     await update.message.reply_text(_with_dropped("Stopped." if stopped else "Nothing running.", dropped))
 
 
@@ -727,12 +735,54 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Acknowledge before signalling: waiting out the SIGINT grace period can take
     # seconds, and a silent /cancel reads as a bot that ignored the command.
     ack = await update.message.reply_text("Interrupting Codex…")
-    outcome = await codex_mgr.interrupt(chat_id, mark_pending=_chat_lock(chat_id).locked())
+    if chat_id in _stream_mode:
+        outcome = (
+            "idle"
+            if chat_id in _stream_control_active
+            else await app_server_mgr.interrupt(chat_id, mark_pending=_chat_lock(chat_id).locked())
+        )
+    else:
+        outcome = await codex_mgr.interrupt(chat_id, mark_pending=_chat_lock(chat_id).locked())
     text = _with_dropped(_CANCEL_OUTCOMES[outcome], dropped)
     try:
         await ack.edit_text(text)
     except TelegramError:
         await update.message.reply_text(text)
+
+
+async def stream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Opt this chat into the persistent Codex app-server prototype."""
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    if _chat_lock(chat_id).locked():
+        await update.message.reply_text("Codex is working. Use /cancel before switching modes.")
+        return
+    if chat_id in _stream_mode:
+        await update.message.reply_text("Persistent stream mode is already enabled.")
+        return
+    _stream_mode.add(chat_id)
+    await update.message.reply_text(
+        "Persistent stream mode enabled (experimental). The next message will use Codex app-server."
+    )
+
+
+async def nostream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Return this chat to the established one-shot codex exec transport."""
+    if not is_authorized(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    if _chat_lock(chat_id).locked():
+        await update.message.reply_text("Codex is working. Use /cancel before switching modes.")
+        return
+    was_streaming = chat_id in _stream_mode
+    _stream_mode.discard(chat_id)
+    await app_server_mgr.stop(chat_id)
+    await update.message.reply_text(
+        "One-shot mode enabled. Future messages will use codex exec."
+        if was_streaming
+        else "One-shot mode is already enabled."
+    )
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -871,12 +921,65 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text and not attachment_paths:
         return
 
+    if text.startswith("//") and not attachment_paths and chat_id in _stream_mode:
+        await _handle_stream_slash(chat_id, text[1:], update, context)
+        return
+
     prompt = text
     if attachment_paths:
         paths_str = "\n".join(f"  - {p}" for p in attachment_paths)
         prompt += f"\n\nAttached files (saved to disk, you can read them):\n{paths_str}"
 
     await _queue_prompt(chat_id, prompt, update, context)
+
+
+async def _handle_stream_slash(
+    chat_id: int,
+    command: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Map escaped Telegram commands onto explicit app-server operations."""
+    # Clear only stale state from an earlier operation. A /cancel arriving after
+    # this synchronous boundary remains armed throughout repository preparation.
+    app_server_mgr.clear_pending_interrupt(chat_id)
+    lock = _chat_lock(chat_id)
+    if lock.locked():
+        await update.message.reply_text("Codex is working. Wait for it to finish or use /cancel first.")
+        return
+    async with lock:
+        repo = get_active_repo(chat_id)
+        if not repo:
+            await update.message.reply_text("No repo set. Use /repo owner/name first.")
+            return
+        if codex_mgr.get_session_id(chat_id, repo) is None:
+            saved_session = load_codex_session_id(chat_id, repo)
+            if saved_session:
+                codex_mgr._sessions[(chat_id, repo)] = saved_session
+        command_name = command.lstrip("/").split(None, 1)[0].lower() if command.strip("/").strip() else ""
+        is_control = command_name in {"status", "usage"}
+        if is_control:
+            _stream_control_active.add(chat_id)
+        try:
+            await codex_mgr.ensure_clone(repo)
+            branch = get_active_branch(chat_id)
+            if branch:
+                await codex_mgr.checkout_branch(repo, branch)
+            response = await app_server_mgr.execute_slash(chat_id, repo, command, model=get_model(chat_id))
+            thread_id = codex_mgr.get_session_id(chat_id, repo)
+            if thread_id:
+                save_codex_session_id(chat_id, repo, thread_id)
+        except CodexTurnAborted:
+            logger.info("Codex stream command stopped for chat %d", chat_id)
+            return
+        except Exception as exc:
+            logger.error("Codex stream command failed for chat %d: %s", chat_id, exc, exc_info=True)
+            await update.message.reply_text(f"Codex stream command failed: {exc}")
+            return
+        finally:
+            if is_control:
+                _stream_control_active.discard(chat_id)
+    await send_long_message(chat_id, response, context.bot)
 
 
 async def _queue_prompt(chat_id: int, prompt: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -940,6 +1043,7 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
     # a /stop that landed outside a turn would otherwise cancel this message
     # before it ever reached Codex, silently. Must run before the first await.
     codex_mgr.clear_pending_abort(chat_id)
+    app_server_mgr.clear_pending_interrupt(chat_id)
 
     repo = get_active_repo(chat_id)
     if not repo:
@@ -974,7 +1078,8 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
     on_event, state = _make_event_handler(chat_id, context.bot, activity_event)
     heartbeat_task = asyncio.create_task(_idle_heartbeat(chat_id, context.bot, activity_event))
     try:
-        await codex_mgr.run_turn(chat_id, repo, prompt, on_event, model=get_model(chat_id))
+        manager = app_server_mgr if chat_id in _stream_mode else codex_mgr
+        await manager.run_turn(chat_id, repo, prompt, on_event, model=get_model(chat_id))
     except CodexTurnAborted:
         logger.info("Codex turn stopped for chat %d", chat_id)
         # The reader may have posted progress after /cancel cleared it.
@@ -1011,6 +1116,8 @@ async def notify_startup(app: Application) -> None:
             ("repo", "Set active GitHub repo (list / number / name / owner/name)"),
             ("branch", "Set active branch"),
             ("newsession", "Wipe this repo's session and start fresh"),
+            ("stream", "Enable persistent app-server mode (experimental)"),
+            ("nostream", "Return to one-shot codex exec mode"),
             ("cancel", "Stop the active turn and clear the queue"),
             ("stop", "Force-kill Codex run and child processes now"),
             ("model", "Show or switch model"),
@@ -1021,6 +1128,10 @@ async def notify_startup(app: Application) -> None:
             ("help", "Show help message"),
         ]
     )
+
+
+async def shutdown_app_server(_app: Application) -> None:
+    await app_server_mgr.stop_all()
 
 
 def main() -> None:
@@ -1034,6 +1145,8 @@ def main() -> None:
     app.add_handler(CommandHandler("repo", set_repo))
     app.add_handler(CommandHandler("branch", set_branch))
     app.add_handler(CommandHandler("newsession", new_session_command))
+    app.add_handler(CommandHandler("stream", stream_command))
+    app.add_handler(CommandHandler("nostream", nostream_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("model", show_model))
@@ -1051,6 +1164,7 @@ def main() -> None:
     )
 
     app.post_init = notify_startup
+    app.post_shutdown = shutdown_app_server
 
     logger.info("Teleclaude Codex bot started — cli: %s", codex_mgr.cli_path)
     app.run_polling(allowed_updates=Update.ALL_TYPES)

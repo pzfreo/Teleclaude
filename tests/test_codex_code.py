@@ -5,17 +5,332 @@ import json
 import os
 import signal
 from pathlib import Path
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+import codex_code
 from codex_code import (
+    CodexAppServerManager,
     CodexCodeManager,
     CodexTurnAborted,
     format_agent_progress,
     format_item_progress,
     looks_like_auth_error,
 )
+
+
+class TestCodexAppServerManager:
+    def test_normalizes_app_server_items_for_existing_renderer(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+
+        assert manager._normalize_item(
+            {"type": "commandExecution", "status": "inProgress", "command": "pytest", "exitCode": 2}
+        ) == {
+            "type": "command_execution",
+            "status": "in_progress",
+            "command": "pytest",
+            "exitCode": 2,
+            "exit_code": 2,
+        }
+        assert manager._normalize_item({"type": "agentMessage", "text": "Done"})["type"] == "agent_message"
+
+    async def test_run_turn_uses_persistent_thread_and_streams_notifications(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
+        manager = CodexAppServerManager(owner)
+        proc = MagicMock()
+        proc.returncode = None
+        conn = codex_code._AppServerConnection(proc=proc)
+        received = []
+
+        async def on_event(event):
+            received.append(event)
+
+        async def request(_chat_id, active_conn, method, params, timeout=30):
+            assert active_conn is conn
+            assert method == "turn/start"
+            assert params["threadId"] == "thr_123"
+            assert params["input"] == [{"type": "text", "text": "Run tests"}]
+            await manager._notification(
+                1001,
+                conn,
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thr_123",
+                        "item": {"type": "agentMessage", "text": "All green"},
+                    },
+                },
+            )
+            await manager._notification(
+                1001,
+                conn,
+                {
+                    "method": "turn/completed",
+                    "params": {"threadId": "thr_123", "turn": {"id": "turn_1", "status": "completed"}},
+                },
+            )
+            return {"turn": {"id": "turn_1", "status": "inProgress"}}
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
+            patch.object(manager, "_request", side_effect=request),
+        ):
+            await manager.run_turn(1001, "owner/repo", "Run tests", on_event)
+
+        assert received == [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "All green"}},
+            {"type": "turn.completed", "usage": {}},
+        ]
+        assert conn.active_turn_id is None
+
+    async def test_interrupt_uses_protocol_request_not_process_signal(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        proc = MagicMock()
+        proc.returncode = None
+        conn = codex_code._AppServerConnection(
+            proc=proc,
+            active_thread_id="thr_123",
+            active_turn_id="turn_456",
+        )
+        manager._connections[1001] = conn
+
+        with patch.object(manager, "_request", new_callable=AsyncMock, return_value={}) as request:
+            outcome = await manager.interrupt(1001)
+
+        assert outcome == "cancelled"
+        request.assert_awaited_once_with(
+            1001,
+            conn,
+            "turn/interrupt",
+            {"threadId": "thr_123", "turnId": "turn_456"},
+        )
+
+    async def test_interrupt_marks_turn_cancelled_before_app_server_starts(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+
+        assert await manager.interrupt(1001, mark_pending=True) == "cancelled"
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock) as start,
+            pytest.raises(CodexTurnAborted),
+        ):
+            await manager.run_turn(1001, "owner/repo", "Never run", AsyncMock())
+
+        start.assert_not_awaited()
+        assert 1001 not in manager._pending_interrupts
+
+    async def test_new_operation_can_clear_stale_pending_interrupt(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        manager._pending_interrupts.add(1001)
+
+        manager.clear_pending_interrupt(1001)
+
+        assert 1001 not in manager._pending_interrupts
+
+    async def test_event_handler_failure_does_not_break_turn_completion(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        turn_done = asyncio.get_running_loop().create_future()
+        conn = codex_code._AppServerConnection(
+            proc=MagicMock(),
+            active_thread_id="thr_123",
+            on_event=AsyncMock(side_effect=RuntimeError("Telegram unavailable")),
+            turn_done=turn_done,
+        )
+
+        await manager._notification(
+            1001,
+            conn,
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "thr_123", "turn": {"id": "turn_1", "status": "completed"}},
+            },
+        )
+
+        await turn_done
+
+    async def test_turn_start_failure_recycles_connection_with_uncertain_state(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
+            patch.object(manager, "_request", new_callable=AsyncMock, side_effect=TimeoutError),
+            patch.object(manager, "stop", new_callable=AsyncMock) as stop,
+            pytest.raises(TimeoutError),
+        ):
+            await manager.run_turn(1001, "owner/repo", "Run tests", AsyncMock())
+
+        stop.assert_awaited_once_with(1001)
+        assert conn.turn_done is None
+
+    async def test_thread_load_failure_recycles_connection_with_uncertain_state(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        with (
+            patch.object(manager, "_request", new_callable=AsyncMock, side_effect=TimeoutError),
+            patch.object(manager, "stop", new_callable=AsyncMock) as stop,
+            pytest.raises(TimeoutError),
+        ):
+            await manager._load_thread(1001, conn, "owner/repo", tmp_path, None)
+
+        stop.assert_awaited_once_with(1001)
+
+    async def test_execute_status_maps_to_thread_read(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
+            patch.object(
+                manager,
+                "_request",
+                new_callable=AsyncMock,
+                return_value={"thread": {"id": "thr_123", "status": "idle", "model": "gpt-test"}},
+            ) as request,
+        ):
+            response = await manager.execute_slash(1001, "owner/repo", "/status")
+
+        request.assert_awaited_once_with(
+            1001,
+            conn,
+            "thread/read",
+            {"threadId": "thr_123", "includeTurns": False},
+        )
+        assert "Thread: thr_123" in response
+        assert "Runtime: idle" in response
+
+    async def test_execute_compact_waits_for_thread_compacted_notification(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        async def request(_chat_id, active_conn, method, params, timeout=30):
+            assert active_conn is conn
+            assert method == "thread/compact/start"
+            assert params == {"threadId": "thr_123"}
+            assert conn.compact_done is not None
+            assert not conn.compact_done.done()
+            await manager._notification(
+                1001,
+                conn,
+                {"method": "thread/compacted", "params": {"threadId": "thr_123"}},
+            )
+            return {}
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
+            patch.object(manager, "_request", side_effect=request),
+        ):
+            response = await manager.execute_slash(1001, "owner/repo", "/compact")
+
+        assert response == "Codex context compaction completed."
+        assert conn.compact_done is None
+
+    async def test_execute_compact_consumes_cancel_armed_during_preparation(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        async def load_thread(*_args):
+            manager._pending_interrupts.add(1001)
+            return "thr_123"
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", side_effect=load_thread),
+            patch.object(manager, "_request", new_callable=AsyncMock) as request,
+            pytest.raises(CodexTurnAborted),
+        ):
+            await manager.execute_slash(1001, "owner/repo", "/compact")
+
+        request.assert_not_awaited()
+        assert 1001 not in manager._pending_interrupts
+
+    async def test_compact_start_failure_recycles_connection_with_uncertain_state(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
+            patch.object(manager, "_request", new_callable=AsyncMock, side_effect=TimeoutError),
+            patch.object(manager, "stop", new_callable=AsyncMock) as stop,
+            pytest.raises(TimeoutError),
+        ):
+            await manager.execute_slash(1001, "owner/repo", "/compact")
+
+        stop.assert_awaited_once_with(1001)
+        assert conn.compact_done is None
+
+    async def test_execute_unknown_slash_does_not_start_model_turn(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
+            patch.object(manager, "_request", new_callable=AsyncMock) as request,
+        ):
+            response = await manager.execute_slash(1001, "owner/repo", "/diff")
+
+        request.assert_not_awaited()
+        assert "Unsupported Codex stream command: /diff" in response
+
+    async def test_interrupted_notification_raises_turn_aborted(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock(), active_thread_id="thr_123")
+        turn_done = asyncio.get_running_loop().create_future()
+        conn.turn_done = turn_done
+
+        await manager._notification(
+            1001,
+            conn,
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "thr_123", "turn": {"status": "interrupted"}},
+            },
+        )
+
+        with pytest.raises(CodexTurnAborted):
+            await turn_done
+
+    async def test_completed_notification_rejects_nonterminal_status(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        turn_done = asyncio.get_running_loop().create_future()
+        conn = codex_code._AppServerConnection(
+            proc=MagicMock(),
+            active_thread_id="thr_123",
+            turn_done=turn_done,
+        )
+
+        await manager._notification(
+            1001,
+            conn,
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "thr_123", "turn": {"status": "inProgress"}},
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="Unexpected Codex app-server terminal status"):
+            await turn_done
 
 
 class TestCodexCodeManager:
