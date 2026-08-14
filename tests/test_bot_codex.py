@@ -304,6 +304,7 @@ class TestIdleHeartbeat:
 def _reset_queue_state(chat_id: int) -> None:
     bot_codex._chat_locks.pop(chat_id, None)
     bot_codex._pending_prompts.pop(chat_id, None)
+    bot_codex._prompt_active.discard(chat_id)
 
 
 class TestQueuedMessages:
@@ -330,6 +331,33 @@ class TestQueuedMessages:
         dispatch.assert_not_awaited()
         assert chat_id not in bot_codex._pending_prompts
         update.message.reply_text.assert_awaited_once_with("Added to the active Codex turn.")
+        _reset_queue_state(chat_id)
+
+    async def test_stream_message_waits_out_control_lock_without_becoming_orphaned(self):
+        chat_id = 406
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        lock = bot_codex._chat_lock(chat_id)
+        bot_codex._stream_mode.add(chat_id)
+        await lock.acquire()
+
+        try:
+            with (
+                patch.object(bot_codex.app_server_mgr, "steer", new_callable=AsyncMock, return_value=False),
+                patch("bot_codex._dispatch_prompt", new_callable=AsyncMock, return_value=True) as dispatch,
+            ):
+                task = asyncio.create_task(bot_codex._queue_prompt(chat_id, "after status", update, context))
+                await asyncio.sleep(0)
+                lock.release()
+                await task
+        finally:
+            if lock.locked():
+                lock.release()
+            bot_codex._stream_mode.discard(chat_id)
+
+        dispatch.assert_awaited_once_with(chat_id, "after status", update, context)
+        assert chat_id not in bot_codex._pending_prompts
+        update.message.reply_text.assert_awaited_once_with("Waiting for the current Codex command to finish…")
         _reset_queue_state(chat_id)
 
     async def test_message_arriving_mid_turn_is_queued_not_rejected(self):

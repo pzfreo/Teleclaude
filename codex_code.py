@@ -864,8 +864,9 @@ class CodexAppServerManager:
         if method == "turn/started":
             turn = params.get("turn") or {}
             conn.active_turn_id = turn.get("id")
-            conn.turn_ready = True
-            if chat_id in self._pending_interrupts and conn.active_thread_id and conn.active_turn_id:
+            cancellation_pending = chat_id in self._pending_interrupts
+            conn.turn_ready = not cancellation_pending
+            if cancellation_pending and conn.active_thread_id and conn.active_turn_id:
                 self._pending_interrupts.discard(chat_id)
                 asyncio.create_task(
                     self._interrupt_started_turn(chat_id, conn, conn.active_thread_id, conn.active_turn_id)
@@ -1155,6 +1156,9 @@ class CodexAppServerManager:
                 self._pending_interrupts.add(chat_id)
                 return "cancelled"
             return "idle"
+        # Stop accepting follow-up input before awaiting the protocol response;
+        # /cancel and a simultaneous message are processed concurrently.
+        conn.turn_ready = False
         try:
             await self._request(
                 chat_id,

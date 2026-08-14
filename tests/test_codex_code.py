@@ -96,6 +96,7 @@ class TestCodexAppServerManager:
             proc=proc,
             active_thread_id="thr_123",
             active_turn_id="turn_456",
+            turn_ready=True,
         )
         manager._connections[1001] = conn
 
@@ -109,6 +110,30 @@ class TestCodexAppServerManager:
             "turn/interrupt",
             {"threadId": "thr_123", "turnId": "turn_456"},
         )
+        assert conn.turn_ready is False
+
+    async def test_pending_cancel_never_opens_turn_for_steering(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(
+            proc=MagicMock(),
+            active_thread_id="thr_123",
+            turn_done=asyncio.get_running_loop().create_future(),
+        )
+        manager._pending_interrupts.add(1001)
+
+        with patch.object(manager, "_interrupt_started_turn", new_callable=AsyncMock):
+            await manager._notification(
+                1001,
+                conn,
+                {
+                    "method": "turn/started",
+                    "params": {"threadId": "thr_123", "turn": {"id": "turn_456"}},
+                },
+            )
+
+        assert conn.turn_ready is False
+        assert await manager.steer(1001, "Do not add this") is False
 
     async def test_interrupt_marks_turn_cancelled_before_app_server_starts(self, tmp_path):
         owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))

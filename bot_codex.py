@@ -145,6 +145,7 @@ _progress_lines: dict[int, list[str]] = {}
 _files_cache: dict[int, list[Path]] = {}
 _stream_mode: set[int] = set()  # opt-in app-server chats; codex exec remains the default
 _stream_control_active: set[int] = set()  # //status or //usage, which do not create cancellable turns
+_prompt_active: set[int] = set()  # chat locks currently owned by the prompt runner, not // controls
 # Messages that arrived mid-turn, waiting to be handed to Codex together. Whoever
 # holds the chat lock drains this when its turn ends; /cancel and /stop clear it,
 # so stopping a turn doesn't just start the next queued message.
@@ -1006,6 +1007,14 @@ async def _queue_prompt(chat_id: int, prompt: str, update: Update, context: Cont
                 logger.warning("Codex turn/steer failed for chat %d: %s", chat_id, exc)
                 await msg.reply_text("Could not add that message to the active turn. Please send it again.")
                 return
+            if chat_id not in _prompt_active:
+                # Stream control commands share the lock but do not drain the
+                # prompt queue. Wait for that command, then dispatch normally.
+                await msg.reply_text("Waiting for the current Codex command to finish…")
+                async with lock:
+                    pass
+                await _queue_prompt(chat_id, prompt, update, context)
+                return
         pending = _pending_prompts.setdefault(chat_id, [])
         if len(pending) >= MAX_QUEUED_PROMPTS:
             await msg.reply_text(
@@ -1020,21 +1029,25 @@ async def _queue_prompt(chat_id: int, prompt: str, update: Update, context: Cont
 
     dropped = 0
     async with lock:
-        keep_going = await _dispatch_prompt(chat_id, prompt, update, context)
-        while keep_going:
-            queued = _pending_prompts.pop(chat_id, None)
-            if not queued:
-                break
-            # One turn for the lot: `codex exec resume` reloads the thread each time,
-            # so N follow-ups as N turns is N times the setup for the same context.
-            logger.info("Codex: merging %d queued message(s) into one turn for chat %d", len(queued), chat_id)
-            merged = "\n\n".join(text for text, _ in queued)
-            keep_going = await _dispatch_prompt(chat_id, merged, queued[-1][1], context)
+        _prompt_active.add(chat_id)
+        try:
+            keep_going = await _dispatch_prompt(chat_id, prompt, update, context)
+            while keep_going:
+                queued = _pending_prompts.pop(chat_id, None)
+                if not queued:
+                    break
+                # One turn for the lot: `codex exec resume` reloads the thread each time,
+                # so N follow-ups as N turns is N times the setup for the same context.
+                logger.info("Codex: merging %d queued message(s) into one turn for chat %d", len(queued), chat_id)
+                merged = "\n\n".join(text for text, _ in queued)
+                keep_going = await _dispatch_prompt(chat_id, merged, queued[-1][1], context)
 
-        if not keep_going:
-            # Aborted mid-turn: anything queued in the gap before it actually
-            # stopped belongs to the work the user just cancelled.
-            dropped = _drop_queued(chat_id)
+            if not keep_going:
+                # Aborted mid-turn: anything queued in the gap before it actually
+                # stopped belongs to the work the user just cancelled.
+                dropped = _drop_queued(chat_id)
+        finally:
+            _prompt_active.discard(chat_id)
 
     # Everything above the lock release is synchronous once the queue reads empty,
     # so a message arriving from here on finds an unlocked chat and runs itself
