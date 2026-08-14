@@ -576,8 +576,23 @@ class TestStreamModeCommands:
     def test_stream_is_default_for_new_chat(self):
         chat_id = 600
         bot_codex._one_shot_mode.discard(chat_id)
+        bot_codex._stream_mode_loaded.discard(chat_id)
 
-        assert bot_codex._uses_stream(chat_id) is True
+        with patch("bot_codex.load_codex_stream_mode", return_value=True):
+            assert bot_codex._uses_stream(chat_id) is True
+
+    def test_persisted_nostream_mode_is_restored(self):
+        chat_id = 606
+        bot_codex._one_shot_mode.discard(chat_id)
+        bot_codex._stream_mode_loaded.discard(chat_id)
+
+        with patch("bot_codex.load_codex_stream_mode", return_value=False) as load:
+            assert bot_codex._uses_stream(chat_id) is False
+            assert bot_codex._uses_stream(chat_id) is False
+
+        load.assert_called_once_with(chat_id)
+        bot_codex._one_shot_mode.discard(chat_id)
+        bot_codex._stream_mode_loaded.discard(chat_id)
 
     async def test_stream_enables_app_server_mode(self):
         chat_id = 601
@@ -585,10 +600,14 @@ class TestStreamModeCommands:
         context = _make_context()
         bot_codex._one_shot_mode.add(chat_id)
 
-        with patch("bot_codex.is_authorized", return_value=True):
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch("bot_codex.save_codex_stream_mode") as save_mode,
+        ):
             await bot_codex.stream_command(update, context)
 
         assert chat_id not in bot_codex._one_shot_mode
+        save_mode.assert_called_once_with(chat_id, True)
         assert "enabled" in update.message.reply_text.await_args.args[0]
         bot_codex._one_shot_mode.discard(chat_id)
 
@@ -600,11 +619,13 @@ class TestStreamModeCommands:
 
         with (
             patch("bot_codex.is_authorized", return_value=True),
+            patch("bot_codex.save_codex_stream_mode") as save_mode,
             patch.object(bot_codex.app_server_mgr, "stop", new_callable=AsyncMock) as stop,
         ):
             await bot_codex.nostream_command(update, context)
 
         assert chat_id in bot_codex._one_shot_mode
+        save_mode.assert_called_once_with(chat_id, False)
         stop.assert_awaited_once_with(chat_id)
         assert "One-shot mode enabled" in update.message.reply_text.await_args.args[0]
 

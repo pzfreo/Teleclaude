@@ -46,9 +46,11 @@ from persistence import (
     load_codex_active_branch,
     load_codex_active_repo,
     load_codex_session_id,
+    load_codex_stream_mode,
     save_codex_active_branch,
     save_codex_active_repo,
     save_codex_session_id,
+    save_codex_stream_mode,
 )
 from shared import (
     download_telegram_file,
@@ -144,6 +146,7 @@ _progress_msg_ids: dict[int, int] = {}
 _progress_lines: dict[int, list[str]] = {}
 _files_cache: dict[int, list[Path]] = {}
 _one_shot_mode: set[int] = set()  # explicit /nostream opt-outs; app-server is the default
+_stream_mode_loaded: set[int] = set()  # chats whose persisted preference has been read
 _stream_control_active: set[int] = set()  # non-turn app-server controls such as /status and /goal
 _prompt_active: set[int] = set()  # chat locks currently owned by the prompt runner, not // controls
 _pending_steers: dict[int, set[object]] = {}  # follow-ups waiting for turn/started
@@ -195,6 +198,10 @@ def _chat_lock(chat_id: int) -> asyncio.Lock:
 
 
 def _uses_stream(chat_id: int) -> bool:
+    if chat_id not in _stream_mode_loaded:
+        if not load_codex_stream_mode(chat_id):
+            _one_shot_mode.add(chat_id)
+        _stream_mode_loaded.add(chat_id)
     return chat_id not in _one_shot_mode
 
 
@@ -771,6 +778,7 @@ async def stream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Persistent stream mode is already enabled.")
         return
     _one_shot_mode.discard(chat_id)
+    save_codex_stream_mode(chat_id, True)
     await update.message.reply_text("Persistent stream mode enabled. The next message will use Codex app-server.")
 
 
@@ -784,6 +792,7 @@ async def nostream_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     was_streaming = _uses_stream(chat_id)
     _one_shot_mode.add(chat_id)
+    save_codex_stream_mode(chat_id, False)
     await app_server_mgr.stop(chat_id)
     await update.message.reply_text(
         "One-shot mode enabled. Future messages will use codex exec."
