@@ -956,7 +956,9 @@ class CodexAppServerManager:
         common: dict[str, Any] = {
             "cwd": str(cwd),
             "approvalPolicy": "never",
-            "sandbox": "danger-full-access",
+            # ThreadStartParams/ThreadResumeParams use the protocol's camel-case
+            # SandboxMode enum, unlike turn/start's kebab-case SandboxPolicy tag.
+            "sandbox": "dangerFullAccess",
         }
         if model:
             common["model"] = model
