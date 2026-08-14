@@ -1077,8 +1077,8 @@ class CodexAppServerManager:
         """Execute a supported TUI-style command through app-server methods.
 
         Slash commands are normally parsed by the interactive Codex TUI, not
-        by app-server. Teleclaude maps the useful read/maintenance commands
-        explicitly so ``//status`` is never mistaken for a model prompt.
+        by app-server. Teleclaude exposes selected app-server operations as
+        ordinary Telegram commands; flexible ``//`` input bypasses this method.
         """
         name, _, args = command.strip().partition(" ")
         name = name.lower().lstrip("/")
@@ -1102,7 +1102,7 @@ class CodexAppServerManager:
 
         if name == "compact":
             if args:
-                return "Usage: //compact"
+                return "Usage: /compact"
             done = asyncio.get_running_loop().create_future()
             conn.compact_done = done
             try:
@@ -1120,7 +1120,7 @@ class CodexAppServerManager:
 
         if name == "status":
             if args:
-                return "Usage: //status"
+                return "Usage: /status"
             result = await self._request(
                 chat_id,
                 conn,
@@ -1176,7 +1176,7 @@ class CodexAppServerManager:
 
         if name == "usage":
             if args:
-                return "Usage filters are not supported yet. Use //usage without arguments."
+                return "Usage filters are not supported yet. Use /usage without arguments."
             result = await self._request(chat_id, conn, "account/usage/read", {})
             rendered = json.dumps(result, indent=2, sort_keys=True)
             if len(rendered) > 3500:

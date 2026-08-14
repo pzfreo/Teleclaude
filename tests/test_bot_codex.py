@@ -305,6 +305,7 @@ def _reset_queue_state(chat_id: int) -> None:
     bot_codex._chat_locks.pop(chat_id, None)
     bot_codex._pending_prompts.pop(chat_id, None)
     bot_codex._prompt_active.discard(chat_id)
+    bot_codex._pending_steers.pop(chat_id, None)
 
 
 class TestQueuedMessages:
@@ -331,6 +332,43 @@ class TestQueuedMessages:
         dispatch.assert_not_awaited()
         assert chat_id not in bot_codex._pending_prompts
         update.message.reply_text.assert_awaited_once_with("Added to the active Codex turn.")
+        _reset_queue_state(chat_id)
+
+    async def test_stream_message_waits_for_turn_started_then_steers(self):
+        chat_id = 407
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        lock = bot_codex._chat_lock(chat_id)
+        bot_codex._stream_mode.add(chat_id)
+        bot_codex._prompt_active.add(chat_id)
+        await lock.acquire()
+
+        try:
+            with (
+                patch.object(bot_codex.app_server_mgr, "steer", new_callable=AsyncMock) as steer,
+                patch("bot_codex.audit_log"),
+            ):
+                steer.side_effect = [False, True]
+                await bot_codex._queue_prompt(chat_id, "during setup", update, context)
+        finally:
+            lock.release()
+            bot_codex._stream_mode.discard(chat_id)
+
+        assert steer.await_count == 2
+        assert chat_id not in bot_codex._pending_steers
+        assert [call.args[0] for call in update.message.reply_text.await_args_list] == [
+            "Waiting for the active Codex turn to accept this message…",
+            "Added to the active Codex turn.",
+        ]
+        _reset_queue_state(chat_id)
+
+    async def test_cancel_drops_message_waiting_to_steer(self):
+        chat_id = 408
+        token = object()
+        bot_codex._pending_steers[chat_id] = {token}
+
+        assert bot_codex._drop_queued(chat_id) == 1
+        assert chat_id not in bot_codex._pending_steers
         _reset_queue_state(chat_id)
 
     async def test_stream_message_waits_out_control_lock_without_becoming_orphaned(self):
