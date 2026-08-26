@@ -15,6 +15,7 @@ wild.
 """
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -53,6 +54,8 @@ class _AppServerConnection:
     on_event: Any = None
     turn_done: asyncio.Future | None = None
     compact_done: asyncio.Future | None = None
+    background_turn: bool = False
+    goal_status: str | None = None
 
 
 async def update_codex_cli() -> tuple[bool, str]:
@@ -695,10 +698,21 @@ class CodexAppServerManager:
         self.owner = owner
         self._connections: dict[int, _AppServerConnection] = {}
         self._pending_interrupts: set[int] = set()
+        # While a thread goal is active, Codex starts continuation turns by
+        # itself, back to back, until the goal completes or stalls. Nothing is
+        # awaiting those turns, so the bot registers sinks here to render them
+        # and to report goal status changes.
+        self.on_background_event: Any = None  # async callable(chat_id, event)
+        self.on_goal_status: Any = None  # async callable(chat_id, goal)
 
     def active(self, chat_id: int) -> bool:
         conn = self._connections.get(chat_id)
         return bool(conn and conn.proc.returncode is None and conn.reader_task and not conn.reader_task.done())
+
+    def goal_status(self, chat_id: int) -> str | None:
+        """Last goal status seen for this chat, or None if there is no goal."""
+        conn = self._connections.get(chat_id)
+        return conn.goal_status if conn else None
 
     def clear_pending_interrupt(self, chat_id: int) -> None:
         """Discard a cancellation left behind before an operation started.
@@ -822,6 +836,16 @@ class CodexAppServerManager:
                 conn.turn_done.set_exception(error)
             if conn.compact_done and not conn.compact_done.done():
                 conn.compact_done.set_exception(error)
+            if conn.background_turn and self.on_background_event:
+                # A goal continuation has no future to fail, so its renderer
+                # only learns the connection died from a terminal event.
+                conn.background_turn = False
+                event: dict[str, Any] = (
+                    {"type": "turn.interrupted"}
+                    if isinstance(error, CodexTurnAborted)
+                    else {"type": "_process_error", "returncode": 1, "stderr": str(error)}
+                )
+                asyncio.create_task(self._emit(chat_id, functools.partial(self.on_background_event, chat_id), event))
 
     async def _drain_stderr(self, chat_id: int, conn: _AppServerConnection) -> None:
         assert conn.proc.stderr is not None
@@ -853,16 +877,43 @@ class CodexAppServerManager:
             normalized["exit_code"] = item["exitCode"]
         return normalized
 
+    @staticmethod
+    def _is_background_turn(conn: _AppServerConnection) -> bool:
+        """Report whether Codex started this turn on its own.
+
+        Turn ids cannot settle this: ``turn/start`` answers with a different id
+        from the one ``turn/started`` reports. What is reliable is whether this
+        client is waiting for a turn at all — if it is not, Codex started this
+        one to continue an active goal.
+        """
+        return conn.turn_done is None and conn.compact_done is None
+
+    def _sink(self, chat_id: int, conn: _AppServerConnection):
+        """Return the event handler for whichever turn is currently running."""
+        if not conn.background_turn:
+            return conn.on_event
+        if self.on_background_event is None:
+            return None
+        return functools.partial(self.on_background_event, chat_id)
+
+    @staticmethod
+    def _terminal_event(status: str | None, turn: dict) -> dict:
+        if status == "failed":
+            return {"type": "turn.failed", "error": turn.get("error") or {}}
+        if status == "completed":
+            return {"type": "turn.completed", "usage": {}}
+        return {"type": "turn.interrupted"}
+
     async def _notification(self, chat_id: int, conn: _AppServerConnection, message: dict) -> None:
         method = message.get("method")
         params = message.get("params") or {}
         thread_id = params.get("threadId")
         if thread_id and conn.active_thread_id and thread_id != conn.active_thread_id:
             return
-        on_event = conn.on_event
         if method == "turn/started":
             turn = params.get("turn") or {}
             conn.active_turn_id = turn.get("id")
+            conn.background_turn = self._is_background_turn(conn)
             cancellation_pending = chat_id in self._pending_interrupts
             conn.turn_ready = not cancellation_pending
             if cancellation_pending and conn.active_thread_id and conn.active_turn_id:
@@ -870,8 +921,21 @@ class CodexAppServerManager:
                 asyncio.create_task(
                     self._interrupt_started_turn(chat_id, conn, conn.active_thread_id, conn.active_turn_id)
                 )
-            if on_event:
-                await self._emit(chat_id, on_event, {"type": "turn.started"})
+            sink = self._sink(chat_id, conn)
+            if sink:
+                await self._emit(chat_id, sink, {"type": "turn.started"})
+            return
+        on_event = self._sink(chat_id, conn)
+        if method == "thread/goal/updated":
+            goal = params.get("goal") or {}
+            status = goal.get("status")
+            if status != conn.goal_status:
+                conn.goal_status = status
+                if self.on_goal_status:
+                    await self._emit(chat_id, functools.partial(self.on_goal_status, chat_id), goal)
+            return
+        if method == "thread/goal/cleared":
+            conn.goal_status = None
             return
         if method in {"item/started", "item/completed"} and on_event:
             event_type = "item.started" if method.endswith("started") else "item.completed"
@@ -900,6 +964,15 @@ class CodexAppServerManager:
 
         turn = params.get("turn") or {}
         status = turn.get("status")
+        if conn.background_turn:
+            # A goal continuation finished. No caller is waiting on it, so the
+            # turn state a client turn would own must be left as it is.
+            conn.background_turn = False
+            conn.active_turn_id = None
+            conn.turn_ready = False
+            if on_event:
+                await self._emit(chat_id, on_event, self._terminal_event(status, turn))
+            return
         if on_event and status == "completed":
             await self._emit(chat_id, on_event, {"type": "turn.completed", "usage": {}})
         done = conn.turn_done
@@ -1012,7 +1085,9 @@ class CodexAppServerManager:
             params["model"] = model
         try:
             result = await self._request(chat_id, conn, "turn/start", params)
-            if not done.done():
+            # Codex may already be running goal continuations, so this id is
+            # what separates the caller's turn from the ones it never asked for.
+            if not done.done() and not conn.background_turn:
                 conn.active_turn_id = (result.get("turn") or {}).get("id") or conn.active_turn_id
             if chat_id in self._pending_interrupts:
                 self._pending_interrupts.discard(chat_id)
@@ -1085,7 +1160,7 @@ class CodexAppServerManager:
         if name not in supported:
             return (
                 f"Unsupported Codex stream command: /{name}\n"
-                "Supported: /status, /usage, /compact, /goal [objective|clear]"
+                "Supported: /status, /usage, /compact, /goal [objective|resume|clear]"
             )
         if name == "compact" and chat_id in self._pending_interrupts:
             self._pending_interrupts.discard(chat_id)
@@ -1147,13 +1222,28 @@ class CodexAppServerManager:
                     {"threadId": thread_id},
                 )
                 return "Codex goal cleared." if result.get("cleared") else "No Codex goal was set."
-            if goal_args:
+            if goal_args.lower() == "resume":
+                # Codex stalls a goal by moving it out of "active" (blocked,
+                # paused, or a usage/budget limit). Resuming is a status flip
+                # back to active; the next turn picks the objective back up.
+                current = await self._request(chat_id, conn, "thread/goal/get", {"threadId": thread_id})
+                if not current.get("goal"):
+                    return "No Codex goal is set.\nSet one with /goal <objective>."
+                result = await self._request(
+                    chat_id,
+                    conn,
+                    "thread/goal/set",
+                    {"threadId": thread_id, "status": "active"},
+                )
+                resumed = True
+            elif goal_args:
                 result = await self._request(
                     chat_id,
                     conn,
                     "thread/goal/set",
                     {"threadId": thread_id, "objective": goal_args},
                 )
+                resumed = False
             else:
                 result = await self._request(
                     chat_id,
@@ -1161,16 +1251,24 @@ class CodexAppServerManager:
                     "thread/goal/get",
                     {"threadId": thread_id},
                 )
+                resumed = False
             goal = result.get("goal")
             if not goal:
                 return "No Codex goal is set.\nSet one with /goal <objective>."
             budget = goal.get("tokenBudget")
             budget_line = f"\nToken budget: {budget}" if budget is not None else ""
+            status = goal.get("status", "unknown")
+            if resumed:
+                hint = "\nCodex will carry on working towards it."
+            elif status in {"paused", "blocked", "usageLimited", "budgetLimited"}:
+                hint = "\nResume it with /goal resume."
+            else:
+                hint = ""
             return (
                 "Codex goal\n"
                 f"Objective: {goal.get('objective', '')}\n"
-                f"Status: {goal.get('status', 'unknown')}\n"
-                f"Tokens used: {goal.get('tokensUsed', 0)}{budget_line}"
+                f"Status: {status}\n"
+                f"Tokens used: {goal.get('tokensUsed', 0)}{budget_line}{hint}"
             )
 
         if name == "usage":
