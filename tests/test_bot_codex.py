@@ -498,6 +498,72 @@ class TestQueuedMessages:
         _reset_queue_state(chat_id)
 
 
+class TestGoalContinuations:
+    async def test_background_turn_is_rendered_and_finalised(self):
+        bot = MagicMock()
+        chat_id = 321
+        bot_codex._background_turns.pop(chat_id, None)
+
+        with (
+            patch.object(bot_codex, "_start_typing") as start_typing,
+            patch.object(bot_codex, "_stop_typing") as stop_typing,
+            patch.object(bot_codex, "_clear_progress", new_callable=AsyncMock),
+            patch.object(bot_codex, "_update_progress", new_callable=AsyncMock),
+            patch.object(bot_codex, "get_active_repo", return_value="owner/repo"),
+            patch.object(bot_codex, "_parse_and_send_markers", new_callable=AsyncMock) as markers,
+            patch.object(bot_codex, "send_long_message", new_callable=AsyncMock) as send,
+        ):
+            markers.side_effect = lambda chat, text, repo, b: text
+            await bot_codex._on_background_event(bot, chat_id, {"type": "turn.started"})
+            assert chat_id in bot_codex._background_turns
+            await bot_codex._on_background_event(
+                bot,
+                chat_id,
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "goal progress"}},
+            )
+            await bot_codex._on_background_event(bot, chat_id, {"type": "turn.completed", "usage": {}})
+
+        start_typing.assert_called_once_with(chat_id, bot)
+        stop_typing.assert_called_once_with(chat_id)
+        assert chat_id not in bot_codex._background_turns
+        send.assert_awaited_once()
+        assert send.await_args.args[1] == "goal progress"
+
+    async def test_interrupted_background_turn_stops_the_indicators(self):
+        bot = MagicMock()
+        chat_id = 322
+        bot_codex._background_turns.pop(chat_id, None)
+
+        with (
+            patch.object(bot_codex, "_start_typing"),
+            patch.object(bot_codex, "_stop_typing") as stop_typing,
+            patch.object(bot_codex, "_clear_progress", new_callable=AsyncMock) as clear,
+            patch.object(bot_codex, "send_long_message", new_callable=AsyncMock) as send,
+        ):
+            await bot_codex._on_background_event(bot, chat_id, {"type": "turn.interrupted"})
+
+        stop_typing.assert_called_once_with(chat_id)
+        clear.assert_awaited_once()
+        send.assert_not_awaited()
+        assert chat_id not in bot_codex._background_turns
+
+    async def test_goal_status_announcements(self):
+        bot = MagicMock()
+        with patch.object(bot_codex, "send_long_message", new_callable=AsyncMock) as send:
+            await bot_codex._on_goal_status(bot, 1, {"status": "active", "objective": "Ship it", "tokensUsed": 1})
+            send.assert_not_awaited()
+
+            await bot_codex._on_goal_status(bot, 1, {"status": "blocked", "objective": "Ship it", "tokensUsed": 9})
+            text = send.await_args.args[1]
+            assert "blocked" in text
+            assert "/goal resume" in text
+
+            await bot_codex._on_goal_status(bot, 1, {"status": "complete", "objective": "Ship it", "tokensUsed": 9})
+            done = send.await_args.args[1]
+            assert "Goal complete" in done
+            assert "/goal resume" not in done
+
+
 class TestCancellationCommands:
     async def test_cancel_uses_graceful_interrupt(self):
         update = _make_update(chat_id=501)
@@ -516,6 +582,23 @@ class TestCancellationCommands:
         interrupt.assert_awaited_once_with(501, mark_pending=False)
         update.message.reply_text.return_value.edit_text.assert_awaited_once_with("Cancelled current turn.")
         bot_codex._one_shot_mode.discard(501)
+
+    async def test_cancel_points_at_resume_when_a_goal_is_still_active(self):
+        update = _make_update(chat_id=505)
+        context = _make_context()
+        bot_codex._one_shot_mode.discard(505)
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch("bot_codex._uses_stream", return_value=True),
+            patch.object(bot_codex.app_server_mgr, "interrupt", new_callable=AsyncMock, return_value="cancelled"),
+            patch.object(bot_codex.app_server_mgr, "goal_status", return_value="active"),
+            patch("bot_codex._clear_progress", new_callable=AsyncMock),
+        ):
+            await bot_codex.cancel_command(update, context)
+
+        text = update.message.reply_text.return_value.edit_text.await_args.args[0]
+        assert "/goal resume" in text
 
     async def test_cancel_acknowledges_before_signalling(self):
         """Regression: /cancel used to sit silent for the whole SIGINT grace period."""

@@ -467,7 +467,7 @@ class TestCodexAppServerManager:
         )
         assert "Objective: Ship it" in response
         assert "Status: active" in response
-        assert "Send a message to continue the goal." in response
+        assert "Codex will carry on working towards it." in response
 
     async def test_execute_goal_resume_without_a_goal_does_not_set_one(self, tmp_path):
         owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
@@ -504,6 +504,120 @@ class TestCodexAppServerManager:
             response = await manager.execute_slash(1001, "owner/repo", "/goal")
 
         assert "Resume it with /goal resume." in response
+
+    async def test_server_started_turn_renders_through_the_background_sink(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock(), active_thread_id="thr_123")
+        seen: list[tuple[int, dict]] = []
+
+        async def sink(chat_id, event):
+            seen.append((chat_id, event))
+
+        manager.on_background_event = sink
+        started = {"method": "turn/started", "params": {"threadId": "thr_123", "turn": {"id": "t1"}}}
+        item = {
+            "method": "item/completed",
+            "params": {"threadId": "thr_123", "item": {"type": "agentMessage", "text": "progress"}},
+        }
+        completed = {
+            "method": "turn/completed",
+            "params": {"threadId": "thr_123", "turn": {"id": "t1", "status": "completed"}},
+        }
+        for message in (started, item, completed):
+            await manager._notification(1001, conn, message)
+
+        assert [event["type"] for _, event in seen] == ["turn.started", "item.completed", "turn.completed"]
+        assert {chat_id for chat_id, _ in seen} == {1001}
+        assert conn.background_turn is False
+        assert conn.active_turn_id is None
+
+    async def test_background_turn_leaves_a_pending_client_turn_alone(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock(), active_thread_id="thr_123")
+        client_events: list[dict] = []
+
+        async def client_sink(event):
+            client_events.append(event)
+
+        async def background_sink(chat_id, event):
+            raise AssertionError("client turn must not be treated as a goal continuation")
+
+        manager.on_background_event = background_sink
+        conn.turn_done = asyncio.get_running_loop().create_future()
+        conn.on_event = client_sink
+
+        await manager._notification(
+            1001, conn, {"method": "turn/started", "params": {"threadId": "thr_123", "turn": {"id": "t1"}}}
+        )
+        await manager._notification(
+            1001,
+            conn,
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "thr_123", "turn": {"id": "t1", "status": "completed"}},
+            },
+        )
+
+        assert [event["type"] for event in client_events] == ["turn.started", "turn.completed"]
+        assert conn.turn_done is None  # resolved and cleared by the client turn path
+
+    async def test_failed_background_turn_reports_the_error(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock(), active_thread_id="thr_123")
+        seen: list[dict] = []
+
+        async def sink(chat_id, event):
+            seen.append(event)
+
+        manager.on_background_event = sink
+        await manager._notification(
+            1001, conn, {"method": "turn/started", "params": {"threadId": "thr_123", "turn": {"id": "t1"}}}
+        )
+        await manager._notification(
+            1001,
+            conn,
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thr_123",
+                    "turn": {"id": "t1", "status": "failed", "error": {"message": "boom"}},
+                },
+            },
+        )
+
+        assert seen[-1] == {"type": "turn.failed", "error": {"message": "boom"}}
+
+    async def test_goal_status_hook_fires_only_on_a_change(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock(), active_thread_id="thr_123")
+        seen: list[str] = []
+
+        async def sink(chat_id, goal):
+            seen.append(goal["status"])
+
+        manager.on_goal_status = sink
+
+        async def update(status):
+            await manager._notification(
+                1001,
+                conn,
+                {
+                    "method": "thread/goal/updated",
+                    "params": {"threadId": "thr_123", "goal": {"objective": "Ship it", "status": status}},
+                },
+            )
+
+        await update("active")
+        await update("active")
+        await update("blocked")
+        await manager._notification(1001, conn, {"method": "thread/goal/cleared", "params": {"threadId": "thr_123"}})
+
+        assert seen == ["active", "blocked"]
+        assert conn.goal_status is None
 
     async def test_interrupted_notification_raises_turn_aborted(self, tmp_path):
         owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))

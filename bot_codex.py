@@ -11,6 +11,7 @@ from pathlib import Path
 VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 
 import asyncio
+import functools
 import io
 import logging
 import os
@@ -154,6 +155,16 @@ _pending_steers: dict[int, set[object]] = {}  # follow-ups waiting for turn/star
 # holds the chat lock drains this when its turn ends; /cancel and /stop clear it,
 # so stopping a turn doesn't just start the next queued message.
 _pending_prompts: dict[int, list[tuple[str, Update]]] = {}
+# Renderers for turns Codex started by itself to continue an active thread goal.
+_background_turns: dict[int, tuple] = {}
+
+_TERMINAL_TURN_EVENTS = {"turn.completed", "turn.failed", "turn.interrupted", "_process_error"}
+_GOAL_STALL_HINTS = {
+    "paused": "paused",
+    "blocked": "blocked",
+    "usageLimited": "stopped — usage limit reached",
+    "budgetLimited": "stopped — token budget spent",
+}
 
 
 def get_active_repo(chat_id: int) -> str | None:
@@ -481,6 +492,50 @@ async def _idle_heartbeat(chat_id: int, bot, activity_event: asyncio.Event) -> N
             )
 
 
+async def _on_background_event(bot, chat_id: int, event: dict) -> None:
+    """Render a turn Codex started by itself to continue an active goal.
+
+    These turns have no caller waiting on them, so this owns the whole
+    lifecycle a prompt-driven turn gets from `_dispatch_prompt`: progress
+    lines, the typing indicator, and the closing agent message.
+    """
+    entry = _background_turns.get(chat_id)
+    if entry is None:
+        entry = _background_turns[chat_id] = _make_event_handler(chat_id, bot)
+        _start_typing(chat_id, bot)
+    on_event, state = entry
+    await on_event(event)
+    if event.get("type") not in _TERMINAL_TURN_EVENTS:
+        return
+    _background_turns.pop(chat_id, None)
+    _stop_typing(chat_id)
+    await _clear_progress(chat_id, bot)
+    final_text = state["final_text"]
+    if not final_text:
+        return
+    final_text = await _parse_and_send_markers(chat_id, final_text, get_active_repo(chat_id), bot)
+    if final_text:
+        await send_long_message(chat_id, final_text, bot)
+
+
+async def _on_goal_status(bot, chat_id: int, goal: dict) -> None:
+    """Announce a goal reaching an end state, or stalling until the user resumes."""
+    status = goal.get("status")
+    objective = goal.get("objective", "")
+    tokens = goal.get("tokensUsed", 0)
+    if status == "complete":
+        await send_long_message(chat_id, f"Goal complete: {objective}\nTokens used: {tokens}", bot)
+        return
+    hint = _GOAL_STALL_HINTS.get(status)
+    if not hint:
+        return  # "active" — the goal is simply running
+    await send_long_message(
+        chat_id,
+        f"Goal {hint}: {objective}\nTokens used: {tokens}\nContinue it with /goal resume.",
+        bot,
+    )
+
+
 # ── Commands ──────────────────────────────────────────────────────────
 
 
@@ -761,6 +816,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         outcome = await codex_mgr.interrupt(chat_id, mark_pending=_chat_lock(chat_id).locked())
     text = _with_dropped(_CANCEL_OUTCOMES[outcome], dropped)
+    # Interrupting a turn stops Codex continuing the goal, but leaves the goal
+    # itself active — without this the goal looks finished when it is not.
+    if _uses_stream(chat_id) and app_server_mgr.goal_status(chat_id) == "active":
+        text += " The goal is still set — /goal resume to carry on with it."
     try:
         await ack.edit_text(text)
     except TelegramError:
@@ -1217,7 +1276,10 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
             await heartbeat_task
         except asyncio.CancelledError:
             pass
-        _stop_typing(chat_id)
+        # A goal continuation may already have started behind this turn. Leave
+        # the indicators it is now driving alone.
+        if chat_id not in _background_turns:
+            _stop_typing(chat_id)
 
     new_session_id = codex_mgr.get_session_id(chat_id, repo)
     if new_session_id:
@@ -1233,6 +1295,8 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
 
 
 async def notify_startup(app: Application) -> None:
+    app_server_mgr.on_background_event = functools.partial(_on_background_event, app.bot)
+    app_server_mgr.on_goal_status = functools.partial(_on_goal_status, app.bot)
     await app.bot.set_my_commands(
         [
             ("repo", "Set active GitHub repo (list / number / name / owner/name)"),
