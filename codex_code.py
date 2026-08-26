@@ -1085,7 +1085,7 @@ class CodexAppServerManager:
         if name not in supported:
             return (
                 f"Unsupported Codex stream command: /{name}\n"
-                "Supported: /status, /usage, /compact, /goal [objective|clear]"
+                "Supported: /status, /usage, /compact, /goal [objective|resume|clear]"
             )
         if name == "compact" and chat_id in self._pending_interrupts:
             self._pending_interrupts.discard(chat_id)
@@ -1147,13 +1147,28 @@ class CodexAppServerManager:
                     {"threadId": thread_id},
                 )
                 return "Codex goal cleared." if result.get("cleared") else "No Codex goal was set."
-            if goal_args:
+            if goal_args.lower() == "resume":
+                # Codex stalls a goal by moving it out of "active" (blocked,
+                # paused, or a usage/budget limit). Resuming is a status flip
+                # back to active; the next turn picks the objective back up.
+                current = await self._request(chat_id, conn, "thread/goal/get", {"threadId": thread_id})
+                if not current.get("goal"):
+                    return "No Codex goal is set.\nSet one with /goal <objective>."
+                result = await self._request(
+                    chat_id,
+                    conn,
+                    "thread/goal/set",
+                    {"threadId": thread_id, "status": "active"},
+                )
+                resumed = True
+            elif goal_args:
                 result = await self._request(
                     chat_id,
                     conn,
                     "thread/goal/set",
                     {"threadId": thread_id, "objective": goal_args},
                 )
+                resumed = False
             else:
                 result = await self._request(
                     chat_id,
@@ -1161,16 +1176,24 @@ class CodexAppServerManager:
                     "thread/goal/get",
                     {"threadId": thread_id},
                 )
+                resumed = False
             goal = result.get("goal")
             if not goal:
                 return "No Codex goal is set.\nSet one with /goal <objective>."
             budget = goal.get("tokenBudget")
             budget_line = f"\nToken budget: {budget}" if budget is not None else ""
+            status = goal.get("status", "unknown")
+            if resumed:
+                hint = "\nSend a message to continue the goal."
+            elif status in {"paused", "blocked", "usageLimited", "budgetLimited"}:
+                hint = "\nResume it with /goal resume."
+            else:
+                hint = ""
             return (
                 "Codex goal\n"
                 f"Objective: {goal.get('objective', '')}\n"
-                f"Status: {goal.get('status', 'unknown')}\n"
-                f"Tokens used: {goal.get('tokensUsed', 0)}{budget_line}"
+                f"Status: {status}\n"
+                f"Tokens used: {goal.get('tokensUsed', 0)}{budget_line}{hint}"
             )
 
         if name == "usage":

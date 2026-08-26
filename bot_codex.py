@@ -501,7 +501,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/newsession - Wipe this repo's session and start fresh\n"
         "/stream - Use persistent Codex app-server mode (default)\n"
         "/nostream - Opt out to one-shot codex exec mode\n"
-        "/status, /usage, /compact, /goal - App-server controls in stream mode\n"
+        "/status, /usage, /compact - App-server controls in stream mode\n"
+        "/goal [objective|resume|clear] - Show, set, resume, or clear the Codex goal\n"
         "//command - Pass /command through to Codex as turn input\n"
         "/cancel - Stop the active turn and clear the queue\n"
         "/stop - Force-kill the Codex run and its child processes now\n"
@@ -1242,7 +1243,7 @@ async def notify_startup(app: Application) -> None:
             ("status", "Show Codex app-server status (stream mode)"),
             ("usage", "Show Codex account usage (stream mode)"),
             ("compact", "Compact Codex context (stream mode)"),
-            ("goal", "Show or set the Codex goal (stream mode)"),
+            ("goal", "Show, set, resume, or clear the Codex goal (stream mode)"),
             ("cancel", "Stop the active turn and clear the queue"),
             ("stop", "Force-kill Codex run and child processes now"),
             ("model", "Show or switch model"),

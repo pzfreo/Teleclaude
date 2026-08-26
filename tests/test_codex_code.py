@@ -444,6 +444,67 @@ class TestCodexAppServerManager:
             assert await manager.execute_slash(1001, "owner/repo", "/goal clear") == "Codex goal cleared."
             request.assert_awaited_with(1001, conn, "thread/goal/clear", {"threadId": "thr_123"})
 
+    async def test_execute_goal_resume_reactivates_a_stalled_goal(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
+            patch.object(manager, "_request", new_callable=AsyncMock) as request,
+        ):
+            request.side_effect = [
+                {"goal": {"objective": "Ship it", "status": "blocked", "tokensUsed": 7, "tokenBudget": None}},
+                {"goal": {"objective": "Ship it", "status": "active", "tokensUsed": 7, "tokenBudget": None}},
+            ]
+            response = await manager.execute_slash(1001, "owner/repo", "/goal resume")
+
+        assert request.await_args_list[0].args[2:] == ("thread/goal/get", {"threadId": "thr_123"})
+        assert request.await_args_list[1].args[2:] == (
+            "thread/goal/set",
+            {"threadId": "thr_123", "status": "active"},
+        )
+        assert "Objective: Ship it" in response
+        assert "Status: active" in response
+        assert "Send a message to continue the goal." in response
+
+    async def test_execute_goal_resume_without_a_goal_does_not_set_one(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
+            patch.object(manager, "_request", new_callable=AsyncMock, return_value={"goal": None}) as request,
+        ):
+            response = await manager.execute_slash(1001, "owner/repo", "/goal resume")
+
+        request.assert_awaited_once_with(1001, conn, "thread/goal/get", {"threadId": "thr_123"})
+        assert response.startswith("No Codex goal is set.")
+
+    async def test_execute_goal_get_hints_at_resume_when_stalled(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
+            patch.object(
+                manager,
+                "_request",
+                new_callable=AsyncMock,
+                return_value={
+                    "goal": {"objective": "Ship it", "status": "usageLimited", "tokensUsed": 9, "tokenBudget": None}
+                },
+            ),
+        ):
+            response = await manager.execute_slash(1001, "owner/repo", "/goal")
+
+        assert "Resume it with /goal resume." in response
+
     async def test_interrupted_notification_raises_turn_aborted(self, tmp_path):
         owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
         manager = CodexAppServerManager(owner)
