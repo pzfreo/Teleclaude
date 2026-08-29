@@ -188,9 +188,14 @@ class TestCodexAppServerManager:
         with (
             patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
             patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
-            patch.object(manager, "_request", new_callable=AsyncMock, side_effect=TimeoutError),
+            patch.object(
+                manager,
+                "_request",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("Codex app-server request timed out after 30s"),
+            ),
             patch.object(manager, "stop", new_callable=AsyncMock) as stop,
-            pytest.raises(TimeoutError),
+            pytest.raises(RuntimeError),
         ):
             await manager.run_turn(1001, "owner/repo", "Run tests", AsyncMock())
 
@@ -256,9 +261,14 @@ class TestCodexAppServerManager:
         conn = codex_code._AppServerConnection(proc=MagicMock())
 
         with (
-            patch.object(manager, "_request", new_callable=AsyncMock, side_effect=TimeoutError),
+            patch.object(
+                manager,
+                "_request",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("Codex app-server request timed out after 30s"),
+            ),
             patch.object(manager, "stop", new_callable=AsyncMock) as stop,
-            pytest.raises(TimeoutError),
+            pytest.raises(RuntimeError),
         ):
             await manager._load_thread(1001, conn, "owner/repo", tmp_path, None)
 
@@ -367,9 +377,14 @@ class TestCodexAppServerManager:
         with (
             patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
             patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
-            patch.object(manager, "_request", new_callable=AsyncMock, side_effect=TimeoutError),
+            patch.object(
+                manager,
+                "_request",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("Codex app-server request timed out after 30s"),
+            ),
             patch.object(manager, "stop", new_callable=AsyncMock) as stop,
-            pytest.raises(TimeoutError),
+            pytest.raises(RuntimeError),
         ):
             await manager.execute_slash(1001, "owner/repo", "/compact")
 
@@ -1022,6 +1037,11 @@ class TestRunTurn:
             async def readline(self):
                 return self._lines.pop(0) if self._lines else b""
 
+            async def readuntil(self, sep=b"\n"):
+                if not self._lines:
+                    raise asyncio.IncompleteReadError(b"", None)
+                return self._lines.pop(0)
+
         class _FakeProc:
             def __init__(self):
                 self.pid = 4321
@@ -1134,10 +1154,10 @@ class TestRunTurn:
 
         proc = self._fake_proc([], returncode=None)
 
-        async def never_returns():
+        async def never_returns(*_args, **_kwargs):
             await asyncio.Event().wait()
 
-        proc.stdout.readline = never_returns  # orphaned child holds the pipe open
+        proc.stdout.readuntil = never_returns  # orphaned child holds the pipe open
         proc.wait = never_returns  # SIGINT ignored, process outlives the turn
 
         async def fake_create(*_args, **_kwargs):
@@ -1316,6 +1336,12 @@ class TestRunTurn:
                 mgr._aborted_chats.add(1001)
                 return b'{"type":"item.completed","item":{"type":"agent_message","text":"late"}}\n'
 
+            async def readuntil(self, sep=b"\n"):
+                line = await self.readline()
+                if not line:
+                    raise asyncio.IncompleteReadError(b"", None)
+                return line
+
         class _FakeProc:
             pid = 4321
             returncode = -signal.SIGTERM
@@ -1361,51 +1387,100 @@ class TestRunTurn:
 
 
 class TestOversizedLines:
-    """A JSONL event bigger than the stream buffer must not kill the reader.
+    """A JSONL event bigger than the stream buffer must not be lost.
 
     asyncio's readline() raises ValueError ("Separator is not found, and chunk
-    exceed the limit") once a line passes the subprocess buffer limit, which
-    used to surface to the user as a failed turn.
+    exceed the limit") past the subprocess buffer limit and discards what it
+    buffered. Dropping the line loses whole events — and when the oversized
+    line is a JSON-RPC response, whoever awaits it hangs until it times out.
     """
 
-    class _OverflowStream:
-        """Raises like an over-limit readline() before yielding the real lines."""
+    class _ChunkedStream:
+        """Delivers one line in over-limit pieces, the way StreamReader does."""
 
-        def __init__(self, lines):
-            self._lines = list(lines)
-            self.overflowed = False
+        def __init__(self, pieces, rest=()):
+            self._pieces = list(pieces)
+            self._rest = list(rest)
 
-        async def readline(self):
-            if not self.overflowed:
-                self.overflowed = True
-                raise ValueError("Separator is not found, and chunk exceed the limit")
-            return self._lines.pop(0) if self._lines else b""
+        async def readuntil(self, sep=b"\n"):
+            # Like StreamReader: an over-limit chunk is reported, not consumed.
+            if self._pieces:
+                raise asyncio.LimitOverrunError("chunk exceed the limit", len(self._pieces[0]))
+            if self._rest:
+                return self._rest.pop(0)
+            raise asyncio.IncompleteReadError(b"", None)
 
-    async def test_read_line_skips_oversized_line(self):
-        stream = self._OverflowStream([b"next\n"])
-        assert await codex_code._read_line(stream, "stdout") == b"next\n"
+        async def read(self, n):
+            return self._pieces.pop(0) if self._pieces else b""
 
-    async def test_iter_lines_skips_oversized_line(self):
-        stream = self._OverflowStream([b"a\n", b"b\n"])
-        assert [line async for line in codex_code._iter_lines(stream, "stdout")] == [b"a\n", b"b\n"]
+    async def test_read_line_reassembles_oversized_line(self):
+        stream = self._ChunkedStream([b"a" * 8, b"b" * 8], rest=[b"c" * 4 + b"\n"])
+        assert await codex_code._read_line(stream, "stdout") == b"a" * 8 + b"b" * 8 + b"c" * 4 + b"\n"
 
-    async def test_run_turn_survives_oversized_event(self, tmp_path):
+    async def test_line_past_the_hard_cap_fails_loudly(self, monkeypatch):
+        """Reassembly is bounded: past the cap, fail the turn rather than OOM."""
+        monkeypatch.setattr(codex_code, "MAX_LINE_BYTES", 16)
+        stream = self._ChunkedStream([b"x" * 12, b"x" * 12], rest=[b"\n"])
+
+        with pytest.raises(RuntimeError, match="exceeded"):
+            await codex_code._read_line(stream, "stdout")
+
+    async def test_iter_lines_stops_at_eof(self):
+        stream = self._ChunkedStream([], rest=[b"one\n", b"two\n"])
+        assert [line async for line in codex_code._iter_lines(stream, "stdout")] == [b"one\n", b"two\n"]
+
+    async def test_run_turn_delivers_oversized_event(self, tmp_path):
         mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
         repo_dir = mgr.workspace_path("owner/repo")
         repo_dir.mkdir(parents=True)
 
+        event = '{"type":"item.completed","item":{"type":"agent_message","text":"%s"}}' % ("x" * 32)
+        head, rest = event[:10].encode(), event[10:].encode() + b"\n"
+
         proc = TestRunTurn._fake_proc([])
-        proc.stdout = self._OverflowStream([b'{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}\n'])
+        proc.stdout = self._ChunkedStream([head], rest=[rest])
 
         async def fake_create(*_args, **_kwargs):
             return proc
 
         received: list[dict] = []
 
-        async def on_event(event):
-            received.append(event)
+        async def on_event(e):
+            received.append(e)
 
         with patch("asyncio.create_subprocess_exec", new=fake_create):
             await mgr.run_turn(1001, "owner/repo", "hello", on_event)
 
-        assert [e["item"]["text"] for e in received] == ["hi"]
+        assert [e["item"]["text"] for e in received] == ["x" * 32]
+
+
+class TestRequestTimeout:
+    async def test_timeout_error_names_the_method(self, tmp_path):
+        """A bare asyncio TimeoutError stringifies to nothing, which reached the
+        user as 'Codex Code error:' with no error in it."""
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        conn = codex_code._AppServerConnection(proc=MagicMock())
+
+        async def fake_send(_conn, _payload):
+            pass
+
+        with patch.object(manager, "_send", new=fake_send), pytest.raises(RuntimeError) as excinfo:
+            await manager._request(1001, conn, "turn/start", {}, timeout=0.01)
+
+        assert "turn/start" in str(excinfo.value)
+        assert conn.pending == {}
+
+    async def test_stalled_stdin_drain_reports_a_message(self, tmp_path):
+        """wait_for around drain() raises the same message-less TimeoutError."""
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        proc = MagicMock()
+        proc.stdin.is_closing.return_value = False
+        proc.stdin.drain = AsyncMock(side_effect=TimeoutError)
+        conn = codex_code._AppServerConnection(proc=proc)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await manager._send(conn, {"method": "initialized", "params": {}})
+
+        assert str(excinfo.value)
