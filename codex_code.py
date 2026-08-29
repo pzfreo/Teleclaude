@@ -42,22 +42,31 @@ class CodexTurnAborted(Exception):
 
 
 async def _read_line(stream: asyncio.StreamReader, label: str) -> bytes:
-    """readline() that survives an event too long for the stream buffer.
+    """Read one newline-terminated line of any length. Empty bytes at EOF.
 
     A single JSONL line can exceed STDIO_LIMIT when Codex reports a large tool
-    result. asyncio raises ValueError on those, which would kill the reader and
-    with it the whole turn. readline() has already dropped the buffered chunk,
-    so skipping the line and reading on resyncs on the next one.
+    result or replays a long thread on resume. readline() raises on those and
+    throws the buffered chunk away, so reassemble the line from buffer-sized
+    pieces instead: dropping it would strip a JSON-RPC response someone is
+    waiting on, and that turn then hangs until its request times out.
     """
+    chunks: list[bytes] = []
     while True:
         try:
-            return await stream.readline()
-        except ValueError:
-            logger.warning("Skipping Codex %s line larger than %d bytes", label, STDIO_LIMIT)
+            chunks.append(await stream.readuntil(b"\n"))
+            break
+        except asyncio.LimitOverrunError as e:
+            # e.consumed bytes are already buffered, so this cannot block.
+            chunks.append(await stream.read(e.consumed))
+            logger.warning("Codex %s line exceeds the stdio buffer; reading it in parts", label)
+        except asyncio.IncompleteReadError as e:
+            chunks.append(e.partial)
+            break
+    return b"".join(chunks)
 
 
 async def _iter_lines(stream: asyncio.StreamReader, label: str) -> AsyncIterator[bytes]:
-    """Iterate lines like ``async for ... in stream``, skipping oversized ones."""
+    """Iterate lines like ``async for ... in stream``, without the length cap."""
     while True:
         line = await _read_line(stream, label)
         if not line:
@@ -810,7 +819,12 @@ class CodexAppServerManager:
         conn.pending[request_id] = future
         try:
             await self._send(conn, {"method": method, "id": request_id, "params": params})
-            result = await asyncio.wait_for(future, timeout=timeout)
+            try:
+                result = await asyncio.wait_for(future, timeout=timeout)
+            except TimeoutError:
+                # Bare TimeoutError stringifies to nothing, which reaches the
+                # user as an error message with no error in it.
+                raise RuntimeError(f"Codex app-server {method} timed out after {timeout}s") from None
             return result
         finally:
             conn.pending.pop(request_id, None)
