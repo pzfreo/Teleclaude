@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import signal
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -33,10 +34,35 @@ PROCESS_ABORT_TIMEOUT = 3  # seconds to wait after TERM before escalating
 PROCESS_INTERRUPT_GRACE = 8  # seconds to let Codex wind down after SIGINT before force-killing
 PROCESS_EXIT_WAIT = 15  # seconds to wait for exit after Codex closed stdout on its own
 _ORPHAN_POLL_INTERVAL = 0.1  # seconds between checks that a signalled process group has drained
+STDIO_LIMIT = 10 * 1024 * 1024  # per-line buffer for Codex JSONL stdio
 
 
 class CodexTurnAborted(Exception):
     """Raised when a Codex turn is intentionally stopped by the user."""
+
+
+async def _read_line(stream: asyncio.StreamReader, label: str) -> bytes:
+    """readline() that survives an event too long for the stream buffer.
+
+    A single JSONL line can exceed STDIO_LIMIT when Codex reports a large tool
+    result. asyncio raises ValueError on those, which would kill the reader and
+    with it the whole turn. readline() has already dropped the buffered chunk,
+    so skipping the line and reading on resyncs on the next one.
+    """
+    while True:
+        try:
+            return await stream.readline()
+        except ValueError:
+            logger.warning("Skipping Codex %s line larger than %d bytes", label, STDIO_LIMIT)
+
+
+async def _iter_lines(stream: asyncio.StreamReader, label: str) -> AsyncIterator[bytes]:
+    """Iterate lines like ``async for ... in stream``, skipping oversized ones."""
+    while True:
+        line = await _read_line(stream, label)
+        if not line:
+            return
+        yield line
 
 
 @dataclass
@@ -572,7 +598,7 @@ class CodexCodeManager:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            limit=10 * 1024 * 1024,
+            limit=STDIO_LIMIT,
             env=self._git_env(),
             start_new_session=True,
         )
@@ -613,7 +639,7 @@ class CodexCodeManager:
         async def _drain_stderr() -> None:
             assert proc.stderr is not None
             try:
-                async for raw in proc.stderr:
+                async for raw in _iter_lines(proc.stderr, "stderr"):
                     line = raw.decode(errors="replace").rstrip()
                     if line:
                         stderr_lines.append(line)
@@ -627,7 +653,7 @@ class CodexCodeManager:
         try:
             assert proc.stdout is not None
             while True:
-                read_task = asyncio.create_task(proc.stdout.readline())
+                read_task = asyncio.create_task(_read_line(proc.stdout, "stdout"))
                 done, _pending = await asyncio.wait({read_task, abort_waiter}, return_when=asyncio.FIRST_COMPLETED)
                 if read_task not in done:
                     read_task.cancel()
@@ -736,7 +762,7 @@ class CodexAppServerManager:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            limit=10 * 1024 * 1024,
+            limit=STDIO_LIMIT,
             env=self.owner._git_env(),
             start_new_session=True,
         )
@@ -793,7 +819,7 @@ class CodexAppServerManager:
         assert conn.proc.stdout is not None
         error: Exception = RuntimeError("Codex app-server exited")
         try:
-            async for raw in conn.proc.stdout:
+            async for raw in _iter_lines(conn.proc.stdout, "app-server stdout"):
                 try:
                     message = json.loads(raw)
                 except json.JSONDecodeError:
@@ -850,7 +876,7 @@ class CodexAppServerManager:
     async def _drain_stderr(self, chat_id: int, conn: _AppServerConnection) -> None:
         assert conn.proc.stderr is not None
         try:
-            async for raw in conn.proc.stderr:
+            async for raw in _iter_lines(conn.proc.stderr, "app-server stderr"):
                 line = raw.decode(errors="replace").rstrip()
                 if line:
                     logger.debug("Codex app-server stderr (chat %d): %s", chat_id, line)

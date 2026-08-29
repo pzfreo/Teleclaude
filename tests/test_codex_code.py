@@ -1358,3 +1358,54 @@ class TestRunTurn:
             await mgr.run_turn(1001, "owner/repo", "hello", on_event)
 
         assert mgr.has_running_proc(1001) is False
+
+
+class TestOversizedLines:
+    """A JSONL event bigger than the stream buffer must not kill the reader.
+
+    asyncio's readline() raises ValueError ("Separator is not found, and chunk
+    exceed the limit") once a line passes the subprocess buffer limit, which
+    used to surface to the user as a failed turn.
+    """
+
+    class _OverflowStream:
+        """Raises like an over-limit readline() before yielding the real lines."""
+
+        def __init__(self, lines):
+            self._lines = list(lines)
+            self.overflowed = False
+
+        async def readline(self):
+            if not self.overflowed:
+                self.overflowed = True
+                raise ValueError("Separator is not found, and chunk exceed the limit")
+            return self._lines.pop(0) if self._lines else b""
+
+    async def test_read_line_skips_oversized_line(self):
+        stream = self._OverflowStream([b"next\n"])
+        assert await codex_code._read_line(stream, "stdout") == b"next\n"
+
+    async def test_iter_lines_skips_oversized_line(self):
+        stream = self._OverflowStream([b"a\n", b"b\n"])
+        assert [line async for line in codex_code._iter_lines(stream, "stdout")] == [b"a\n", b"b\n"]
+
+    async def test_run_turn_survives_oversized_event(self, tmp_path):
+        mgr = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
+        repo_dir = mgr.workspace_path("owner/repo")
+        repo_dir.mkdir(parents=True)
+
+        proc = TestRunTurn._fake_proc([])
+        proc.stdout = self._OverflowStream([b'{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}\n'])
+
+        async def fake_create(*_args, **_kwargs):
+            return proc
+
+        received: list[dict] = []
+
+        async def on_event(event):
+            received.append(event)
+
+        with patch("asyncio.create_subprocess_exec", new=fake_create):
+            await mgr.run_turn(1001, "owner/repo", "hello", on_event)
+
+        assert [e["item"]["text"] for e in received] == ["hi"]
