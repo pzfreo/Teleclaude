@@ -188,9 +188,14 @@ class TestCodexAppServerManager:
         with (
             patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
             patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
-            patch.object(manager, "_request", new_callable=AsyncMock, side_effect=TimeoutError),
+            patch.object(
+                manager,
+                "_request",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("Codex app-server request timed out after 30s"),
+            ),
             patch.object(manager, "stop", new_callable=AsyncMock) as stop,
-            pytest.raises(TimeoutError),
+            pytest.raises(RuntimeError),
         ):
             await manager.run_turn(1001, "owner/repo", "Run tests", AsyncMock())
 
@@ -256,9 +261,14 @@ class TestCodexAppServerManager:
         conn = codex_code._AppServerConnection(proc=MagicMock())
 
         with (
-            patch.object(manager, "_request", new_callable=AsyncMock, side_effect=TimeoutError),
+            patch.object(
+                manager,
+                "_request",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("Codex app-server request timed out after 30s"),
+            ),
             patch.object(manager, "stop", new_callable=AsyncMock) as stop,
-            pytest.raises(TimeoutError),
+            pytest.raises(RuntimeError),
         ):
             await manager._load_thread(1001, conn, "owner/repo", tmp_path, None)
 
@@ -367,9 +377,14 @@ class TestCodexAppServerManager:
         with (
             patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
             patch.object(manager, "_load_thread", new_callable=AsyncMock, return_value="thr_123"),
-            patch.object(manager, "_request", new_callable=AsyncMock, side_effect=TimeoutError),
+            patch.object(
+                manager,
+                "_request",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("Codex app-server request timed out after 30s"),
+            ),
             patch.object(manager, "stop", new_callable=AsyncMock) as stop,
-            pytest.raises(TimeoutError),
+            pytest.raises(RuntimeError),
         ):
             await manager.execute_slash(1001, "owner/repo", "/compact")
 
@@ -1402,6 +1417,14 @@ class TestOversizedLines:
         stream = self._ChunkedStream([b"a" * 8, b"b" * 8], rest=[b"c" * 4 + b"\n"])
         assert await codex_code._read_line(stream, "stdout") == b"a" * 8 + b"b" * 8 + b"c" * 4 + b"\n"
 
+    async def test_line_past_the_hard_cap_fails_loudly(self, monkeypatch):
+        """Reassembly is bounded: past the cap, fail the turn rather than OOM."""
+        monkeypatch.setattr(codex_code, "MAX_LINE_BYTES", 16)
+        stream = self._ChunkedStream([b"x" * 12, b"x" * 12], rest=[b"\n"])
+
+        with pytest.raises(RuntimeError, match="exceeded"):
+            await codex_code._read_line(stream, "stdout")
+
     async def test_iter_lines_stops_at_eof(self):
         stream = self._ChunkedStream([], rest=[b"one\n", b"two\n"])
         assert [line async for line in codex_code._iter_lines(stream, "stdout")] == [b"one\n", b"two\n"]
@@ -1447,3 +1470,17 @@ class TestRequestTimeout:
 
         assert "turn/start" in str(excinfo.value)
         assert conn.pending == {}
+
+    async def test_stalled_stdin_drain_reports_a_message(self, tmp_path):
+        """wait_for around drain() raises the same message-less TimeoutError."""
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path))
+        manager = CodexAppServerManager(owner)
+        proc = MagicMock()
+        proc.stdin.is_closing.return_value = False
+        proc.stdin.drain = AsyncMock(side_effect=TimeoutError)
+        conn = codex_code._AppServerConnection(proc=proc)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            await manager._send(conn, {"method": "initialized", "params": {}})
+
+        assert str(excinfo.value)

@@ -35,6 +35,7 @@ PROCESS_INTERRUPT_GRACE = 8  # seconds to let Codex wind down after SIGINT befor
 PROCESS_EXIT_WAIT = 15  # seconds to wait for exit after Codex closed stdout on its own
 _ORPHAN_POLL_INTERVAL = 0.1  # seconds between checks that a signalled process group has drained
 STDIO_LIMIT = 10 * 1024 * 1024  # per-line buffer for Codex JSONL stdio
+MAX_LINE_BYTES = 64 * 1024 * 1024  # give up on a line past this rather than buffer it into an OOM
 
 
 class CodexTurnAborted(Exception):
@@ -51,13 +52,19 @@ async def _read_line(stream: asyncio.StreamReader, label: str) -> bytes:
     waiting on, and that turn then hangs until its request times out.
     """
     chunks: list[bytes] = []
+    size = 0
     while True:
         try:
             chunks.append(await stream.readuntil(b"\n"))
             break
         except asyncio.LimitOverrunError as e:
             # e.consumed bytes are already buffered, so this cannot block.
-            chunks.append(await stream.read(e.consumed))
+            chunk = await stream.read(e.consumed)
+            size += len(chunk)
+            if size > MAX_LINE_BYTES:
+                # Holding the rest would trade a lost event for an OOM kill.
+                raise RuntimeError(f"Codex {label} line exceeded {MAX_LINE_BYTES} bytes") from None
+            chunks.append(chunk)
             logger.warning("Codex %s line exceeds the stdio buffer; reading it in parts", label)
         except asyncio.IncompleteReadError as e:
             chunks.append(e.partial)
@@ -803,7 +810,10 @@ class CodexAppServerManager:
             raise RuntimeError("Codex app-server stdin is closed")
         async with conn.write_lock:
             conn.proc.stdin.write((json.dumps(payload) + "\n").encode())
-            await asyncio.wait_for(conn.proc.stdin.drain(), timeout=5)
+            try:
+                await asyncio.wait_for(conn.proc.stdin.drain(), timeout=5)
+            except TimeoutError:
+                raise RuntimeError("Codex app-server stopped reading stdin") from None
 
     async def _request(
         self,
