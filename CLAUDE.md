@@ -211,7 +211,9 @@ tests/              # pytest test suite
 - `GITHUB_TOKEN` (optional — enables GitHub tools)
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (optional — enables Tasks/Calendar/Gmail/Contacts)
 - `DARWIN_API_TOKEN` (optional — enables UK train times via National Rail Darwin API)
-- `CLAUDE_MODEL` (default: claude-sonnet-4-6)
+- `CLAUDE_MODEL` (optional — a family alias `fable`/`opus`/`sonnet`/`haiku` that auto-resolves to the
+  newest model in that family, or a full model id to pin. Default: latest Sonnet. The alias is
+  re-resolved every 6 hours and on `/new`; a per-chat `/model` saves a resolved id that stays put)
 - `ALLOWED_USER_IDS` (comma-separated Telegram user IDs; empty = allow all)
 - `TIMEZONE` (default: UTC)
 - `DAILY_BRIEFING_TIME` (e.g., "08:00")
@@ -219,7 +221,7 @@ tests/              # pytest test suite
 **Agent bot (`.env.agent`)**:
 - `TELEGRAM_BOT_TOKEN` (required, different bot from API bot)
 - `GITHUB_TOKEN` (required for repo cloning)
-- `CLAUDE_MODEL` (default: claude-opus-4-6)
+- `CLAUDE_MODEL` (default: `opus` — Claude Code CLI aliases, resolved by the CLI at run time)
 - `CLAUDE_CLI_PATH` (auto-detected if in PATH)
 - `CLAUDE_CODE_WORKSPACE` (default: ./workspaces)
 - `WEBHOOK_PORT` (0 = disabled)

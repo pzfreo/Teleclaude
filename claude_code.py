@@ -338,6 +338,20 @@ class ClaudeCodeManager:
         """
         return self._session_jsonl_path(session_id, repo_dir).is_file()
 
+    def session_would_reset(self, chat_id: int, repo: str) -> bool:
+        """True if relaunching this chat's CLI would start a new conversation.
+
+        A relaunch replays the stored session via --resume, but when the
+        transcript is missing the CLI mints a fresh id and the history is gone.
+        Callers that restart the process use this to warn the user instead of
+        reporting a bare success. A chat with no stored session has nothing to
+        lose, so this is False.
+        """
+        session_id = self._sessions.get((chat_id, repo))
+        if not session_id:
+            return False
+        return not self._session_resumable(session_id, self.workspace_path(repo))
+
     def new_session(self, chat_id: int, repo: str) -> None:
         """Clear the session for this (chat, repo) pair so the next message starts fresh.
 

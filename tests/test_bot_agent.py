@@ -2091,8 +2091,11 @@ class TestInlineCallback:
                 patch("bot_agent.is_authorized", return_value=True),
                 patch("bot_agent.save_model") as mock_save,
                 patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("bot_agent.get_model", return_value="sonnet"),
             ):
                 mock_mgr.clear_last_model = MagicMock()
+                mock_mgr.abort = AsyncMock()
+                mock_mgr.probe_resolved_model = AsyncMock(return_value="claude-opus-5")
                 await inline_callback(update, ctx)
             mock_save.assert_called_once_with(chat_id, "opus")
             assert bot_agent.chat_models[chat_id] == "opus"
@@ -2210,4 +2213,279 @@ class TestDispatchPrompt:
             mock_start.assert_awaited_once()
             mock_mgr.feed.assert_awaited_once_with(chat_id, "hi")
         finally:
+            bot_agent._stream_mode.discard(chat_id)
+
+
+class TestModelSwitchTakesEffect:
+    """A model switch must reach the running CLI, not just the saved state.
+
+    Stream mode feeds the CLI over stdin and the model is an argv flag fixed at
+    launch, so restarting the stream is the only way to apply a change. These
+    drive the real command handlers and let _start_stream_for_chat run, stubbing
+    only the manager, so they can observe which model the relaunch actually used.
+    """
+
+    @staticmethod
+    def _mgr(resolves="claude-sonnet-5", would_reset=False, started=None):
+        mgr = MagicMock()
+        mgr.abort = AsyncMock()
+        mgr.stop_stream = AsyncMock()
+        mgr.clear_last_model = MagicMock()
+        mgr.session_would_reset = MagicMock(return_value=would_reset)
+        mgr.probe_resolved_model = AsyncMock(return_value=resolves)
+
+        async def _start(**kwargs):
+            if started is not None:
+                started.update(kwargs)
+
+        mgr.start_stream = AsyncMock(side_effect=_start)
+        return mgr
+
+    async def test_stream_restart_uses_the_new_model(self):
+        """The relaunch must pass the NEW model to the CLI, not the old one."""
+        import bot_agent
+        from bot_agent import show_model
+
+        chat_id = 5001
+        started: dict = {}
+        bot_agent._stream_mode.add(chat_id)
+        bot_agent.chat_models[chat_id] = "opus"
+        update = _make_update(chat_id=chat_id)
+        ctx = _make_context(args=["sonnet"])
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.save_model"),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.get_active_branch", return_value=None),
+                patch("bot_agent._clear_progress", new=AsyncMock()),
+                patch("bot_agent.claude_code_mgr", self._mgr(started=started)),
+            ):
+                await show_model(update, ctx)
+            assert started.get("model") == "sonnet"
+            assert bot_agent.chat_models[chat_id] == "sonnet"
+            assert "restarted" in update.message.reply_text.call_args[0][0].lower()
+        finally:
+            bot_agent._stream_mode.discard(chat_id)
+            bot_agent.chat_models.pop(chat_id, None)
+
+    async def test_reply_names_the_resolved_model(self):
+        """This bot stores CLI aliases, so "sonnet" alone does not tell the user
+        which model they landed on. The reply must name the resolved id."""
+        import bot_agent
+        from bot_agent import show_model
+
+        chat_id = 5006
+        bot_agent._stream_mode.add(chat_id)
+        bot_agent.chat_models[chat_id] = "opus"
+        update = _make_update(chat_id=chat_id)
+        ctx = _make_context(args=["sonnet"])
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.save_model"),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.get_active_branch", return_value=None),
+                patch("bot_agent._clear_progress", new=AsyncMock()),
+                patch("bot_agent.claude_code_mgr", self._mgr(resolves="claude-sonnet-5")),
+            ):
+                await show_model(update, ctx)
+            text = update.message.reply_text.call_args[0][0]
+            assert "sonnet" in text
+            assert "claude-sonnet-5" in text
+        finally:
+            bot_agent._stream_mode.discard(chat_id)
+            bot_agent.chat_models.pop(chat_id, None)
+
+    async def test_reselecting_current_model_changes_nothing(self):
+        """Tapping the ✓ button must not kill a running turn to change nothing."""
+        import bot_agent
+        from bot_agent import show_model
+
+        chat_id = 5002
+        bot_agent._stream_mode.add(chat_id)
+        bot_agent.chat_models[chat_id] = "opus"
+        update = _make_update(chat_id=chat_id)
+        ctx = _make_context(args=["opus"])
+        mgr = self._mgr()
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.save_model") as save,
+                patch("bot_agent.claude_code_mgr", mgr),
+            ):
+                await show_model(update, ctx)
+            save.assert_not_called()
+            mgr.stop_stream.assert_not_awaited()
+            mgr.abort.assert_not_awaited()
+            assert "already on" in update.message.reply_text.call_args[0][0].lower()
+        finally:
+            bot_agent._stream_mode.discard(chat_id)
+
+    async def test_unresolvable_model_is_rejected_before_teardown(self):
+        """Validation runs first: a typo must not kill a live stream."""
+        import bot_agent
+        from bot_agent import show_model
+
+        chat_id = 5003
+        bot_agent._stream_mode.add(chat_id)
+        bot_agent.chat_models[chat_id] = "opus"
+        update = _make_update(chat_id=chat_id)
+        ctx = _make_context(args=["claude-opus-6"])
+        mgr = self._mgr(resolves=None)
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.save_model") as save,
+                patch("bot_agent.claude_code_mgr", mgr),
+            ):
+                await show_model(update, ctx)
+            save.assert_not_called()
+            mgr.stop_stream.assert_not_awaited()
+            assert bot_agent.chat_models.get(chat_id) != "claude-opus-6"
+            text = update.message.reply_text.call_args[0][0]
+            assert "could not resolve" in text and "unchanged" in text.lower()
+        finally:
+            bot_agent._stream_mode.discard(chat_id)
+            bot_agent.chat_models.pop(chat_id, None)
+
+    async def test_lost_session_is_reported_not_hidden(self):
+        """If the relaunch cannot resume, say so instead of reporting success."""
+        import bot_agent
+        from bot_agent import show_model
+
+        chat_id = 5004
+        bot_agent._stream_mode.add(chat_id)
+        bot_agent.chat_models[chat_id] = "opus"
+        update = _make_update(chat_id=chat_id)
+        ctx = _make_context(args=["sonnet"])
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.save_model"),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.get_active_branch", return_value=None),
+                patch("bot_agent._clear_progress", new=AsyncMock()),
+                patch("bot_agent.claude_code_mgr", self._mgr(would_reset=True)),
+            ):
+                await show_model(update, ctx)
+            assert "starting fresh" in update.message.reply_text.call_args[0][0].lower()
+        finally:
+            bot_agent._stream_mode.discard(chat_id)
+            bot_agent.chat_models.pop(chat_id, None)
+
+    async def test_no_cli_manager_is_not_fatal(self):
+        """Hosts without the Claude CLI have claude_code_mgr = None, as CI does."""
+        import bot_agent
+        from bot_agent import show_model
+
+        chat_id = 5005
+        bot_agent.chat_models[chat_id] = "opus"
+        update = _make_update(chat_id=chat_id)
+        ctx = _make_context(args=["sonnet"])
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.save_model"),
+                patch("bot_agent.claude_code_mgr", None),
+            ):
+                await show_model(update, ctx)
+            assert bot_agent.chat_models[chat_id] == "sonnet"
+        finally:
+            bot_agent.chat_models.pop(chat_id, None)
+
+
+class TestTeardownResetsState:
+    """Killing the CLI means the turn's result event never arrives, so every
+    teardown path has to reset the state a turn sets on the way in."""
+
+    async def test_teardown_clears_compacting_and_typing(self):
+        """A stuck _compacting entry silently disables auto-compact for the chat."""
+        import bot_agent
+        from bot_agent import _teardown_stream
+
+        chat_id = 5100
+        bot_agent._stream_mode.add(chat_id)
+        bot_agent._compacting.add(chat_id)
+        bot_agent._last_ctx_tokens[chat_id] = 123456
+        mgr = MagicMock()
+        mgr.stop_stream = AsyncMock()
+        mgr.abort = AsyncMock()
+        try:
+            with (
+                patch("bot_agent.claude_code_mgr", mgr),
+                patch("bot_agent._clear_progress", new=AsyncMock()) as clear,
+            ):
+                await _teardown_stream(chat_id, AsyncMock())
+            assert chat_id not in bot_agent._compacting
+            assert chat_id not in bot_agent._last_ctx_tokens
+            assert chat_id not in bot_agent._stream_mode
+            clear.assert_awaited_once()
+            mgr.stop_stream.assert_awaited_once()
+        finally:
+            bot_agent._compacting.discard(chat_id)
+            bot_agent._last_ctx_tokens.pop(chat_id, None)
+            bot_agent._stream_mode.discard(chat_id)
+
+
+class TestPlanModeSwitch:
+    """/plan and /work change --permission-mode, the same argv problem."""
+
+    async def test_plan_when_already_planning_is_a_noop(self):
+        import bot_agent
+        from bot_agent import plan_command
+
+        chat_id = 5200
+        bot_agent._plan_mode.add(chat_id)
+        update = _make_update(chat_id=chat_id, text="/plan")
+        ctx = _make_context()
+        mgr = MagicMock()
+        mgr.stop_stream = AsyncMock()
+        mgr.abort = AsyncMock()
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.claude_code_mgr", mgr),
+            ):
+                await plan_command(update, ctx)
+            mgr.stop_stream.assert_not_awaited()
+            mgr.abort.assert_not_awaited()
+            assert "already in plan mode" in update.message.reply_text.call_args[0][0].lower()
+        finally:
+            bot_agent._plan_mode.discard(chat_id)
+
+    async def test_plan_sets_mode_before_reloading(self):
+        """The reload reads _plan_mode to build --permission-mode, so the flag
+        must be set first. Swapping the two lines reintroduces the bug."""
+        import bot_agent
+        from bot_agent import plan_command
+
+        chat_id = 5201
+        bot_agent._plan_mode.discard(chat_id)
+        seen: dict = {}
+
+        async def _start(**kwargs):
+            seen.update(kwargs)
+
+        mgr = MagicMock()
+        mgr.stop_stream = AsyncMock()
+        mgr.abort = AsyncMock()
+        mgr.session_would_reset = MagicMock(return_value=False)
+        mgr.start_stream = AsyncMock(side_effect=_start)
+        bot_agent._stream_mode.add(chat_id)
+        bot_agent.chat_models[chat_id] = "opus"
+        update = _make_update(chat_id=chat_id, text="/plan")
+        ctx = _make_context()
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.get_active_branch", return_value=None),
+                patch("bot_agent._clear_progress", new=AsyncMock()),
+                patch("bot_agent.claude_code_mgr", mgr),
+            ):
+                await plan_command(update, ctx)
+            assert seen.get("permission_mode") == "plan"
+        finally:
+            bot_agent._plan_mode.discard(chat_id)
             bot_agent._stream_mode.discard(chat_id)

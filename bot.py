@@ -79,38 +79,103 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+DEFAULT_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
 CLAUDE_SESSION_KEY = os.getenv("CLAUDE_SESSION_KEY", "")
 CLAUDE_ORG_ID = os.getenv("CLAUDE_ORG_ID", "")
 
+# Fallback pins, used only when the Models API is unreachable or no API key is
+# set. main() replaces these with whatever the API reports as newest per family,
+# and a periodic job refreshes them so new releases land without a redeploy.
 AVAILABLE_MODELS = {
-    "fable": "claude-fable-5",
+    "fable": "claude-fable-5-1",
     "opus": "claude-opus-5",
     "sonnet": "claude-sonnet-5",
-    "haiku": "claude-haiku-4-5-20251001",
+    "haiku": "claude-haiku-4-5",
 }
+
+# Matches "claude-<family>-<version...>" — e.g. claude-opus-5, claude-fable-5-1,
+# claude-haiku-4-5-20251001. Legacy ids such as claude-3-opus-20240229 put the
+# version first and are deliberately skipped; the pins above still cover them.
+_MODEL_FAMILY_RE = re.compile(r"^claude-([a-z]+)-\d")
+
+# How often to re-query the Models API for newly released models.
+MODEL_REFRESH_INTERVAL = 6 * 3600
 
 
 def _resolve_latest_models(fallback: dict[str, str]) -> dict[str, str]:
-    """Query Anthropic API for the newest model per family. Returns fallback on failure."""
+    """Query Anthropic API for the newest model per family. Returns fallback on failure.
+
+    Families are discovered from the returned model ids rather than being limited
+    to the keys of ``fallback``, so a brand new family becomes selectable without
+    a code change. Every family in ``fallback`` is preserved even if the API
+    lists nothing for it.
+    """
     if not ANTHROPIC_API_KEY:
         return dict(fallback)
     try:
         from anthropic import Anthropic
 
-        client = Anthropic(api_key=ANTHROPIC_API_KEY)
-        models = list(client.models.list(limit=50).data)
+        # Short timeout and a single retry: this runs at startup and on a timer,
+        # so a slow API must never stall the bot.
+        client = Anthropic(api_key=ANTHROPIC_API_KEY, timeout=15.0, max_retries=1)
+        models = list(client.models.list(limit=100).data)
+        latest: dict[str, Any] = {}
+        for model in models:
+            match = _MODEL_FAMILY_RE.match(model.id)
+            if not match:
+                continue
+            family = match.group(1)
+            best = latest.get(family)
+            if best is None or model.created_at > best.created_at:
+                latest[family] = model
+        if not latest:
+            logger.warning("Models API returned no recognisable model ids, using fallback")
+            return dict(fallback)
         result = dict(fallback)
-        for family in fallback:
-            candidates = [m for m in models if f"claude-{family}-" in m.id]
-            if candidates:
-                candidates.sort(key=lambda m: m.created_at, reverse=True)
-                result[family] = candidates[0].id
-                logger.info("Latest %s model: %s", family, candidates[0].id)
+        for family, model in latest.items():
+            result[family] = model.id
+        logger.info("Resolved models: %s", ", ".join(f"{k}={v}" for k, v in sorted(result.items())))
         return result
     except Exception as e:
         logger.warning("Failed to resolve latest models, using fallback: %s", e)
         return dict(fallback)
+
+
+def _apply_resolved_models(resolved: dict[str, str]) -> None:
+    """Install a resolved model map into the module globals.
+
+    Idempotent: DEFAULT_MODEL is always recomputed from the environment, so
+    repeated refreshes never compound. A CLAUDE_MODEL holding a full model id is
+    left untouched; a bare alias ("sonnet", "claude-sonnet") is mapped through
+    the resolved map so stale env vars always yield a valid id.
+    """
+    global AVAILABLE_MODELS, BACKGROUND_MODEL, DEFAULT_MODEL
+    AVAILABLE_MODELS = resolved
+    BACKGROUND_MODEL = resolved.get("haiku", BACKGROUND_MODEL)
+    configured = os.getenv("CLAUDE_MODEL", "").strip()
+    if not configured:
+        DEFAULT_MODEL = resolved.get("sonnet", DEFAULT_MODEL)
+    else:
+        aliases = {**resolved, **{f"claude-{k}": v for k, v in resolved.items()}}
+        DEFAULT_MODEL = aliases.get(configured.lower(), configured)
+
+
+async def _refresh_models() -> None:
+    """Re-resolve the model map so new releases land without restarting the bot."""
+    if not ANTHROPIC_API_KEY:
+        return
+    previous = dict(AVAILABLE_MODELS)
+    resolved = await asyncio.to_thread(_resolve_latest_models, previous)
+    if resolved == previous:
+        return
+    _apply_resolved_models(resolved)
+    changed = {k: v for k, v in resolved.items() if previous.get(k) != v}
+    logger.info("Model map refreshed: %s", changed)
+
+
+async def _refresh_models_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """job_queue wrapper around _refresh_models()."""
+    await _refresh_models()
 
 
 def _check_required_config() -> None:
@@ -936,6 +1001,10 @@ async def new_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     save_todos(chat_id, [])
     save_plan_mode(chat_id, False)
     set_active_branch(chat_id, None)
+    # Mirror the agent bot's /new: take the chance to pick up newly released
+    # models. Runs off the job queue so the reply is never held up by the API.
+    if context.application.job_queue:
+        context.application.job_queue.run_once(_refresh_models_job, when=0, name="model_refresh_now")
     await update.message.reply_text(f"Conversation cleared. Starting fresh.\nModel: {get_model(chat_id)}")
 
 
@@ -952,7 +1021,7 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"Current model: {model}\n\n"
             f"Switch with: /model <name>\n"
             f"Shortcuts: {shortcuts}\n"
-            f"Or use a full model ID, e.g. /model claude-sonnet-4-20250514"
+            f"Or use a full model ID, e.g. /model {AVAILABLE_MODELS.get('opus', 'claude-opus-5')}"
         )
         return
 
@@ -1590,6 +1659,13 @@ async def _process_message(
     # thinking is active.
     use_thinking = _wants_extended_thinking(user_content)
 
+    # Pin the model for the whole turn. A chat that never ran /model resolves
+    # through to the DEFAULT_MODEL global, which the refresh job rebinds on the
+    # same event loop, so re-reading it per round let another chat's /new switch
+    # this turn's model mid-loop. That replays thinking blocks signed by the
+    # previous model into the new one, and discards the prompt cache.
+    turn_model = get_model(chat_id)
+
     # Shared progress status — the tool loop writes, keep_typing reads
     progress: dict[str, Any] = {"round": 0, "max": max_rounds, "tools": [], "last_update_round": -1}
 
@@ -1624,7 +1700,7 @@ async def _process_message(
                 history.extend(sanitized_messages)
 
             kwargs: dict[str, Any] = {
-                "model": get_model(chat_id),
+                "model": turn_model,
                 "max_tokens": 4096,
                 "system": system,
                 "messages": history,
@@ -1764,10 +1840,13 @@ async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
 
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
 
+    # Pin the model for the whole loop — see the note in _process_message.
+    turn_model = get_model(chat_id)
+
     loop = asyncio.get_running_loop()
     for _ in range(10):
         response = await _call_anthropic(
-            model=get_model(chat_id),
+            model=turn_model,
             max_tokens=2048,
             system=system,
             messages=messages,
@@ -2167,16 +2246,7 @@ def main() -> None:
     init_db()
 
     # Resolve latest models from Anthropic API (falls back to hardcoded defaults)
-    global AVAILABLE_MODELS, BACKGROUND_MODEL, DEFAULT_MODEL
-    AVAILABLE_MODELS = _resolve_latest_models(AVAILABLE_MODELS)
-    BACKGROUND_MODEL = AVAILABLE_MODELS["haiku"]
-    # Resolve DEFAULT_MODEL: no env var → use latest sonnet; bare alias (e.g. "claude-sonnet",
-    # "sonnet") → map through AVAILABLE_MODELS so stale env vars always get a valid versioned ID.
-    aliases = {**AVAILABLE_MODELS, **{f"claude-{k}": v for k, v in AVAILABLE_MODELS.items()}}
-    if not os.getenv("CLAUDE_MODEL"):
-        DEFAULT_MODEL = AVAILABLE_MODELS["sonnet"]
-    else:
-        DEFAULT_MODEL = aliases.get(DEFAULT_MODEL, DEFAULT_MODEL)
+    _apply_resolved_models(_resolve_latest_models(AVAILABLE_MODELS))
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
@@ -2225,6 +2295,15 @@ def main() -> None:
         _evict_idle_caches()
 
     app.job_queue.run_repeating(_evict_caches_job, interval=3600, first=3600, name="cache_eviction")
+
+    # Re-resolve model aliases periodically so a long-lived container picks up
+    # new model releases without a redeploy.
+    app.job_queue.run_repeating(
+        _refresh_models_job,
+        interval=MODEL_REFRESH_INTERVAL,
+        first=MODEL_REFRESH_INTERVAL,
+        name="model_refresh",
+    )
 
     logger.info(
         "Teleclaude started — model: %s | github: %s | search: %s | tasks: %s | calendar: %s | email: %s",

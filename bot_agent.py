@@ -127,6 +127,7 @@ active_branches: dict[int, str] = {}
 chat_models: dict[int, str] = {}
 _plan_mode: set[int] = set()  # chat IDs with plan mode enabled
 _stream_mode: set[int] = set()  # chat IDs with /newstream continuous mode
+_stream_locks: dict[int, asyncio.Lock] = {}  # chat_id → serializes stream start/teardown
 _typing_tasks: dict[int, asyncio.Task] = {}
 _frag_buffers: dict[int, str] = {}  # chat_id -> buffered text from split pastes
 _frag_tasks: dict[int, asyncio.Task] = {}  # chat_id -> pending flush task
@@ -296,6 +297,46 @@ def _stop_stream_typing(chat_id: int) -> None:
     task = _typing_tasks.pop(chat_id, None)
     if task and not task.done():
         task.cancel()
+
+
+def _stream_lock(chat_id: int) -> asyncio.Lock:
+    """Serialize stream lifecycle changes for one chat.
+
+    Starting or tearing down a stream spans several awaits (git fetch, clone,
+    process spawn) and the bot runs with concurrent_updates, so without this a
+    message arriving mid-restart starts a second stream. With matching settings
+    that leaves two readers on one stdout and the user sees roughly half of
+    Claude's output; with different settings the second start kills the first
+    process underneath its own live reader, which then posts a spurious
+    "Stream ended" over a healthy stream.
+    """
+    lock = _stream_locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _stream_locks[chat_id] = lock
+    return lock
+
+
+async def _teardown_stream(chat_id: int, bot) -> None:
+    """Tear down a chat's stream and CLI process, resetting all per-turn state.
+
+    Killing the CLI means the turn's result event never arrives, so anything a
+    turn sets on the way in has to be cleared here instead. Leaving one of these
+    set outlives the process it belonged to and silently changes later
+    behaviour: a stuck _compacting entry disables auto-compact for the chat, and
+    a leaked typing task types forever. Every path that kills a running stream
+    must go through this, or the resets drift apart again.
+
+    The session id is deliberately left alone — callers wanting a fresh
+    conversation clear it themselves.
+    """
+    _stream_mode.discard(chat_id)
+    _compacting.discard(chat_id)
+    _last_ctx_tokens.pop(chat_id, None)
+    _stop_stream_typing(chat_id)
+    await _clear_progress(chat_id, bot)
+    await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
+    await claude_code_mgr.abort(chat_id)
 
 
 def _save_attachment(chat_id: int, data: bytes, mime: str, label: str = "") -> str:
@@ -1012,16 +1053,11 @@ async def new_stream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     # Tear down any existing stream / process for this chat.
-    _stream_mode.discard(chat_id)
-    await _clear_progress(chat_id, context.bot)
-    await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
-    await claude_code_mgr.abort(chat_id)
+    await _teardown_stream(chat_id, context.bot)
 
     # Clear ONLY this repo's session. Other repos in this chat keep their memory.
     claude_code_mgr.new_session(chat_id, repo)
     save_session_id(chat_id, repo, None)
-    _compacting.discard(chat_id)
-    _last_ctx_tokens.pop(chat_id, None)
 
     await update.message.reply_text("Updating Claude CLI…")
     await _report_cli_update_status(update)
@@ -1063,12 +1099,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             session_id = saved
 
     # Tear down stream + proc, but DON'T clear the session — we want to resume.
-    _stream_mode.discard(chat_id)
-    _compacting.discard(chat_id)
-    _last_ctx_tokens.pop(chat_id, None)
-    await _clear_progress(chat_id, context.bot)
-    await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
-    await claude_code_mgr.abort(chat_id)
+    await _teardown_stream(chat_id, context.bot)
 
     await update.message.reply_text("Updating Claude CLI…")
     await _report_cli_update_status(update)
@@ -1095,20 +1126,96 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(usage)
 
 
-async def _warn_if_model_unresolvable(chat_id: int, model_id: str, bot: Bot) -> None:
-    """Warn the user if the CLI can't resolve a newly selected model.
+async def _probe_model(model_id: str) -> tuple[bool, str | None]:
+    """Ask the Claude CLI to resolve a model id, returning (usable, resolved id).
 
-    An outdated CLI fails silently on unknown aliases (the init event never
-    arrives and runs just hang), so surface it explicitly at switch time.
+    An outdated CLI fails silently on unknown aliases: the init event never
+    arrives and runs just hang, so a definitive miss makes the model unusable.
+    A probe that errors out is not a verdict — the model stays usable and the
+    resolved id is simply unknown.
+
+    The resolved id is worth surfacing because this bot stores CLI aliases, so
+    "sonnet" alone does not tell the user which model they actually landed on.
     """
+    if not claude_code_mgr:
+        return True, None
     try:
-        if await claude_code_mgr.probe_resolved_model(model_id) is None:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ Claude CLI could not resolve '{model_id}' — the CLI may be outdated. Try /update.",
-            )
+        resolved = await claude_code_mgr.probe_resolved_model(model_id)
     except Exception as e:
         logger.warning("Model resolution check for %s failed: %s", model_id, e)
+        return True, None
+    return resolved is not None, resolved
+
+
+async def _reload_cli_settings(chat_id: int, bot: Bot, what: str) -> str:
+    """Restart the CLI so a changed model or permission mode takes effect.
+
+    Both are argv flags fixed at launch, and stream mode feeds the running
+    process over stdin, so relaunching is the only way to apply a change. The
+    stored session is replayed via --resume, so history normally survives.
+
+    Returns a status line to append to the reply, empty if nothing was running.
+    """
+    if not claude_code_mgr:
+        # No CLI on this host — nothing to re-point. The saved setting takes
+        # effect once a manager exists.
+        return ""
+
+    async with _stream_lock(chat_id):
+        repo = get_active_repo(chat_id) if chat_id in _stream_mode else None
+        if not repo:
+            # Nothing streaming: drop any idle process so the next turn starts
+            # one with the new setting.
+            await claude_code_mgr.abort(chat_id)
+            return ""
+
+        # Check before tearing down: if the transcript is gone the CLI mints a
+        # fresh session instead of resuming, and the user has to be told the
+        # conversation restarted empty rather than shown a bare success.
+        will_reset = claude_code_mgr.session_would_reset(chat_id, repo)
+
+        await _teardown_stream(chat_id, bot)
+        err = await _start_stream_for_chat(chat_id, repo, bot)
+
+    if err:
+        return f"\n⚠️ Stream restart failed: {err}"
+    if will_reset:
+        return f"\nStream restarted on the new {what}, but the previous session could not be resumed — starting fresh."
+    return f"\nStream restarted on the new {what}."
+
+
+async def _switch_model(chat_id: int, model_id: str, bot: Bot) -> str:
+    """Validate, persist and apply a model switch. Returns the full reply text.
+
+    Validation runs BEFORE anything destructive. Applying tears down a possibly
+    mid-turn stream, so checking afterwards meant a typo killed the session and
+    relaunched the CLI with an argv it could not resolve.
+    """
+    if get_model(chat_id) == model_id:
+        # Re-selecting the active model (tapping its ✓ button) must not kill a
+        # running turn to change nothing. Report the resolved id from the last
+        # CLI init if we have it — that is cached, so this costs no probe.
+        cached = claude_code_mgr.get_last_model(chat_id) if claude_code_mgr else None
+        label = f"{model_id} (resolved: {cached})" if cached and cached != model_id else model_id
+        return f"Already on: {label}"
+
+    usable, resolved = await _probe_model(model_id)
+    if not usable:
+        return (
+            f"⚠️ Claude CLI could not resolve '{model_id}' — the CLI may be outdated. "
+            f"Try /update.\nModel unchanged."
+        )
+
+    chat_models[chat_id] = model_id
+    save_model(chat_id, model_id)
+    if claude_code_mgr:
+        claude_code_mgr.clear_last_model(chat_id)
+    note = await _reload_cli_settings(chat_id, bot, "model")
+    # Show what the alias actually resolved to. "sonnet" alone does not confirm
+    # which model the CLI landed on, which is the whole point of the switch.
+    # Matches the "(resolved: …)" wording /model already uses for status.
+    label = f"{model_id} (resolved: {resolved})" if resolved and resolved != model_id else model_id
+    return f"Model switched to: {label}{note}"
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1144,11 +1251,7 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"Unknown model: {choice}")
         return
 
-    chat_models[chat_id] = model_id
-    save_model(chat_id, model_id)
-    claude_code_mgr.clear_last_model(chat_id)
-    await update.message.reply_text(f"Model switched to: {model_id}")
-    await _warn_if_model_unresolvable(chat_id, model_id, context.bot)
+    await update.message.reply_text(await _switch_model(chat_id, model_id, context.bot))
 
 
 async def send_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1269,11 +1372,7 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if name not in AVAILABLE_MODELS:
             return
         model_id = AVAILABLE_MODELS[name]
-        chat_models[chat_id] = model_id
-        save_model(chat_id, model_id)
-        claude_code_mgr.clear_last_model(chat_id)
-        await query.edit_message_text(f"Model switched to: {model_id}")
-        await _warn_if_model_unresolvable(chat_id, model_id, context.bot)
+        await query.edit_message_text(await _switch_model(chat_id, model_id, context.bot))
 
     elif data.startswith("ask_agent:"):
         parts = data.split(":")
@@ -1491,9 +1590,17 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     task = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
 
     if not task:
-        # Toggle plan mode on
+        # Toggle plan mode on. Guard the no-op: re-sending /plan while already
+        # in plan mode would otherwise restart the CLI, killing a running turn
+        # to arrive at the same --permission-mode.
+        if chat_id in _plan_mode:
+            await update.message.reply_text("Already in plan mode. Send /work to switch back.")
+            return
         _plan_mode.add(chat_id)
-        await update.message.reply_text("Plan mode ON. Claude will plan but not implement.\nSend /work to switch back.")
+        note = await _reload_cli_settings(chat_id, context.bot, "permission mode")
+        await update.message.reply_text(
+            f"Plan mode ON. Claude will plan but not implement.\nSend /work to switch back.{note}"
+        )
         return
 
     # Send the framed planning prompt through the normal stream path
@@ -1513,7 +1620,8 @@ async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     was_planning = chat_id in _plan_mode
     _plan_mode.discard(chat_id)
     if was_planning:
-        await update.message.reply_text("Plan mode OFF. Claude will now implement directly.")
+        note = await _reload_cli_settings(chat_id, context.bot, "permission mode")
+        await update.message.reply_text(f"Plan mode OFF. Claude will now implement directly.{note}")
     else:
         await update.message.reply_text("Already in work mode.")
 
@@ -1716,19 +1824,25 @@ async def _dispatch_prompt(chat_id: int, prompt: str, update: Update, context: C
 
     # Auto-start stream if not running. Reader task may have died, in which
     # case stream_mode_active() returns False even when chat_id is in _stream_mode.
-    if chat_id not in _stream_mode or not claude_code_mgr.stream_mode_active(chat_id):
-        _stream_mode.discard(chat_id)
-        err = await _start_stream_for_chat(chat_id, repo, context.bot)
-        if err:
-            await update.message.reply_text(err)
-            return
+    # Hold the lifecycle lock across the check and the start: a /model or /plan
+    # restart runs git operations between tearing the old stream down and
+    # bringing the new one up, and starting a second stream in that window
+    # leaves two readers on one stdout.
+    async with _stream_lock(chat_id):
+        if chat_id not in _stream_mode or not claude_code_mgr.stream_mode_active(chat_id):
+            _stream_mode.discard(chat_id)
+            err = await _start_stream_for_chat(chat_id, repo, context.bot)
+            if err:
+                await update.message.reply_text(err)
+                return
 
     sent = await claude_code_mgr.feed(chat_id, prompt)
     if not sent:
         # Stream pipe broken mid-send. Tear down and restart once, then retry.
-        await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
-        _stream_mode.discard(chat_id)
-        err = await _start_stream_for_chat(chat_id, repo, context.bot)
+        async with _stream_lock(chat_id):
+            await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
+            _stream_mode.discard(chat_id)
+            err = await _start_stream_for_chat(chat_id, repo, context.bot)
         if err:
             await update.message.reply_text(f"Stream restart failed: {err}")
             return
