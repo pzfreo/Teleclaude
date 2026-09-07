@@ -1021,7 +1021,7 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"Current model: {model}\n\n"
             f"Switch with: /model <name>\n"
             f"Shortcuts: {shortcuts}\n"
-            f"Or use a full model ID, e.g. /model {AVAILABLE_MODELS['opus']}"
+            f"Or use a full model ID, e.g. /model {AVAILABLE_MODELS.get('opus', 'claude-opus-5')}"
         )
         return
 
@@ -1659,6 +1659,13 @@ async def _process_message(
     # thinking is active.
     use_thinking = _wants_extended_thinking(user_content)
 
+    # Pin the model for the whole turn. A chat that never ran /model resolves
+    # through to the DEFAULT_MODEL global, which the refresh job rebinds on the
+    # same event loop, so re-reading it per round let another chat's /new switch
+    # this turn's model mid-loop. That replays thinking blocks signed by the
+    # previous model into the new one, and discards the prompt cache.
+    turn_model = get_model(chat_id)
+
     # Shared progress status — the tool loop writes, keep_typing reads
     progress: dict[str, Any] = {"round": 0, "max": max_rounds, "tools": [], "last_update_round": -1}
 
@@ -1693,7 +1700,7 @@ async def _process_message(
                 history.extend(sanitized_messages)
 
             kwargs: dict[str, Any] = {
-                "model": get_model(chat_id),
+                "model": turn_model,
                 "max_tokens": 4096,
                 "system": system,
                 "messages": history,
@@ -1833,10 +1840,13 @@ async def run_scheduled_prompt(bot, chat_id: int, prompt: str) -> None:
 
     messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
 
+    # Pin the model for the whole loop — see the note in _process_message.
+    turn_model = get_model(chat_id)
+
     loop = asyncio.get_running_loop()
     for _ in range(10):
         response = await _call_anthropic(
-            model=get_model(chat_id),
+            model=turn_model,
             max_tokens=2048,
             system=system,
             messages=messages,

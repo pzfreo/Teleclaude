@@ -212,7 +212,8 @@ tests/              # pytest test suite
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` (optional — enables Tasks/Calendar/Gmail/Contacts)
 - `DARWIN_API_TOKEN` (optional — enables UK train times via National Rail Darwin API)
 - `CLAUDE_MODEL` (optional — a family alias `fable`/`opus`/`sonnet`/`haiku` that auto-resolves to the
-  newest model in that family, or a full model id to pin. Default: latest Sonnet)
+  newest model in that family, or a full model id to pin. Default: latest Sonnet. The alias is
+  re-resolved every 6 hours and on `/new`; a per-chat `/model` saves a resolved id that stays put)
 - `ALLOWED_USER_IDS` (comma-separated Telegram user IDs; empty = allow all)
 - `TIMEZONE` (default: UTC)
 - `DAILY_BRIEFING_TIME` (e.g., "08:00")
