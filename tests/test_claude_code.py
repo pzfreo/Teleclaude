@@ -593,3 +593,83 @@ class TestInterrupt:
         result = await mgr.interrupt(4444)
         assert result is False
         assert 4444 not in mgr._proc_stdins
+
+
+class TestProcRelaunchOnSettingsChange:
+    """A running CLI process bakes --model and --permission-mode into argv, so a
+    changed value must force a relaunch rather than silently reuse the process."""
+
+    @staticmethod
+    def _fake_proc_factory(captured: list[list[str]]):
+        class _FakeStdin:
+            def is_closing(self) -> bool:
+                return False
+
+        class _FakeProc:
+            def __init__(self) -> None:
+                self.stdin = _FakeStdin()
+                self.stdout = None
+                self.stderr = None
+                self.returncode = None
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            async def wait(self):
+                return self.returncode
+
+        async def fake_create(*args, **_kwargs):
+            captured.append(list(args))
+            return _FakeProc()
+
+        return fake_create
+
+    async def _mgr(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        mgr = ClaudeCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/bin/claude")
+        repo = "owner/repo"
+        mgr.workspace_path(repo).mkdir(parents=True)
+        return mgr, repo
+
+    async def test_same_settings_reuse_process(self, tmp_path, monkeypatch):
+        mgr, repo = await self._mgr(tmp_path, monkeypatch)
+        captured: list[list[str]] = []
+        with patch("asyncio.create_subprocess_exec", new=self._fake_proc_factory(captured)):
+            first = await mgr._ensure_proc(1001, repo, model="opus", permission_mode=None)
+            second = await mgr._ensure_proc(1001, repo, model="opus", permission_mode=None)
+        assert first is second
+        assert len(captured) == 1
+
+    async def test_model_change_relaunches(self, tmp_path, monkeypatch):
+        mgr, repo = await self._mgr(tmp_path, monkeypatch)
+        captured: list[list[str]] = []
+        with patch("asyncio.create_subprocess_exec", new=self._fake_proc_factory(captured)):
+            first = await mgr._ensure_proc(1001, repo, model="opus", permission_mode=None)
+            second = await mgr._ensure_proc(1001, repo, model="sonnet", permission_mode=None)
+        assert first is not second
+        assert len(captured) == 2
+        assert captured[0][captured[0].index("--model") + 1] == "opus"
+        assert captured[1][captured[1].index("--model") + 1] == "sonnet"
+
+    async def test_relaunch_resumes_same_session(self, tmp_path, monkeypatch):
+        """History must survive the relaunch — the second launch resumes the
+        session id the first one created."""
+        mgr, repo = await self._mgr(tmp_path, monkeypatch)
+        captured: list[list[str]] = []
+        with patch("asyncio.create_subprocess_exec", new=self._fake_proc_factory(captured)):
+            await mgr._ensure_proc(1001, repo, model="opus", permission_mode=None)
+            session_id = mgr.get_session_id(1001, repo)
+            # Make the session look resumable so the id is not discarded.
+            with patch.object(mgr, "_session_resumable", return_value=True):
+                await mgr._ensure_proc(1001, repo, model="sonnet", permission_mode=None)
+        assert captured[1][captured[1].index("--resume") + 1] == session_id
+
+    async def test_permission_mode_change_relaunches(self, tmp_path, monkeypatch):
+        mgr, repo = await self._mgr(tmp_path, monkeypatch)
+        captured: list[list[str]] = []
+        with patch("asyncio.create_subprocess_exec", new=self._fake_proc_factory(captured)):
+            await mgr._ensure_proc(1001, repo, model="opus", permission_mode=None)
+            await mgr._ensure_proc(1001, repo, model="opus", permission_mode="plan")
+        assert len(captured) == 2
+        assert "--permission-mode" not in captured[0]
+        assert captured[1][captured[1].index("--permission-mode") + 1] == "plan"

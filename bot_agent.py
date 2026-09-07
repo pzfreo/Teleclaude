@@ -1111,6 +1111,40 @@ async def _warn_if_model_unresolvable(chat_id: int, model_id: str, bot: Bot) -> 
         logger.warning("Model resolution check for %s failed: %s", model_id, e)
 
 
+async def _reload_cli_settings(chat_id: int, bot: Bot, what: str) -> str:
+    """Make a changed model or permission mode take effect on the running CLI.
+
+    Both are CLI argv flags, so a live process keeps the old value until it is
+    relaunched — without this a switch is only cosmetic. In stream mode the CLI
+    is fed over stdin and never revisits _ensure_proc(), so restart the stream
+    here; the session id is replayed via --resume, so history survives. Outside
+    stream mode, dropping the process is enough: the next turn's _ensure_proc()
+    sees the change and relaunches.
+
+    Returns a status line to append to the reply (empty if there is nothing to say).
+    """
+    repo = get_active_repo(chat_id) if chat_id in _stream_mode else None
+    if not repo:
+        await claude_code_mgr.abort(chat_id)
+        return ""
+
+    await claude_code_mgr.stop_stream(chat_id, kill_proc=True)
+    _stream_mode.discard(chat_id)
+    _stop_stream_typing(chat_id)
+    err = await _start_stream_for_chat(chat_id, repo, bot)
+    if err:
+        return f"\n⚠️ Stream restart failed: {err}"
+    return f"\nStream restarted on the new {what}."
+
+
+async def _apply_model_change(chat_id: int, model_id: str, bot: Bot) -> str:
+    """Persist a model switch and make it take effect on the running CLI."""
+    chat_models[chat_id] = model_id
+    save_model(chat_id, model_id)
+    claude_code_mgr.clear_last_model(chat_id)
+    return await _reload_cli_settings(chat_id, bot, "model")
+
+
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
@@ -1144,10 +1178,8 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"Unknown model: {choice}")
         return
 
-    chat_models[chat_id] = model_id
-    save_model(chat_id, model_id)
-    claude_code_mgr.clear_last_model(chat_id)
-    await update.message.reply_text(f"Model switched to: {model_id}")
+    note = await _apply_model_change(chat_id, model_id, context.bot)
+    await update.message.reply_text(f"Model switched to: {model_id}{note}")
     await _warn_if_model_unresolvable(chat_id, model_id, context.bot)
 
 
@@ -1269,10 +1301,8 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if name not in AVAILABLE_MODELS:
             return
         model_id = AVAILABLE_MODELS[name]
-        chat_models[chat_id] = model_id
-        save_model(chat_id, model_id)
-        claude_code_mgr.clear_last_model(chat_id)
-        await query.edit_message_text(f"Model switched to: {model_id}")
+        note = await _apply_model_change(chat_id, model_id, context.bot)
+        await query.edit_message_text(f"Model switched to: {model_id}{note}")
         await _warn_if_model_unresolvable(chat_id, model_id, context.bot)
 
     elif data.startswith("ask_agent:"):
@@ -1493,7 +1523,10 @@ async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not task:
         # Toggle plan mode on
         _plan_mode.add(chat_id)
-        await update.message.reply_text("Plan mode ON. Claude will plan but not implement.\nSend /work to switch back.")
+        note = await _reload_cli_settings(chat_id, context.bot, "permission mode")
+        await update.message.reply_text(
+            f"Plan mode ON. Claude will plan but not implement.\nSend /work to switch back.{note}"
+        )
         return
 
     # Send the framed planning prompt through the normal stream path
@@ -1513,7 +1546,8 @@ async def work_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     was_planning = chat_id in _plan_mode
     _plan_mode.discard(chat_id)
     if was_planning:
-        await update.message.reply_text("Plan mode OFF. Claude will now implement directly.")
+        note = await _reload_cli_settings(chat_id, context.bot, "permission mode")
+        await update.message.reply_text(f"Plan mode OFF. Claude will now implement directly.{note}")
     else:
         await update.message.reply_text("Already in work mode.")
 

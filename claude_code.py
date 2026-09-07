@@ -170,6 +170,12 @@ class ClaudeCodeManager:
         self._running_procs: dict[int, asyncio.subprocess.Process] = {}  # chat_id → active proc
         self._proc_stdins: dict[int, asyncio.StreamWriter] = {}  # chat_id → stdin writer
         self._proc_repos: dict[int, str] = {}  # chat_id → repo the process was launched for
+        # The model and permission mode are baked into the CLI argv at launch, so a
+        # running process cannot be re-pointed. Track what each was launched with and
+        # relaunch when the user changes either, otherwise /model and /plan silently
+        # keep using the old value for the life of the process.
+        self._proc_models: dict[int, str | None] = {}  # chat_id → --model the process was launched with
+        self._proc_modes: dict[int, str | None] = {}  # chat_id → --permission-mode it was launched with
         self._stdin_locks: dict[int, asyncio.Lock] = {}  # chat_id → lock for stdin writes
         self._last_models: dict[int, str] = {}  # chat_id → resolved model id from most recent CLI init
         self._stream_tasks: dict[int, asyncio.Task] = {}  # chat_id → continuous reader task (stream mode)
@@ -531,6 +537,8 @@ class ClaudeCodeManager:
         self._proc_stdins.pop(chat_id, None)
         proc = self._running_procs.pop(chat_id, None)
         self._proc_repos.pop(chat_id, None)
+        self._proc_models.pop(chat_id, None)
+        self._proc_modes.pop(chat_id, None)
         stderr_task = self._stderr_tasks.pop(chat_id, None)
         if stderr_task and not stderr_task.done():
             stderr_task.cancel()
@@ -570,16 +578,32 @@ class ClaudeCodeManager:
     ) -> asyncio.subprocess.Process:
         """Return a running CLI process for this chat, launching one if needed.
 
-        Reuses the existing process when the repo hasn't changed. Kills and
-        restarts if the repo changed or the process exited.
+        Reuses the existing process only when the repo, model, and permission mode
+        all match what it was launched with. Those are argv flags, so a running
+        process cannot adopt a new value — it has to be relaunched. The session id
+        is stored per (chat, repo) and replayed via --resume, so the relaunch keeps
+        the conversation intact.
         """
         existing = self._running_procs.get(chat_id)
         same_repo = self._proc_repos.get(chat_id) == repo
+        same_model = self._proc_models.get(chat_id) == model
+        same_mode = self._proc_modes.get(chat_id) == permission_mode
 
-        if existing and existing.returncode is None and same_repo:
+        if existing and existing.returncode is None and same_repo and same_model and same_mode:
             return existing
 
-        # Different repo or dead process — start fresh
+        if existing and existing.returncode is None and same_repo:
+            logger.info(
+                "Relaunching CLI for chat %d on %s: model %s→%s, mode %s→%s",
+                chat_id,
+                repo,
+                self._proc_models.get(chat_id),
+                model,
+                self._proc_modes.get(chat_id),
+                permission_mode,
+            )
+
+        # Different repo, changed model/mode, or dead process — start fresh
         await self._kill_proc(chat_id)
 
         repo_dir = self.workspace_path(repo)
@@ -664,6 +688,8 @@ class ClaudeCodeManager:
         assert proc.stdin is not None, "stdin pipe not available"
         self._proc_stdins[chat_id] = proc.stdin
         self._proc_repos[chat_id] = repo
+        self._proc_models[chat_id] = model
+        self._proc_modes[chat_id] = permission_mode
         self._stderr_tasks[chat_id] = asyncio.create_task(self._drain_stderr(proc, chat_id))
         return proc
 

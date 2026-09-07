@@ -2093,9 +2093,12 @@ class TestInlineCallback:
                 patch("bot_agent.claude_code_mgr") as mock_mgr,
             ):
                 mock_mgr.clear_last_model = MagicMock()
+                mock_mgr.abort = AsyncMock()
                 await inline_callback(update, ctx)
             mock_save.assert_called_once_with(chat_id, "opus")
             assert bot_agent.chat_models[chat_id] == "opus"
+            # The switch must reach the CLI, not just the saved state.
+            mock_mgr.abort.assert_awaited_once_with(chat_id)
             update.callback_query.edit_message_text.assert_awaited_once()
         finally:
             bot_agent.chat_models.pop(chat_id, None)
@@ -2211,3 +2214,99 @@ class TestDispatchPrompt:
             mock_mgr.feed.assert_awaited_once_with(chat_id, "hi")
         finally:
             bot_agent._stream_mode.discard(chat_id)
+
+
+class TestModelSwitchTakesEffect:
+    """Switching model must reach the running CLI, not just the saved state.
+
+    In stream mode the CLI is fed over stdin and never revisits _ensure_proc(),
+    so the stream has to be torn down and restarted for the new --model to apply.
+    """
+
+    async def test_stream_mode_restarts_stream(self):
+        import bot_agent
+        from bot_agent import _apply_model_change
+
+        bot_agent._stream_mode.add(5001)
+        restart = AsyncMock(return_value=None)
+        try:
+            with (
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("bot_agent.save_model"),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent._start_stream_for_chat", restart),
+                patch("bot_agent._stop_stream_typing"),
+            ):
+                mock_mgr.stop_stream = AsyncMock()
+                mock_mgr.abort = AsyncMock()
+                note = await _apply_model_change(5001, "sonnet", AsyncMock())
+            mock_mgr.stop_stream.assert_awaited_once()
+            assert mock_mgr.stop_stream.await_args.kwargs.get("kill_proc") is True
+            restart.assert_awaited_once()
+            assert "restarted" in note.lower()
+            assert bot_agent.chat_models[5001] == "sonnet"
+        finally:
+            bot_agent._stream_mode.discard(5001)
+            bot_agent.chat_models.pop(5001, None)
+
+    async def test_stream_restart_failure_is_reported(self):
+        import bot_agent
+        from bot_agent import _apply_model_change
+
+        bot_agent._stream_mode.add(5002)
+        try:
+            with (
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("bot_agent.save_model"),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent._start_stream_for_chat", AsyncMock(return_value="boom")),
+                patch("bot_agent._stop_stream_typing"),
+            ):
+                mock_mgr.stop_stream = AsyncMock()
+                mock_mgr.abort = AsyncMock()
+                note = await _apply_model_change(5002, "sonnet", AsyncMock())
+            assert "boom" in note
+        finally:
+            bot_agent._stream_mode.discard(5002)
+            bot_agent.chat_models.pop(5002, None)
+
+    async def test_non_stream_chat_drops_process(self):
+        """Outside stream mode, killing the process is enough — the next turn's
+        _ensure_proc() relaunches with the new model."""
+        import bot_agent
+        from bot_agent import _apply_model_change
+
+        bot_agent._stream_mode.discard(5003)
+        try:
+            with (
+                patch("bot_agent.claude_code_mgr") as mock_mgr,
+                patch("bot_agent.save_model"),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+            ):
+                mock_mgr.abort = AsyncMock()
+                mock_mgr.stop_stream = AsyncMock()
+                note = await _apply_model_change(5003, "sonnet", AsyncMock())
+            mock_mgr.abort.assert_awaited_once()
+            mock_mgr.stop_stream.assert_not_awaited()
+            assert note == ""
+        finally:
+            bot_agent.chat_models.pop(5003, None)
+
+    async def test_plan_toggle_reloads_settings(self):
+        """/plan changes --permission-mode, which is the same argv problem."""
+        import bot_agent
+        from bot_agent import plan_command
+
+        update = _make_update(chat_id=5004, text="/plan")
+        ctx = _make_context()
+        reload_mock = AsyncMock(return_value="")
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent._reload_cli_settings", reload_mock),
+            ):
+                await plan_command(update, ctx)
+            reload_mock.assert_awaited_once()
+            assert 5004 in bot_agent._plan_mode
+        finally:
+            bot_agent._plan_mode.discard(5004)
