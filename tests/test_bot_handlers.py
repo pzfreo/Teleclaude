@@ -1118,3 +1118,160 @@ class TestRepoBareNameLookup:
             await _repo_callback(update, MagicMock())
         assert bot.active_repos[8002] == "pzfreo/Teleclaude"
         query.edit_message_text.assert_awaited_once()
+
+
+class TestModelResolution:
+    """Model alias resolution against the Models API, and the periodic refresh."""
+
+    @staticmethod
+    def _model(model_id: str, created_at: int):
+        return SimpleNamespace(id=model_id, created_at=created_at)
+
+    @staticmethod
+    def _fallback():
+        return {
+            "fable": "claude-fable-5-1",
+            "opus": "claude-opus-5",
+            "sonnet": "claude-sonnet-5",
+            "haiku": "claude-haiku-4-5",
+        }
+
+    def _patch_models_list(self, models):
+        client = MagicMock()
+        client.models.list.return_value = SimpleNamespace(data=models)
+        anthropic_cls = MagicMock(return_value=client)
+        return patch("anthropic.Anthropic", anthropic_cls), anthropic_cls
+
+    def test_no_api_key_returns_fallback(self):
+        from bot import _resolve_latest_models
+
+        fallback = self._fallback()
+        with patch("bot.ANTHROPIC_API_KEY", ""):
+            assert _resolve_latest_models(fallback) == fallback
+
+    def test_picks_newest_per_family(self):
+        from bot import _resolve_latest_models
+
+        models = [
+            self._model("claude-opus-5", 100),
+            self._model("claude-opus-4-8", 50),
+            self._model("claude-sonnet-5", 90),
+        ]
+        ctx, _ = self._patch_models_list(models)
+        with patch("bot.ANTHROPIC_API_KEY", "sk-test"), ctx:
+            result = _resolve_latest_models(self._fallback())
+        assert result["opus"] == "claude-opus-5"
+        assert result["sonnet"] == "claude-sonnet-5"
+
+    def test_discovers_new_family(self):
+        """A family absent from the fallback map still becomes selectable."""
+        from bot import _resolve_latest_models
+
+        models = [self._model("claude-opus-5", 100), self._model("claude-mythos-6", 200)]
+        ctx, _ = self._patch_models_list(models)
+        with patch("bot.ANTHROPIC_API_KEY", "sk-test"), ctx:
+            result = _resolve_latest_models(self._fallback())
+        assert result["mythos"] == "claude-mythos-6"
+        # Families the API did not list are preserved from the fallback.
+        assert result["haiku"] == "claude-haiku-4-5"
+
+    def test_skips_legacy_id_shape(self):
+        from bot import _resolve_latest_models
+
+        models = [self._model("claude-3-opus-20240229", 999), self._model("claude-opus-5", 100)]
+        ctx, _ = self._patch_models_list(models)
+        with patch("bot.ANTHROPIC_API_KEY", "sk-test"), ctx:
+            result = _resolve_latest_models(self._fallback())
+        assert result["opus"] == "claude-opus-5"
+        assert "3" not in result
+
+    def test_api_failure_returns_fallback(self):
+        from bot import _resolve_latest_models
+
+        fallback = self._fallback()
+        failing = MagicMock(side_effect=RuntimeError("boom"))
+        with patch("bot.ANTHROPIC_API_KEY", "sk-test"), patch("anthropic.Anthropic", failing):
+            assert _resolve_latest_models(fallback) == fallback
+
+    def test_apply_sets_globals_without_env_var(self):
+        import bot
+        from bot import _apply_resolved_models
+
+        saved = (bot.AVAILABLE_MODELS, bot.BACKGROUND_MODEL, bot.DEFAULT_MODEL)
+        try:
+            with patch.dict("os.environ", {}, clear=False):
+                bot.os.environ.pop("CLAUDE_MODEL", None)
+                _apply_resolved_models({"sonnet": "claude-sonnet-9", "haiku": "claude-haiku-9"})
+            assert bot.DEFAULT_MODEL == "claude-sonnet-9"
+            assert bot.BACKGROUND_MODEL == "claude-haiku-9"
+        finally:
+            bot.AVAILABLE_MODELS, bot.BACKGROUND_MODEL, bot.DEFAULT_MODEL = saved
+
+    def test_apply_maps_bare_alias_env_var(self):
+        import bot
+        from bot import _apply_resolved_models
+
+        saved = (bot.AVAILABLE_MODELS, bot.BACKGROUND_MODEL, bot.DEFAULT_MODEL)
+        try:
+            with patch.dict("os.environ", {"CLAUDE_MODEL": "opus"}):
+                _apply_resolved_models({"opus": "claude-opus-9", "haiku": "claude-haiku-9"})
+            assert bot.DEFAULT_MODEL == "claude-opus-9"
+        finally:
+            bot.AVAILABLE_MODELS, bot.BACKGROUND_MODEL, bot.DEFAULT_MODEL = saved
+
+    def test_apply_leaves_pinned_id_alone(self):
+        import bot
+        from bot import _apply_resolved_models
+
+        saved = (bot.AVAILABLE_MODELS, bot.BACKGROUND_MODEL, bot.DEFAULT_MODEL)
+        try:
+            with patch.dict("os.environ", {"CLAUDE_MODEL": "claude-opus-4-8"}):
+                _apply_resolved_models({"opus": "claude-opus-9", "haiku": "claude-haiku-9"})
+            assert bot.DEFAULT_MODEL == "claude-opus-4-8"
+        finally:
+            bot.AVAILABLE_MODELS, bot.BACKGROUND_MODEL, bot.DEFAULT_MODEL = saved
+
+    async def test_refresh_models_updates_map(self):
+        import bot
+        from bot import _refresh_models
+
+        saved = (bot.AVAILABLE_MODELS, bot.BACKGROUND_MODEL, bot.DEFAULT_MODEL)
+        try:
+            with (
+                patch("bot.ANTHROPIC_API_KEY", "sk-test"),
+                patch("bot._resolve_latest_models", return_value={"opus": "claude-opus-9", "haiku": "claude-haiku-9"}),
+                patch.dict("os.environ", {"CLAUDE_MODEL": "opus"}),
+            ):
+                await _refresh_models()
+            assert bot.AVAILABLE_MODELS["opus"] == "claude-opus-9"
+            assert bot.DEFAULT_MODEL == "claude-opus-9"
+        finally:
+            bot.AVAILABLE_MODELS, bot.BACKGROUND_MODEL, bot.DEFAULT_MODEL = saved
+
+    async def test_refresh_models_noop_without_api_key(self):
+        import bot
+        from bot import _refresh_models
+
+        before = dict(bot.AVAILABLE_MODELS)
+        resolver = MagicMock()
+        with patch("bot.ANTHROPIC_API_KEY", ""), patch("bot._resolve_latest_models", resolver):
+            await _refresh_models()
+        resolver.assert_not_called()
+        assert before == bot.AVAILABLE_MODELS
+
+    async def test_new_conversation_schedules_refresh(self):
+        from bot import new_conversation
+
+        job_queue = MagicMock()
+        update = _make_update(chat_id=7778)
+        ctx = _make_context(job_queue=job_queue)
+        with (
+            patch("bot.is_authorized", return_value=True),
+            patch("bot.clear_conversation"),
+            patch("bot.save_todos"),
+            patch("bot.save_plan_mode"),
+            patch("bot.set_active_branch"),
+            patch("bot.get_model", return_value="claude-sonnet-5"),
+        ):
+            await new_conversation(update, ctx)
+        job_queue.run_once.assert_called_once()
