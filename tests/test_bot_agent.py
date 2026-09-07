@@ -2310,3 +2310,17 @@ class TestModelSwitchTakesEffect:
             assert 5004 in bot_agent._plan_mode
         finally:
             bot_agent._plan_mode.discard(5004)
+
+    async def test_no_cli_manager_is_not_fatal(self):
+        """CI and any host without the Claude CLI have claude_code_mgr = None.
+        A model or plan-mode switch must still save, not raise."""
+        import bot_agent
+        from bot_agent import _apply_model_change, _reload_cli_settings
+
+        try:
+            with patch("bot_agent.claude_code_mgr", None), patch("bot_agent.save_model"):
+                assert await _reload_cli_settings(5005, AsyncMock(), "permission mode") == ""
+                assert await _apply_model_change(5005, "sonnet", AsyncMock()) == ""
+            assert bot_agent.chat_models[5005] == "sonnet"
+        finally:
+            bot_agent.chat_models.pop(5005, None)

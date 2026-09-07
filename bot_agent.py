@@ -1123,6 +1123,11 @@ async def _reload_cli_settings(chat_id: int, bot: Bot, what: str) -> str:
 
     Returns a status line to append to the reply (empty if there is nothing to say).
     """
+    if not claude_code_mgr:
+        # No CLI on this host — there is no process to re-point. The saved
+        # setting still applies once a manager exists.
+        return ""
+
     repo = get_active_repo(chat_id) if chat_id in _stream_mode else None
     if not repo:
         await claude_code_mgr.abort(chat_id)
@@ -1141,7 +1146,8 @@ async def _apply_model_change(chat_id: int, model_id: str, bot: Bot) -> str:
     """Persist a model switch and make it take effect on the running CLI."""
     chat_models[chat_id] = model_id
     save_model(chat_id, model_id)
-    claude_code_mgr.clear_last_model(chat_id)
+    if claude_code_mgr:
+        claude_code_mgr.clear_last_model(chat_id)
     return await _reload_cli_settings(chat_id, bot, "model")
 
 
