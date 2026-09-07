@@ -2269,6 +2269,34 @@ class TestModelSwitchTakesEffect:
             bot_agent._stream_mode.discard(chat_id)
             bot_agent.chat_models.pop(chat_id, None)
 
+    async def test_reply_names_the_resolved_model(self):
+        """This bot stores CLI aliases, so "sonnet" alone does not tell the user
+        which model they landed on. The reply must name the resolved id."""
+        import bot_agent
+        from bot_agent import show_model
+
+        chat_id = 5006
+        bot_agent._stream_mode.add(chat_id)
+        bot_agent.chat_models[chat_id] = "opus"
+        update = _make_update(chat_id=chat_id)
+        ctx = _make_context(args=["sonnet"])
+        try:
+            with (
+                patch("bot_agent.is_authorized", return_value=True),
+                patch("bot_agent.save_model"),
+                patch("bot_agent.get_active_repo", return_value="owner/repo"),
+                patch("bot_agent.get_active_branch", return_value=None),
+                patch("bot_agent._clear_progress", new=AsyncMock()),
+                patch("bot_agent.claude_code_mgr", self._mgr(resolves="claude-sonnet-5")),
+            ):
+                await show_model(update, ctx)
+            text = update.message.reply_text.call_args[0][0]
+            assert "sonnet" in text
+            assert "claude-sonnet-5" in text
+        finally:
+            bot_agent._stream_mode.discard(chat_id)
+            bot_agent.chat_models.pop(chat_id, None)
+
     async def test_reselecting_current_model_changes_nothing(self):
         """Tapping the ✓ button must not kill a running turn to change nothing."""
         import bot_agent

@@ -1126,20 +1126,25 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(usage)
 
 
-async def _model_resolves(model_id: str) -> bool:
-    """Probe whether the Claude CLI can resolve this model id.
+async def _probe_model(model_id: str) -> tuple[bool, str | None]:
+    """Ask the Claude CLI to resolve a model id, returning (usable, resolved id).
 
     An outdated CLI fails silently on unknown aliases: the init event never
-    arrives and runs just hang. A probe that errors out is not a verdict, so
-    only a definitive miss counts as unresolvable.
+    arrives and runs just hang, so a definitive miss makes the model unusable.
+    A probe that errors out is not a verdict — the model stays usable and the
+    resolved id is simply unknown.
+
+    The resolved id is worth surfacing because this bot stores CLI aliases, so
+    "sonnet" alone does not tell the user which model they actually landed on.
     """
     if not claude_code_mgr:
-        return True
+        return True, None
     try:
-        return await claude_code_mgr.probe_resolved_model(model_id) is not None
+        resolved = await claude_code_mgr.probe_resolved_model(model_id)
     except Exception as e:
         logger.warning("Model resolution check for %s failed: %s", model_id, e)
-        return True
+        return True, None
+    return resolved is not None, resolved
 
 
 async def _reload_cli_settings(chat_id: int, bot: Bot, what: str) -> str:
@@ -1188,10 +1193,14 @@ async def _switch_model(chat_id: int, model_id: str, bot: Bot) -> str:
     """
     if get_model(chat_id) == model_id:
         # Re-selecting the active model (tapping its ✓ button) must not kill a
-        # running turn to change nothing.
-        return f"Already on: {model_id}"
+        # running turn to change nothing. Report the resolved id from the last
+        # CLI init if we have it — that is cached, so this costs no probe.
+        cached = claude_code_mgr.get_last_model(chat_id) if claude_code_mgr else None
+        label = f"{model_id} (resolved: {cached})" if cached and cached != model_id else model_id
+        return f"Already on: {label}"
 
-    if not await _model_resolves(model_id):
+    usable, resolved = await _probe_model(model_id)
+    if not usable:
         return (
             f"⚠️ Claude CLI could not resolve '{model_id}' — the CLI may be outdated. "
             f"Try /update.\nModel unchanged."
@@ -1202,7 +1211,11 @@ async def _switch_model(chat_id: int, model_id: str, bot: Bot) -> str:
     if claude_code_mgr:
         claude_code_mgr.clear_last_model(chat_id)
     note = await _reload_cli_settings(chat_id, bot, "model")
-    return f"Model switched to: {model_id}{note}"
+    # Show what the alias actually resolved to. "sonnet" alone does not confirm
+    # which model the CLI landed on, which is the whole point of the switch.
+    # Matches the "(resolved: …)" wording /model already uses for status.
+    label = f"{model_id} (resolved: {resolved})" if resolved and resolved != model_id else model_id
+    return f"Model switched to: {label}{note}"
 
 
 async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
