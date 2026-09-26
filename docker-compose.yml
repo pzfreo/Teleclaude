@@ -1,6 +1,8 @@
 services:
   teleclaude:
     build: .
+    # tini as PID 1 reaps orphaned children (codex/claude shells, tmux servers).
+    init: true
     restart: unless-stopped
     env_file: .env
     volumes:
@@ -8,6 +10,8 @@ services:
 
   teleclaude-agent:
     build: .
+    # tini as PID 1 reaps orphaned children (codex/claude shells, tmux servers).
+    init: true
     restart: unless-stopped
     env_file: .env.agent
     ports:
@@ -61,6 +65,8 @@ services:
   # no docker socket access — those are Claude-Code-specific.
   teleclaude-codex:
     build: .
+    # tini as PID 1 reaps orphaned children (codex/claude shells, tmux servers).
+    init: true
     restart: unless-stopped
     env_file:
       - path: .env.codex
