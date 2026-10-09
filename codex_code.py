@@ -1332,6 +1332,12 @@ class CodexAppServerManager:
 
         raise AssertionError(f"unhandled supported command: {name}")
 
+    async def list_models(self, chat_id: int) -> list[dict]:
+        """Return the models this Codex login can use, as reported by app-server `model/list`."""
+        conn = await self._start(chat_id)
+        result = await self._request(chat_id, conn, "model/list", {})
+        return [m for m in result.get("data") or [] if not m.get("hidden")]
+
     async def interrupt(self, chat_id: int, mark_pending: bool = False) -> Literal["idle", "cancelled", "forced"]:
         conn = self._connections.get(chat_id)
         if conn and conn.compact_done and not conn.compact_done.done():

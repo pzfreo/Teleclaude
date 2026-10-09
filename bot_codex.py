@@ -691,7 +691,7 @@ async def set_repo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline keyboard callbacks: dl:, repo:"""
+    """Handle inline keyboard callbacks: dl:, repo:, model:"""
     query = update.callback_query
     if not query or not query.from_user:
         return
@@ -719,6 +719,11 @@ async def inline_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         _switch_repo(chat_id, repo)
         await query.edit_message_text(f"Active repo set to: {repo}")
+
+    elif data.startswith("model:"):
+        model_id = data[6:]
+        chat_models[chat_id] = model_id
+        await query.edit_message_text(f"Model switched to: {model_id}")
 
 
 async def set_branch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -865,13 +870,46 @@ async def show_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_authorized(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
+    try:
+        models = await _list_models(chat_id)
+    except Exception as e:
+        logger.warning("Codex model/list failed: %s", e)
+        models = []
     if not context.args:
-        model = get_model(chat_id) or "(CLI default)"
-        await update.message.reply_text(f"Current model: {model}\n/model <name> to switch")
+        model = get_model(chat_id)
+        default = next((m["id"] for m in models if m.get("isDefault")), None)
+        status = f"Current model: {model}" if model else f"Current model: {default or 'unknown'} (CLI default)"
+        if not models:
+            await update.message.reply_text(f"{status}\n/model <name> to switch")
+            return
+        active = model or default
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    m["displayName"] + (" ✓" if m["id"] == active else ""), callback_data=f"model:{m['id']}"
+                )
+            ]
+            for m in models
+        ]
+        await update.message.reply_text(f"{status}\n\nTap to switch:", reply_markup=InlineKeyboardMarkup(buttons))
         return
     model_id = context.args[0]
+    if models and model_id not in {m["id"] for m in models}:
+        names = ", ".join(m["id"] for m in models)
+        await update.message.reply_text(f"Unknown model: {model_id}\nAvailable: {names}")
+        return
     chat_models[chat_id] = model_id
     await update.message.reply_text(f"Model switched to: {model_id}")
+
+
+async def _list_models(chat_id: int) -> list[dict]:
+    """Ask Codex which models this login can use, without leaving an app-server behind in one-shot mode."""
+    was_active = app_server_mgr.active(chat_id)
+    try:
+        return await app_server_mgr.list_models(chat_id)
+    finally:
+        if not was_active and not _uses_stream(chat_id):
+            await app_server_mgr.stop(chat_id)
 
 
 async def list_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

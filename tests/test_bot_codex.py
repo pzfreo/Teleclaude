@@ -827,3 +827,85 @@ class TestStreamModeCommands:
         finally:
             bot_codex.codex_mgr._aborted_chats.discard(chat_id)
             bot_codex._one_shot_mode.discard(chat_id)
+
+
+MODELS = [
+    {"id": "gpt-6-sol", "displayName": "GPT-6-Sol", "isDefault": True},
+    {"id": "gpt-5.6-luna", "displayName": "GPT-5.6-Luna", "isDefault": False},
+]
+
+
+class TestModelCommand:
+    async def test_no_args_shows_resolved_default_and_buttons(self):
+        chat_id = 700
+        bot_codex.chat_models.pop(chat_id, None)
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        context.args = []
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch("bot_codex.DEFAULT_MODEL", ""),
+            patch("bot_codex._list_models", new_callable=AsyncMock, return_value=MODELS),
+        ):
+            await bot_codex.show_model(update, context)
+
+        text = update.message.reply_text.await_args.args[0]
+        assert "gpt-6-sol (CLI default)" in text
+        rows = update.message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard
+        assert [(r[0].text, r[0].callback_data) for r in rows] == [
+            ("GPT-6-Sol ✓", "model:gpt-6-sol"),
+            ("GPT-5.6-Luna", "model:gpt-5.6-luna"),
+        ]
+
+    async def test_rejects_model_codex_does_not_offer(self):
+        chat_id = 701
+        bot_codex.chat_models.pop(chat_id, None)
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        context.args = ["gpt-6.1-sol"]
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch("bot_codex._list_models", new_callable=AsyncMock, return_value=MODELS),
+        ):
+            await bot_codex.show_model(update, context)
+
+        assert chat_id not in bot_codex.chat_models
+        assert "Unknown model" in update.message.reply_text.await_args.args[0]
+
+    async def test_falls_back_to_free_text_when_listing_fails(self):
+        chat_id = 702
+        update = _make_update(chat_id=chat_id)
+        context = _make_context()
+        context.args = ["gpt-6.1-sol"]
+
+        with (
+            patch("bot_codex.is_authorized", return_value=True),
+            patch("bot_codex._list_models", new_callable=AsyncMock, side_effect=RuntimeError("no cli")),
+        ):
+            await bot_codex.show_model(update, context)
+
+        assert bot_codex.chat_models.pop(chat_id) == "gpt-6.1-sol"
+
+    async def test_button_switches_model(self):
+        chat_id = 703
+        update = _make_callback_update("model:gpt-5.6-luna", chat_id=chat_id)
+
+        with patch("bot_codex.is_authorized", return_value=True):
+            await bot_codex.inline_callback(update, _make_context())
+
+        assert bot_codex.chat_models.pop(chat_id) == "gpt-5.6-luna"
+        update.callback_query.edit_message_text.assert_awaited_once_with("Model switched to: gpt-5.6-luna")
+
+    async def test_listing_in_one_shot_mode_stops_the_app_server(self):
+        chat_id = 704
+        with (
+            patch.object(bot_codex.app_server_mgr, "active", return_value=False),
+            patch.object(bot_codex.app_server_mgr, "list_models", new_callable=AsyncMock, return_value=MODELS),
+            patch.object(bot_codex.app_server_mgr, "stop", new_callable=AsyncMock) as stop,
+            patch("bot_codex._uses_stream", return_value=False),
+        ):
+            assert await bot_codex._list_models(chat_id) == MODELS
+
+        stop.assert_awaited_once_with(chat_id)
