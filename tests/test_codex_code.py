@@ -36,6 +36,21 @@ class TestCodexAppServerManager:
         }
         assert manager._normalize_item({"type": "agentMessage", "text": "Done"})["type"] == "agent_message"
 
+    async def test_list_models_drops_hidden_models(self, tmp_path):
+        owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
+        manager = CodexAppServerManager(owner)
+        conn = MagicMock()
+        data = [{"id": "gpt-6-sol", "hidden": False}, {"id": "secret", "hidden": True}]
+
+        with (
+            patch.object(manager, "_start", new_callable=AsyncMock, return_value=conn),
+            patch.object(manager, "_request", new_callable=AsyncMock, return_value={"data": data}) as request,
+        ):
+            models = await manager.list_models(7)
+
+        request.assert_awaited_once_with(7, conn, "model/list", {})
+        assert [m["id"] for m in models] == ["gpt-6-sol"]
+
     async def test_run_turn_uses_persistent_thread_and_streams_notifications(self, tmp_path):
         owner = CodexCodeManager("fake-token", workspace_root=str(tmp_path), cli_path="/usr/local/bin/codex")
         manager = CodexAppServerManager(owner)
